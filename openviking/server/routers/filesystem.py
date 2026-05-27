@@ -1,0 +1,210 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Filesystem endpoints for OpenViking HTTP Server."""
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+
+from openviking.core.path_variables import resolve_path_variables
+from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
+from openviking.server.auth import get_request_context
+from openviking.server.dependencies import get_service
+from openviking.server.error_mapping import map_exception
+from openviking.server.identity import RequestContext
+from openviking.server.models import Response
+from openviking_cli.exceptions import NotFoundError
+
+router = APIRouter(prefix="/api/v1/fs", tags=["filesystem"])
+
+
+@router.get("/ls")
+async def ls(
+    uri: str = Query(..., description="Viking URI"),
+    simple: bool = Query(False, description="Return only relative path list"),
+    recursive: bool = Query(False, description="List all subdirectories recursively"),
+    output: str = Query("agent", description="Output format: original or agent"),
+    abs_limit: int = Query(256, description="Abstract limit (only for agent output)"),
+    show_all_hidden: bool = Query(False, description="List all hidden files, like -a"),
+    node_limit: int = Query(1000, description="Maximum number of nodes to list"),
+    limit: Optional[int] = Query(None, description="Alias for node_limit"),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """List directory contents."""
+    service = get_service()
+    actual_node_limit = limit if limit is not None else node_limit
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
+    try:
+        result = await service.fs.ls(
+            uri,
+            ctx=_ctx,
+            recursive=recursive,
+            simple=simple,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=actual_node_limit,
+        )
+    except AGFSNotFoundError:
+        raise NotFoundError(uri, "file")
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+    return Response(status="ok", result=result)
+
+
+@router.get("/tree")
+async def tree(
+    uri: str = Query(..., description="Viking URI"),
+    output: str = Query("agent", description="Output format: original or agent"),
+    abs_limit: int = Query(256, description="Abstract limit (only for agent output)"),
+    show_all_hidden: bool = Query(False, description="List all hidden files, like -a"),
+    node_limit: int = Query(1000, description="Maximum number of nodes to list"),
+    limit: Optional[int] = Query(None, description="Alias for node_limit"),
+    level_limit: int = Query(3, description="Maximum depth level to traverse"),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Get directory tree."""
+    service = get_service()
+    actual_node_limit = limit if limit is not None else node_limit
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
+    try:
+        result = await service.fs.tree(
+            uri,
+            ctx=_ctx,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=actual_node_limit,
+            level_limit=level_limit,
+        )
+    except AGFSNotFoundError:
+        raise NotFoundError(uri, "file")
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+    return Response(status="ok", result=result)
+
+
+@router.get("/stat")
+async def stat(
+    uri: str = Query(..., description="Viking URI"),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Get resource status."""
+    service = get_service()
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
+    try:
+        result = await service.fs.stat(uri, ctx=_ctx)
+        return Response(status="ok", result=result)
+    except AGFSNotFoundError:
+        raise NotFoundError(uri, "file")
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+    except Exception as exc:
+        mapped = map_exception(exc, resource=uri)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+
+
+class MkdirRequest(BaseModel):
+    """Request model for mkdir."""
+
+    uri: str
+    description: Optional[str] = None
+
+
+@router.post("/mkdir")
+async def mkdir(
+    request: MkdirRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Create directory."""
+    service = get_service()
+    # Resolve path variables
+    uri = resolve_path_variables(request.uri)
+    try:
+        await service.fs.mkdir(uri, ctx=_ctx, description=request.description)
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+    return Response(status="ok", result={"uri": uri})
+
+
+@router.delete("")
+async def rm(
+    uri: str = Query(..., description="Viking URI"),
+    recursive: bool = Query(False, description="Remove recursively"),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Remove resource."""
+    service = get_service()
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
+    try:
+        result = await service.fs.rm(uri, ctx=_ctx, recursive=recursive)
+    except AGFSNotFoundError:
+        raise NotFoundError(uri, "file")
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+    except Exception as exc:
+        mapped = map_exception(exc, resource=uri)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+    # Build response with uri and estimated_deleted_count
+    response_result = {"uri": uri}
+    if isinstance(result, dict) and "estimated_deleted_count" in result:
+        response_result["estimated_deleted_count"] = result["estimated_deleted_count"]
+    return Response(status="ok", result=response_result)
+
+
+class MvRequest(BaseModel):
+    """Request model for mv."""
+
+    from_uri: str
+    to_uri: str
+
+
+@router.post("/mv")
+async def mv(
+    request: MvRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Move resource."""
+    service = get_service()
+    # Resolve path variables
+    from_uri = resolve_path_variables(request.from_uri)
+    to_uri = resolve_path_variables(request.to_uri)
+    try:
+        await service.fs.mv(from_uri, to_uri, ctx=_ctx)
+    except AGFSNotFoundError:
+        raise NotFoundError(from_uri, "file")
+    except AGFSClientError as e:
+        mapped = map_exception(e, resource=from_uri, resource_type="file")
+        if mapped is not None:
+            raise mapped from e
+        raise
+    except Exception as exc:
+        mapped = map_exception(exc, resource=from_uri)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+    return Response(status="ok", result={"from": from_uri, "to": to_uri})
