@@ -33,7 +33,6 @@ from openviking.utils.circuit_breaker import (
     CircuitBreakerOpen,
     classify_api_error,
 )
-from openviking.utils.embedding_input import truncate_embedding_input
 from openviking.utils.model_retry import ERROR_CLASS_INPUT_TOO_LARGE, ERROR_CLASS_PERMANENT
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
@@ -78,7 +77,7 @@ class CollectionSchemas:
             # context_type 字段：区分上下文的大类
             # 枚举值："resource"（资源，默认）, "memory"（记忆）, "skill"（技能）
             # 推导规则：
-            #   - URI 以 viking://agent/skills 开头 → "skill"
+            #   - URI 位于 user skills 目录下 → "skill"
             #   - URI 包含 "memories" → "memory"
             #   - 其他情况 → "resource"
             {"FieldName": "context_type", "FieldType": "string"},
@@ -106,7 +105,6 @@ class CollectionSchemas:
                 {"FieldName": "abstract", "FieldType": "string"},
                 {"FieldName": "account_id", "FieldType": "string"},
                 {"FieldName": "owner_user_id", "FieldType": "string"},
-                {"FieldName": "owner_agent_id", "FieldType": "string"},
             ]
         )
         scalar_index = [
@@ -124,7 +122,6 @@ class CollectionSchemas:
                 "tags",
                 "account_id",
                 "owner_user_id",
-                "owner_agent_id",
             ]
         )
         return {
@@ -148,10 +145,25 @@ def _get_active_embedding_model_config(config: "OpenVikingConfig") -> Any:
 
 def _build_embedding_metadata(config: "OpenVikingConfig") -> Dict[str, Any]:
     model_cfg = _get_active_embedding_model_config(config)
+    # When credentials are configured, the first credential drives the actual
+    # provider/model used at request time (see EmbeddingConfig._effective_*),
+    # so the metadata signature must reflect the credential rather than the
+    # parent's possibly-default provider/model. Otherwise a credential-only
+    # OpenAI config would still be signed as ``provider=volcengine`` (the parent
+    # default), masking real vector-space changes.
+    first_cred = None
+    creds = getattr(model_cfg, "credentials", None) or []
+    if creds:
+        first_cred = creds[0]
+    cred_provider = getattr(first_cred, "provider", None) if first_cred else None
+    cred_model = getattr(first_cred, "model", None) if first_cred else None
     provider = (
-        getattr(model_cfg, "provider", None) or getattr(model_cfg, "backend", None) or ""
+        cred_provider
+        or getattr(model_cfg, "provider", None)
+        or getattr(model_cfg, "backend", None)
+        or ""
     ).lower()
-    model = getattr(model_cfg, "model", None) or ""
+    model = cred_model or getattr(model_cfg, "model", None) or ""
     dimension = config.embedding.dimension
     model_path = getattr(model_cfg, "model_path", None)
     model_identity = model
@@ -287,9 +299,53 @@ async def init_context_collection(storage) -> bool:
         )
         return False
 
+    # Embedding metadata differs from current config and the collection is
+    # non-empty. Decide whether the user has explicitly opted in to keep the
+    # existing vectors despite the metadata drift.
+    existing_dimension = (
+        existing_embedding_meta.get("dimension") if existing_embedding_meta else None
+    )
+    current_dimension = embedding_meta.get("dimension")
+    dimension_changed = (
+        existing_dimension is not None
+        and current_dimension is not None
+        and existing_dimension != current_dimension
+    )
+
+    allow_override = bool(getattr(config.embedding, "allow_metadata_override", False))
+    if (
+        allow_override
+        and not dimension_changed
+        and hasattr(storage, "update_collection_description")
+    ):
+        logger.warning(
+            "Embedding metadata changed (provider/model) but dimension is "
+            "unchanged; embedding.allow_metadata_override=true, so the existing "
+            "collection metadata will be rewritten and existing vectors kept. "
+            "old=%s new=%s",
+            existing_embedding_meta,
+            embedding_meta,
+        )
+        await storage.update_collection_description(
+            _encode_collection_description(
+                base_description or "Unified context collection",
+                embedding_meta,
+            )
+        )
+        return False
+
+    if dimension_changed:
+        raise EmbeddingRebuildRequiredError(
+            "Existing collection embedding dimension "
+            f"({existing_dimension}) does not match current configuration "
+            f"({current_dimension}). Vectors are incompatible; rebuild is required."
+        )
+
     raise EmbeddingRebuildRequiredError(
         "Existing collection embedding metadata does not match current configuration. "
-        "Rebuild is required before using the current embedding model."
+        "Rebuild is required before using the current embedding model, or set "
+        "embedding.allow_metadata_override=true to keep existing vectors when "
+        "only provider/model changed (dimension must remain the same)."
     )
 
 
@@ -323,7 +379,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         config = get_openviking_config()
         self._collection_name = config.storage.vectordb.name
         self._vector_dim = config.embedding.dimension
-        self._max_input_tokens = int(getattr(config.embedding, "max_input_tokens", 4096) or 4096)
         self._initialize_embedder(config)
         breaker_cfg = config.embedding.circuit_breaker
         self._circuit_breaker = CircuitBreaker(
@@ -448,9 +503,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     report_success = True
                     return None
 
-                # Only process string messages
-                if not isinstance(embedding_msg.message, str):
-                    logger.debug(f"Skipping non-string message type: {type(embedding_msg.message)}")
+                # Process string (text) or list (multimodal) messages
+                if not isinstance(embedding_msg.message, (str, list)):
+                    logger.debug(
+                        f"Skipping unsupported message type: {type(embedding_msg.message)}"
+                    )
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                     self._record_request_success(embedding_msg)
                     report_success = True
@@ -500,12 +557,8 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         import time as _time
 
                         _embed_t0 = _time.monotonic()
-                        embedding_input = truncate_embedding_input(
-                            embedding_msg.message,
-                            self._max_input_tokens,
-                        )
                         result: EmbedResult = await embed_compat(
-                            self._embedder, embedding_input, is_query=False
+                            self._embedder, embedding_msg.message, is_query=False
                         )
                         _embed_elapsed = _time.monotonic() - _embed_t0
                         try:
@@ -633,7 +686,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     user = UserIdentifier(
                         account_id=account_id,
                         user_id="default",
-                        agent_id="default",
                     )
                     ctx = RequestContext(user=user, role=Role.ROOT)
                     record_id = await self._vikingdb.upsert(inserted_data, ctx=ctx)

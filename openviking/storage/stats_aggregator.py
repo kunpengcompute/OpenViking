@@ -16,7 +16,7 @@ from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
 
-# Memory categories from MemoryCategory enum
+# Memory categories used by the stats API.
 MEMORY_CATEGORIES = [
     "profile",
     "preferences",
@@ -140,8 +140,7 @@ class StatsAggregator:
         Returns:
             Dictionary with session extraction statistics.
         """
-        session = service.sessions.session(ctx, session_id)
-        await session.load()
+        session = await service.sessions.get(session_id, ctx, auto_create=False)
 
         stats = session.stats
         return {

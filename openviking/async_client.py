@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from openviking.client import LocalClient, Session
 from openviking.service.debug_service import SystemStatus
 from openviking.telemetry import TelemetryRequest
+from openviking.utils.search_filters import SearchContextTypeInput
 from openviking_cli.client.base import BaseClient
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
@@ -46,14 +47,16 @@ class AsyncOpenViking:
     def __init__(
         self,
         path: Optional[str] = None,
-        **kwargs,
+        actor_peer_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ):
         """
         Initialize OpenViking client (embedded mode).
 
         Args:
             path: Local storage path (overrides ov.conf storage path).
-            **kwargs: Additional configuration parameters.
+            actor_peer_id: Optional view filter for the current user's peer collection.
+            agent_id: Legacy alias for actor_peer_id.
         """
         # Singleton guard for repeated initialization
         if hasattr(self, "_singleton_initialized") and self._singleton_initialized:
@@ -66,6 +69,8 @@ class AsyncOpenViking:
 
         self._client: BaseClient = LocalClient(
             path=path,
+            actor_peer_id=actor_peer_id,
+            agent_id=agent_id,
         )
         self._singleton_initialized = True
 
@@ -129,7 +134,10 @@ class AsyncOpenViking:
         return await self._client.session_exists(session_id)
 
     async def create_session(
-        self, session_id: Optional[str] = None, telemetry: TelemetryRequest = False
+        self,
+        session_id: Optional[str] = None,
+        telemetry: TelemetryRequest = False,
+        memory_policy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a new session.
 
@@ -138,7 +146,11 @@ class AsyncOpenViking:
                        If None, creates a new session with auto-generated ID.
         """
         await self._ensure_initialized()
-        return await self._client.create_session(session_id, telemetry=telemetry)
+        return await self._client.create_session(
+            session_id,
+            telemetry=telemetry,
+            memory_policy=memory_policy,
+        )
 
     async def list_sessions(self) -> List[Any]:
         """List all sessions."""
@@ -174,7 +186,7 @@ class AsyncOpenViking:
         content: str | None = None,
         parts: list[dict] | None = None,
         created_at: str | None = None,
-        role_id: str | None = None,
+        peer_id: str | None = None,
         telemetry: TelemetryRequest = False,
     ) -> Dict[str, Any]:
         """Add a message to a session.
@@ -183,9 +195,9 @@ class AsyncOpenViking:
             session_id: Session ID
             role: Message role ("user" or "assistant")
             content: Text content (simple mode)
-            parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
+            parts: Parts array (full Part support: TextPart, ContextPart, ImagePart, ToolPart)
             created_at: Message creation time (ISO format string)
-            role_id: Optional explicit actor identity. Omit to let the client/server derive it.
+            peer_id: Optional stable interaction peer identity.
 
         If both content and parts are provided, parts takes precedence.
         """
@@ -196,16 +208,38 @@ class AsyncOpenViking:
             content=content,
             parts=parts,
             created_at=created_at,
-            role_id=role_id,
+            peer_id=peer_id,
+            telemetry=telemetry,
+        )
+
+    async def batch_add_messages(
+        self,
+        session_id: str,
+        messages: list[dict],
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Add multiple messages to a session in a single request."""
+        await self._ensure_initialized()
+        return await self._client.batch_add_messages(
+            session_id=session_id,
+            messages=messages,
             telemetry=telemetry,
         )
 
     async def commit_session(
-        self, session_id: str, telemetry: TelemetryRequest = False
+        self,
+        session_id: str,
+        telemetry: TelemetryRequest = False,
+        *,
+        keep_recent_count: int = 0,
     ) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
         await self._ensure_initialized()
-        return await self._client.commit_session(session_id, telemetry=telemetry)
+        return await self._client.commit_session(
+            session_id,
+            telemetry=telemetry,
+            keep_recent_count=keep_recent_count,
+        )
 
     async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Query background task status."""
@@ -240,6 +274,7 @@ class AsyncOpenViking:
         build_index: bool = True,
         summarize: bool = False,
         watch_interval: float = 0,
+        args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -274,6 +309,7 @@ class AsyncOpenViking:
             summarize=summarize,
             telemetry=telemetry,
             watch_interval=watch_interval,
+            args=args,
             **kwargs,
         )
 
@@ -338,6 +374,7 @@ class AsyncOpenViking:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
+        context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -367,6 +404,7 @@ class AsyncOpenViking:
             limit=limit,
             score_threshold=score_threshold,
             filter=filter,
+            context_type=context_type,
             telemetry=telemetry,
             since=since,
             until=until,
@@ -381,6 +419,7 @@ class AsyncOpenViking:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
+        context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
@@ -395,6 +434,7 @@ class AsyncOpenViking:
             limit=limit,
             score_threshold=score_threshold,
             filter=filter,
+            context_type=context_type,
             telemetry=telemetry,
             since=since,
             until=until,

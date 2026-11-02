@@ -6,12 +6,34 @@ import { defineConfig, type DefaultTheme } from 'vitepress'
 const docsRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repo = process.env.GITHUB_REPOSITORY || 'volcengine/OpenViking'
 const base = process.env.DOCS_BASE || '/'
+const withTrailingSlash = (url: string) => (url.endsWith('/') ? url : `${url}/`)
+const mainSiteBase = withTrailingSlash(process.env.OPENVIKING_SITE_BASE || 'https://www.openviking.ai/')
+const preferenceBootstrapScript = `;(() => {
+  const prefix = 'openviking-preferences:'
+  const cookieKey = 'openviking-preferences'
+  const readCookiePreference = () => {
+    const cookie = document.cookie.split('; ').find((item) => item.startsWith(cookieKey + '='))
+    if (!cookie) return {}
+    return JSON.parse(decodeURIComponent(cookie.slice(cookieKey.length + 1)))
+  }
+  const readTransferPreference = () => {
+    if (!window.name.startsWith(prefix)) return {}
+    return JSON.parse(window.name.slice(prefix.length))
+  }
+  try {
+    const preference = { ...readCookiePreference(), ...readTransferPreference() }
+    if (preference.theme !== 'light' && preference.theme !== 'dark') return
+    localStorage.setItem('vitepress-theme-appearance', preference.theme)
+    document.documentElement.classList.toggle('dark', preference.theme === 'dark')
+  } catch {}
+})()`
 
 const sectionNames: Record<string, string> = {
   'getting-started': 'Getting Started',
   concepts: 'Concepts',
   guides: 'Guides',
   'agent-integrations': 'Agent Integrations',
+  migration: 'Migration',
   api: 'API Reference',
   faq: 'FAQ',
   about: 'About',
@@ -23,6 +45,7 @@ const zhSectionNames: Record<string, string> = {
   concepts: '核心概念',
   guides: '指南',
   'agent-integrations': 'Agent 集成',
+  migration: '迁移指南',
   api: 'API 参考',
   faq: '常见问题',
   about: '关于',
@@ -75,7 +98,7 @@ function sidebarSection(dir: string, title: string, collapsed = true): DefaultTh
 
 function localizedGuideSidebarItems(locale: 'en' | 'zh'): DefaultTheme.SidebarItem[] {
   const labels = locale === 'zh' ? zhSectionNames : sectionNames
-  const sections = ['getting-started', 'concepts', 'guides', 'agent-integrations']
+  const sections = ['getting-started', 'concepts', 'guides', 'agent-integrations', 'migration']
 
   return sections.map((section, index) =>
     sidebarSection(`${locale}/${section}`, labels[section], index !== 0)
@@ -97,14 +120,14 @@ const designSidebar: DefaultTheme.SidebarItem[] = [
 ]
 
 const enNav: DefaultTheme.NavItem[] = [
-  { text: navLabels.en.guide, link: '/en/getting-started/01-introduction', activeMatch: '/en/(getting-started|concepts|guides|agent-integrations)/' },
+  { text: navLabels.en.guide, link: '/en/getting-started/01-introduction', activeMatch: '/en/(getting-started|concepts|guides|agent-integrations|migration)/' },
   { text: navLabels.en.api, link: '/en/api/01-overview', activeMatch: '/en/api/' },
   { text: navLabels.en.faq, link: '/en/faq/faq', activeMatch: '/en/faq/' },
   { text: navLabels.en.about, link: '/en/about/01-about-us', activeMatch: '/en/about/' }
 ]
 
 const zhNav: DefaultTheme.NavItem[] = [
-  { text: navLabels.zh.guide, link: '/zh/getting-started/01-introduction', activeMatch: '/zh/(getting-started|concepts|guides|agent-integrations)/' },
+  { text: navLabels.zh.guide, link: '/zh/getting-started/01-introduction', activeMatch: '/zh/(getting-started|concepts|guides|agent-integrations|migration)/' },
   { text: navLabels.zh.api, link: '/zh/api/01-overview', activeMatch: '/zh/api/' },
   { text: navLabels.zh.faq, link: '/zh/faq/faq', activeMatch: '/zh/faq/' },
   { text: navLabels.zh.about, link: '/zh/about/01-about-us', activeMatch: '/zh/about/' }
@@ -206,7 +229,8 @@ export default defineConfig({
   head: [
     ['link', { rel: 'icon', type: 'image/x-icon', href: `${base}favicon.ico` }],
     ['link', { rel: 'icon', type: 'image/png', sizes: '32x32', href: `${base}favicon-32.png` }],
-    ['link', { rel: 'apple-touch-icon', href: `${base}apple-touch-icon.png` }]
+    ['link', { rel: 'apple-touch-icon', href: `${base}apple-touch-icon.png` }],
+    ['script', {}, preferenceBootstrapScript]
   ],
   transformPageData(pageData, { siteConfig }) {
     const srcPath = path.join(siteConfig.srcDir, pageData.relativePath)
@@ -242,7 +266,7 @@ export default defineConfig({
   },
   themeConfig: {
     logo: '/ov-logo.png',
-    logoLink: 'https://openviking.ai/',
+    logoLink: mainSiteBase,
     search: {
       provider: 'local'
     },
@@ -266,6 +290,7 @@ export default defineConfig({
           '/en/concepts/': localizedGuideSidebarItems('en'),
           '/en/guides/': localizedGuideSidebarItems('en'),
           '/en/agent-integrations/': localizedGuideSidebarItems('en'),
+          '/en/migration/': localizedGuideSidebarItems('en'),
           '/en/api/': localizedReferenceSidebarItems('en'),
           '/en/about/': localizedAboutSidebarItems('en'),
           '/design/': designSidebar
@@ -285,6 +310,7 @@ export default defineConfig({
           '/zh/concepts/': localizedGuideSidebarItems('zh'),
           '/zh/guides/': localizedGuideSidebarItems('zh'),
           '/zh/agent-integrations/': localizedGuideSidebarItems('zh'),
+          '/zh/migration/': localizedGuideSidebarItems('zh'),
           '/zh/api/': localizedReferenceSidebarItems('zh'),
           '/zh/about/': localizedAboutSidebarItems('zh')
         },

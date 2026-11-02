@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
+from __future__ import annotations
+
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -77,6 +79,12 @@ class S3Config(BaseModel):
         "Set to an empty string to disable key normalization. Defaults to ?#%+@.",
     )
 
+    auto_detect_content_type: bool = Field(
+        default=False,
+        description="Automatically infer S3 object Content-Type from the object key filename extension "
+        "during uploads. Disabled by default for backward compatibility.",
+    )
+
     model_config = {"extra": "forbid"}
 
     def validate_config(self):
@@ -147,6 +155,11 @@ class QueueFSConfig(BaseModel):
 
 class AGFSConfig(BaseModel):
     """Configuration for RAGFS (Rust-based AGFS)."""
+
+    name: str = Field(
+        default="primary",
+        description="Logical backend name, globally unique across primary and all backups",
+    )
 
     path: Optional[str] = Field(
         default=None,
@@ -224,6 +237,14 @@ class AGFSConfig(BaseModel):
     # RAGFS will act as a gateway to the specified S3 bucket.
     s3: S3Config = Field(default_factory=lambda: S3Config(), description="S3 backend configuration")
 
+    # Multi-write configuration
+    backups: Optional[dict[str, Any]] = Field(
+        default=None, description="Multi-write backups configuration. None = single backend mode."
+    )
+    redirects: Optional[List[dict[str, Any]]] = Field(
+        default=None, description="Primary redirect policies."
+    )
+
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
@@ -270,5 +291,10 @@ class AGFSConfig(BaseModel):
                     "AGFSConfig: QueueFS backend is 'memory'; "
                     "db_path/queue_db_path will be ignored."
                 )
+
+        if self.redirects is not None and self.backups is None:
+            raise ValueError(
+                "redirects requires backups; single-backend mode does not support redirects"
+            )
 
         return self
