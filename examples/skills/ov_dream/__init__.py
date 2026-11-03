@@ -1,1 +1,0 @@
-"""OV Dream skill package."""
