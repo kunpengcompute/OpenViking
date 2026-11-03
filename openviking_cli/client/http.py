@@ -9,7 +9,7 @@ import tempfile
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypedDict, Union
 
 import httpx
 
@@ -17,6 +17,7 @@ from openviking.core.peer_id import normalize_peer_selector
 from openviking.telemetry import TelemetryRequest, normalize_telemetry_request
 from openviking.utils.search_filters import SearchContextTypeInput
 from openviking_cli.client.base import BaseClient
+from openviking_cli.client.identity import ClientAuthMode, OVIdentity, _identity_arguments
 from openviking_cli.exceptions import (
     AbortedError,
     AlreadyExistsError,
@@ -78,7 +79,7 @@ class _HTTPObserver:
     Provides the same interface as the local observer but fetches data via HTTP.
     """
 
-    def __init__(self, client: "AsyncHTTPClient"):
+    def __init__(self, client: "AsyncHTTPClient") -> None:
         self._client = client
         self._cache = {}
 
@@ -124,11 +125,19 @@ class _HTTPObserver:
         return status.get("is_healthy", False)
 
 
+class _IdentityRequestOptions(TypedDict, total=False):
+    headers: dict[str, str]
+
+
 class AsyncHTTPClient(BaseClient):
     """Async HTTP Client for OpenViking Server.
 
     Implements BaseClient interface using HTTP calls.
     Supports auto-loading url/api_key from ovcli.conf when not provided.
+
+    Business methods accept keyword-only ``identity=OVIdentity(...)``. These
+    headers apply only to that request, including uploads. Omitting identity
+    preserves constructor/profile defaults. The API key remains client-wide.
 
     Examples:
         # Explicit url
@@ -150,7 +159,10 @@ class AsyncHTTPClient(BaseClient):
         timeout: float = 60.0,
         extra_headers: Optional[Dict[str, str]] = None,
         profile_enabled: Optional[bool] = None,
-    ):
+        *,
+        http_client: httpx.AsyncClient | None = None,
+        auth_mode: ClientAuthMode = "api_key",
+    ) -> None:
         """Initialize AsyncHTTPClient.
 
         Args:
@@ -163,7 +175,14 @@ class AsyncHTTPClient(BaseClient):
             agent_id: Legacy alias for actor_peer_id.
             timeout: HTTP request timeout in seconds. Default 60.0.
             extra_headers: Additional HTTP headers to send with requests. If not provided, reads from ovcli.conf.
+            http_client: Borrow an application-owned async HTTP client without changing
+                its defaults. close() detaches this SDK and leaves the pool open.
+            auth_mode: Match the server mode. api_key uses credential identity;
+                only trusted/dev send account and user assertion headers.
         """
+        if auth_mode not in ("api_key", "trusted", "dev"):
+            raise ValueError("auth_mode must be api_key, trusted or dev")
+        self._auth_mode = auth_mode
         effective_user = user if user is not None else user_id
         profile_load_requested = profile_enabled is None
         should_load_cli_config = profile_enabled is not False and (
@@ -215,14 +234,14 @@ class AsyncHTTPClient(BaseClient):
         self._upload_mode = None
         if should_load_cli_config and cli_config is not None and cli_config.upload is not None:
             self._upload_mode = cli_config.upload.mode
+        self._borrowed_http = http_client
         self._http: Optional[httpx.AsyncClient] = None
         self._observer: Optional[_HTTPObserver] = None
 
     # ============= Lifecycle =============
 
-    async def initialize(self) -> None:
-        """Initialize the HTTP client."""
-        headers = {}
+    def _default_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
         if self._api_key:
             headers["X-API-Key"] = self._api_key
         if self._account:
@@ -233,27 +252,109 @@ class AsyncHTTPClient(BaseClient):
             headers["X-OpenViking-Actor-Peer"] = self._actor_peer_id
         if self._extra_headers:
             headers.update(self._extra_headers)
-        self._http = httpx.AsyncClient(
-            base_url=self._url,
-            headers=headers,
-            timeout=self._timeout,
-            params={"profile": "1"} if self._profile_enabled else None,
-        )
+        if self._auth_mode == "api_key":
+            headers = {
+                key: value
+                for key, value in headers.items()
+                if key.lower() not in {"x-openviking-account", "x-openviking-user"}
+            }
+        return headers
+
+    async def initialize(self) -> None:
+        """Attach a borrowed pool or initialize this SDK's owned HTTP client."""
+        if self._http is not None and not self._http.is_closed:
+            return
+        if self._borrowed_http is not None:
+            if self._borrowed_http.is_closed:
+                raise RuntimeError("The application-owned HTTP client is closed")
+            self._http = self._borrowed_http
+        else:
+            self._http = httpx.AsyncClient(
+                base_url=self._url,
+                headers=self._default_headers(),
+                timeout=self._timeout,
+                params={"profile": "1"} if self._profile_enabled else None,
+            )
         self._observer = _HTTPObserver(self)
 
     async def close(self) -> None:
-        """Close the HTTP client."""
-        if self._http:
+        """Detach this SDK; only an owned HTTP client is closed."""
+        if self._http is not None:
             try:
-                await self._http.aclose()
+                if self._borrowed_http is None:
+                    await self._http.aclose()
             except RuntimeError:
                 pass
-            self._http = None
+            finally:
+                self._http = None
+                self._observer = None
 
     # ============= Internal Helpers =============
 
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Apply SDK defaults per request without changing the borrowed pool."""
+        if self._http is None:
+            raise RuntimeError("Initialize the OV client before making a request")
+        headers = httpx.Headers(self._default_headers())
+        headers.update(kwargs.pop("headers", None) or {})
+        if self._profile_enabled:
+            kwargs["params"] = httpx.QueryParams({"profile": "1"}).merge(kwargs.get("params") or {})
+        if self._auth_mode == "api_key":
+            forbidden = ("X-OpenViking-Account", "X-OpenViking-User")
+            for key in forbidden:
+                headers.pop(key, None)
+            # httpx merges borrowed client defaults back into each request.
+            # Remove assertion headers from the built request, never the pool.
+            inherited = getattr(self._http, "headers", {})
+            if any(key in inherited for key in forbidden):
+                request = self._http.build_request(
+                    method,
+                    self._url + "/" + path.lstrip("/"),
+                    headers=headers,
+                    timeout=kwargs.pop("timeout", self._timeout),
+                    **kwargs,
+                )
+                for key in forbidden:
+                    request.headers.pop(key, None)
+                return await self._http.send(request)
+        return await self._http.request(
+            method,
+            self._url + "/" + path.lstrip("/"),
+            headers=headers,
+            timeout=kwargs.pop("timeout", self._timeout),
+            **kwargs,
+        )
+
+    def _request_options(self, identity: OVIdentity | None) -> _IdentityRequestOptions:
+        """Explicit identity overrides only this request; None preserves defaults."""
+        if identity is None:
+            return {}
+        if not isinstance(identity, OVIdentity):
+            raise TypeError("identity must be an OVIdentity")
+        headers = identity.headers()
+        if self._auth_mode == "api_key":
+            headers.pop("X-OpenViking-Account")
+            headers.pop("X-OpenViking-User")
+        return {"headers": headers}
+
     def _handle_response_data(self, response: httpx.Response) -> Dict[str, Any]:
         """Handle HTTP response and return the decoded response envelope."""
+        # Gateways can reject credentials without the OV JSON error envelope.
+        if response.status_code in (401, 403):
+            try:
+                error = response.json().get("error", {})
+            except (ValueError, AttributeError):
+                error = {}
+            if isinstance(error, dict) and error.get("code") in (
+                "UNAUTHENTICATED",
+                "PERMISSION_DENIED",
+            ):
+                # Preserve the service's message and resource details when available.
+                self._raise_exception(error)
+        if response.status_code == 401:
+            raise UnauthenticatedError("OpenViking request failed: HTTP 401")
+        if response.status_code == 403:
+            raise PermissionDeniedError("OpenViking request failed: HTTP 403")
         try:
             data = response.json()
         except Exception:
@@ -313,13 +414,17 @@ class AsyncHTTPClient(BaseClient):
 
         return result
 
-    def _attach_legacy_agent_scope(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if self._legacy_agent_id:
+    def _attach_legacy_agent_scope(
+        self, payload: Dict[str, Any], *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
+        if identity is None and self._legacy_agent_id:
             payload["agent_id"] = self._legacy_agent_id
         return payload
 
-    def _attach_legacy_message_scope(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if not self._legacy_agent_id:
+    def _attach_legacy_message_scope(
+        self, payload: Dict[str, Any], *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
+        if identity is not None or not self._legacy_agent_id:
             return payload
         if payload.get("peer_id") is not None:
             raise InvalidArgumentError(
@@ -329,8 +434,10 @@ class AsyncHTTPClient(BaseClient):
             payload["agent_id"] = self._legacy_agent_id
         return payload
 
-    def _batch_message_payloads(self, messages: list[dict]) -> list[dict]:
-        if not self._legacy_agent_id:
+    def _batch_message_payloads(
+        self, messages: list[dict], *, identity: OVIdentity | None = None
+    ) -> list[dict]:
+        if identity is not None or not self._legacy_agent_id:
             return messages
         scoped_messages = []
         for message in messages:
@@ -365,6 +472,9 @@ class AsyncHTTPClient(BaseClient):
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
             raise exc_class(resource, resource_type)
+        elif exc_class == PermissionDeniedError:
+            resource = details.get("resource") if details else None
+            raise exc_class(message, resource=resource)
         elif exc_class == AlreadyExistsError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
@@ -401,17 +511,19 @@ class AsyncHTTPClient(BaseClient):
 
         return str(zip_path)
 
-    async def _upload_temp_file(self, file_path: str) -> str:
+    async def _upload_temp_file(self, file_path: str, *, identity: OVIdentity | None = None) -> str:
         """Upload a file to /api/v1/resources/temp_upload and return the temp_file_id."""
         with open(file_path, "rb") as f:
             files = {"file": (Path(file_path).name, f, "application/octet-stream")}
             data = None
             if self._upload_mode:
                 data = {"upload_mode": self._upload_mode}
-            response = await self._http.post(
+            response = await self._request(
+                "POST",
                 "/api/v1/resources/temp_upload",
                 files=files,
                 data=data,
+                **self._request_options(identity),
             )
         result = self._handle_response(response)
         return result.get("temp_file_id", "")
@@ -436,6 +548,8 @@ class AsyncHTTPClient(BaseClient):
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking."""
         telemetry = self._validate_telemetry(telemetry)
@@ -468,22 +582,23 @@ class AsyncHTTPClient(BaseClient):
                 request_data["source_name"] = source_name
                 zip_path = self._zip_directory(path)
                 try:
-                    temp_file_id = await self._upload_temp_file(zip_path)
+                    temp_file_id = await self._upload_temp_file(
+                        zip_path, **_identity_arguments(identity)
+                    )
                     request_data["temp_file_id"] = temp_file_id
                 finally:
                     Path(zip_path).unlink(missing_ok=True)
             elif path_obj.is_file():
                 request_data["source_name"] = path_obj.name
-                temp_file_id = await self._upload_temp_file(path)
+                temp_file_id = await self._upload_temp_file(path, **_identity_arguments(identity))
                 request_data["temp_file_id"] = temp_file_id
             else:
                 request_data["path"] = path
         else:
             request_data["path"] = path
 
-        response = await self._http.post(
-            "/api/v1/resources",
-            json=request_data,
+        response = await self._request(
+            "POST", "/api/v1/resources", json=request_data, **self._request_options(identity)
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result"), response_data)
@@ -493,6 +608,8 @@ class AsyncHTTPClient(BaseClient):
         session_id: str,
         messages: list[dict],
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Add multiple messages to a session in a single request.
 
@@ -506,13 +623,17 @@ class AsyncHTTPClient(BaseClient):
             Result dict with session_id, message_count, and added count.
         """
         telemetry = self._validate_telemetry(telemetry)
-        payload: Dict[str, Any] = {"messages": self._batch_message_payloads(messages)}
+        payload: Dict[str, Any] = {
+            "messages": self._batch_message_payloads(messages, identity=identity)
+        }
         if telemetry is not False:
             payload["telemetry"] = telemetry
 
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             f"/api/v1/sessions/{session_id}/messages/batch",
             json=payload,
+            **self._request_options(identity),
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result"), response_data)
@@ -523,6 +644,8 @@ class AsyncHTTPClient(BaseClient):
         wait: bool = False,
         timeout: Optional[float] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Add skill to OpenViking."""
         telemetry = self._validate_telemetry(telemetry)
@@ -537,12 +660,16 @@ class AsyncHTTPClient(BaseClient):
                 if path_obj.is_dir():
                     zip_path = self._zip_directory(data)
                     try:
-                        temp_file_id = await self._upload_temp_file(zip_path)
+                        temp_file_id = await self._upload_temp_file(
+                            zip_path, **_identity_arguments(identity)
+                        )
                         request_data["temp_file_id"] = temp_file_id
                     finally:
                         Path(zip_path).unlink(missing_ok=True)
                 elif path_obj.is_file():
-                    temp_file_id = await self._upload_temp_file(data)
+                    temp_file_id = await self._upload_temp_file(
+                        data, **_identity_arguments(identity)
+                    )
                     request_data["temp_file_id"] = temp_file_id
                 else:
                     request_data["data"] = data
@@ -551,20 +678,26 @@ class AsyncHTTPClient(BaseClient):
         else:
             request_data["data"] = data
 
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/skills",
             json={**request_data, "telemetry": telemetry},
+            **self._request_options(identity),
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result"), response_data)
 
-    async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def wait_processed(
+        self, timeout: Optional[float] = None, *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Wait for all processing to complete."""
         http_timeout = timeout if timeout else 600.0
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/system/wait",
             json={"timeout": timeout},
             timeout=http_timeout,
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
@@ -579,10 +712,13 @@ class AsyncHTTPClient(BaseClient):
         abs_limit: int = 256,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
+        *,
+        identity: OVIdentity | None = None,
     ) -> List[Any]:
         """List directory contents."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             "/api/v1/fs/ls",
             params={
                 "uri": uri,
@@ -593,6 +729,7 @@ class AsyncHTTPClient(BaseClient):
                 "show_all_hidden": show_all_hidden,
                 "node_limit": node_limit,
             },
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
@@ -603,10 +740,13 @@ class AsyncHTTPClient(BaseClient):
         abs_limit: int = 128,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
+        *,
+        identity: OVIdentity | None = None,
     ) -> List[Dict[str, Any]]:
         """Get directory tree."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             "/api/v1/fs/tree",
             params={
                 "uri": uri,
@@ -615,53 +755,61 @@ class AsyncHTTPClient(BaseClient):
                 "show_all_hidden": show_all_hidden,
                 "node_limit": node_limit,
             },
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
-    async def stat(self, uri: str) -> Dict[str, Any]:
+    async def stat(self, uri: str, *, identity: OVIdentity | None = None) -> Dict[str, Any]:
         """Get resource status."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
-            "/api/v1/fs/stat",
-            params={"uri": uri},
+        response = await self._request(
+            "GET", "/api/v1/fs/stat", params={"uri": uri}, **self._request_options(identity)
         )
         return self._handle_response(response)
 
-    async def mkdir(self, uri: str, description: Optional[str] = None) -> None:
+    async def mkdir(
+        self, uri: str, description: Optional[str] = None, *, identity: OVIdentity | None = None
+    ) -> None:
         """Create directory."""
         uri = VikingURI.normalize(uri)
         payload = {"uri": uri}
         if description is not None:
             payload["description"] = description
-        response = await self._http.post(
-            "/api/v1/fs/mkdir",
-            json=payload,
+        response = await self._request(
+            "POST", "/api/v1/fs/mkdir", json=payload, **self._request_options(identity)
         )
         self._handle_response(response)
 
-    async def rm(self, uri: str, recursive: bool = False) -> None:
+    async def rm(
+        self, uri: str, recursive: bool = False, *, identity: OVIdentity | None = None
+    ) -> None:
         """Remove resource."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.request(
+        response = await self._request(
             "DELETE",
             "/api/v1/fs",
             params={"uri": uri, "recursive": recursive},
+            **self._request_options(identity),
         )
         self._handle_response(response)
 
-    async def mv(self, from_uri: str, to_uri: str) -> None:
+    async def mv(self, from_uri: str, to_uri: str, *, identity: OVIdentity | None = None) -> None:
         """Move resource."""
         from_uri = VikingURI.normalize(from_uri)
         to_uri = VikingURI.normalize(to_uri)
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/fs/mv",
             json={"from_uri": from_uri, "to_uri": to_uri},
+            **self._request_options(identity),
         )
         self._handle_response(response)
 
     # ============= Content Reading =============
 
-    async def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+    async def read(
+        self, uri: str, offset: int = 0, limit: int = -1, *, identity: OVIdentity | None = None
+    ) -> str:
         """Read file content.
 
         Args:
@@ -670,27 +818,33 @@ class AsyncHTTPClient(BaseClient):
             limit: Number of lines to read. -1 means read to end. Default -1.
         """
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             "/api/v1/content/read",
             params={"uri": uri, "offset": offset, "limit": limit},
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
-    async def abstract(self, uri: str) -> str:
+    async def abstract(self, uri: str, *, identity: OVIdentity | None = None) -> str:
         """Read L0 abstract."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             "/api/v1/content/abstract",
             params={"uri": uri},
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
-    async def overview(self, uri: str) -> str:
+    async def overview(self, uri: str, *, identity: OVIdentity | None = None) -> str:
         """Read L1 overview."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             "/api/v1/content/overview",
             params={"uri": uri},
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
@@ -702,11 +856,14 @@ class AsyncHTTPClient(BaseClient):
         wait: bool = False,
         timeout: Optional[float] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Write text content to an existing file and refresh semantics/vectors."""
         telemetry = self._validate_telemetry(telemetry)
         uri = VikingURI.normalize(uri)
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/content/write",
             json={
                 "uri": uri,
@@ -716,6 +873,7 @@ class AsyncHTTPClient(BaseClient):
                 "timeout": timeout,
                 "telemetry": telemetry,
             },
+            **self._request_options(identity),
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result") or {}, response_data)
@@ -732,6 +890,8 @@ class AsyncHTTPClient(BaseClient):
         filter: Optional[Dict[str, Any]] = None,
         context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> FindResult:
         """Semantic search without session context."""
         telemetry = self._validate_telemetry(telemetry)
@@ -746,9 +906,12 @@ class AsyncHTTPClient(BaseClient):
                 "filter": filter,
                 "context_type": context_type,
                 "telemetry": telemetry,
-            }
+            },
+            identity=identity,
         )
-        response = await self._http.post("/api/v1/search/find", json=payload)
+        response = await self._request(
+            "POST", "/api/v1/search/find", json=payload, **self._request_options(identity)
+        )
         response_data = self._handle_response_data(response)
         return FindResult.from_dict(response_data.get("result") or {})
 
@@ -764,6 +927,8 @@ class AsyncHTTPClient(BaseClient):
         filter: Optional[Dict[str, Any]] = None,
         context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> FindResult:
         """Semantic search with optional session context."""
         telemetry = self._validate_telemetry(telemetry)
@@ -780,9 +945,12 @@ class AsyncHTTPClient(BaseClient):
                 "filter": filter,
                 "context_type": context_type,
                 "telemetry": telemetry,
-            }
+            },
+            identity=identity,
         )
-        response = await self._http.post("/api/v1/search/search", json=payload)
+        response = await self._request(
+            "POST", "/api/v1/search/search", json=payload, **self._request_options(identity)
+        )
         response_data = self._handle_response_data(response)
         return FindResult.from_dict(response_data.get("result") or {})
 
@@ -793,6 +961,8 @@ class AsyncHTTPClient(BaseClient):
         case_insensitive: bool = False,
         node_limit: Optional[int] = None,
         exclude_uri: Optional[str] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Content search with pattern."""
         uri = VikingURI.normalize(uri)
@@ -805,53 +975,67 @@ class AsyncHTTPClient(BaseClient):
             request_json["node_limit"] = node_limit
         if exclude_uri is not None:
             request_json["exclude_uri"] = VikingURI.normalize(exclude_uri)
-        response = await self._http.post(
-            "/api/v1/search/grep",
-            json=request_json,
+        response = await self._request(
+            "POST", "/api/v1/search/grep", json=request_json, **self._request_options(identity)
         )
         return self._handle_response(response)
 
-    async def glob(self, pattern: str, uri: str = "viking://") -> Dict[str, Any]:
+    async def glob(
+        self, pattern: str, uri: str = "viking://", *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """File pattern matching."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/search/glob",
             json={"pattern": pattern, "uri": uri},
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
     # ============= Relations =============
 
-    async def relations(self, uri: str) -> List[Any]:
+    async def relations(self, uri: str, *, identity: OVIdentity | None = None) -> List[Any]:
         """Get relations for a resource."""
         uri = VikingURI.normalize(uri)
-        response = await self._http.get(
-            "/api/v1/relations",
-            params={"uri": uri},
+        response = await self._request(
+            "GET", "/api/v1/relations", params={"uri": uri}, **self._request_options(identity)
         )
         return self._handle_response(response)
 
-    async def link(self, from_uri: str, to_uris: Union[str, List[str]], reason: str = "") -> None:
+    async def link(
+        self,
+        from_uri: str,
+        to_uris: Union[str, List[str]],
+        reason: str = "",
+        *,
+        identity: OVIdentity | None = None,
+    ) -> None:
         """Create link between resources."""
         from_uri = VikingURI.normalize(from_uri)
         if isinstance(to_uris, str):
             to_uris = VikingURI.normalize(to_uris)
         else:
             to_uris = [VikingURI.normalize(u) for u in to_uris]
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/relations/link",
             json={"from_uri": from_uri, "to_uris": to_uris, "reason": reason},
+            **self._request_options(identity),
         )
         self._handle_response(response)
 
-    async def unlink(self, from_uri: str, to_uri: str) -> None:
+    async def unlink(
+        self, from_uri: str, to_uri: str, *, identity: OVIdentity | None = None
+    ) -> None:
         """Remove link between resources."""
         from_uri = VikingURI.normalize(from_uri)
         to_uri = VikingURI.normalize(to_uri)
-        response = await self._http.request(
+        response = await self._request(
             "DELETE",
             "/api/v1/relations/link",
             json={"from_uri": from_uri, "to_uri": to_uri},
+            **self._request_options(identity),
         )
         self._handle_response(response)
 
@@ -862,6 +1046,8 @@ class AsyncHTTPClient(BaseClient):
         session_id: Optional[str] = None,
         telemetry: TelemetryRequest = False,
         memory_policy: Optional[Dict[str, Any]] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Create a new session.
 
@@ -877,49 +1063,119 @@ class AsyncHTTPClient(BaseClient):
             json_body["memory_policy"] = memory_policy
         if telemetry is not False:
             json_body["telemetry"] = telemetry
-        response = await self._http.post(
-            "/api/v1/sessions",
-            json=json_body,
+        response = await self._request(
+            "POST", "/api/v1/sessions", json=json_body, **self._request_options(identity)
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result"), response_data)
 
-    async def list_sessions(self) -> List[Any]:
+    async def list_sessions(self, *, identity: OVIdentity | None = None) -> List[Any]:
         """List all sessions."""
-        response = await self._http.get("/api/v1/sessions")
+        response = await self._request("GET", "/api/v1/sessions", **self._request_options(identity))
         return self._handle_response(response)
 
-    async def get_session(self, session_id: str, *, auto_create: bool = False) -> Dict[str, Any]:
+    async def get_session(
+        self, session_id: str, *, auto_create: bool = False, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Get session details."""
         params = {}
         if auto_create:
             params["auto_create"] = "true"
-        response = await self._http.get(f"/api/v1/sessions/{session_id}", params=params)
+        response = await self._request(
+            "GET",
+            f"/api/v1/sessions/{session_id}",
+            params=params,
+            **self._request_options(identity),
+        )
         return self._handle_response(response)
 
     async def get_session_context(
-        self, session_id: str, token_budget: int = 128_000
+        self, session_id: str, token_budget: int = 128_000, *, identity: OVIdentity | None = None
     ) -> Dict[str, Any]:
         """Get assembled session context."""
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             f"/api/v1/sessions/{session_id}/context",
             params={"token_budget": token_budget},
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
-    async def get_session_archive(self, session_id: str, archive_id: str) -> Dict[str, Any]:
+    async def get_session_archive(
+        self, session_id: str, archive_id: str, *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Get one completed archive for a session."""
-        response = await self._http.get(
+        response = await self._request(
+            "GET",
             f"/api/v1/sessions/{session_id}/archives/{archive_id}",
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
-    async def delete_session(self, session_id: str) -> None:
+    async def read_tool_result(
+        self,
+        session_id: str,
+        tool_result_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 20_000,
+        identity: OVIdentity | None = None,
+    ) -> Dict[str, Any]:
+        """Read Unicode characters from a session's externalized tool result."""
+        from urllib.parse import quote
+
+        response = await self._request(
+            "GET",
+            f"/api/v1/sessions/{quote(session_id, safe='')}/tool-results/{quote(tool_result_id, safe='')}",
+            params={"offset": offset, "limit": limit},
+            **self._request_options(identity),
+        )
+        return self._handle_response(response)
+
+    async def search_tool_result(
+        self,
+        session_id: str,
+        tool_result_id: str,
+        *,
+        query: str,
+        limit: int = 20,
+        identity: OVIdentity | None = None,
+    ) -> Dict[str, Any]:
+        """Search within a session's externalized tool result."""
+        from urllib.parse import quote
+
+        response = await self._request(
+            "GET",
+            f"/api/v1/sessions/{quote(session_id, safe='')}/tool-results/{quote(tool_result_id, safe='')}/search",
+            params={"q": query, "limit": limit},
+            **self._request_options(identity),
+        )
+        return self._handle_response(response)
+
+    async def list_tool_results(
+        self, session_id: str, *, limit: int = 50, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
+        """List references in the current session."""
+        from urllib.parse import quote
+
+        response = await self._request(
+            "GET",
+            f"/api/v1/sessions/{quote(session_id, safe='')}/tool-results",
+            params={"limit": limit},
+            **self._request_options(identity),
+        )
+        return self._handle_response(response)
+
+    async def delete_session(self, session_id: str, *, identity: OVIdentity | None = None) -> None:
         """Delete a session."""
-        response = await self._http.delete(f"/api/v1/sessions/{session_id}")
+        response = await self._request(
+            "DELETE", f"/api/v1/sessions/{session_id}", **self._request_options(identity)
+        )
         self._handle_response(response)
 
-    async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+    async def get_task(
+        self, task_id: str, *, identity: OVIdentity | None = None
+    ) -> Optional[Dict[str, Any]]:
         """Query background task status.
 
         Args:
@@ -928,10 +1184,51 @@ class AsyncHTTPClient(BaseClient):
         Returns:
             Task info dict, or None if not found
         """
-        response = await self._http.get(f"/api/v1/tasks/{task_id}")
+        response = await self._request(
+            "GET",
+            f"/api/v1/tasks/{task_id}",
+            params=(
+                {}
+                if identity is None
+                else {"account_id": identity.account_id, "user_id": identity.user_id}
+            ),
+            **self._request_options(identity),
+        )
         if response.status_code == 404:
             return None
         return self._handle_response(response)
+
+    async def list_tasks(
+        self,
+        *,
+        task_type: str | None = None,
+        status: str | None = None,
+        resource_id: str | None = None,
+        limit: int = 50,
+        identity: OVIdentity | None = None,
+    ) -> list[dict[str, Any]]:
+        """Find persisted tasks for a session after rebuilding a Run's SDK."""
+        params: dict[str, Any] = {"limit": limit}
+        params.update(
+            {
+                key: value
+                for key, value in {
+                    "task_type": task_type,
+                    "status": status,
+                    "resource_id": resource_id,
+                }.items()
+                if value is not None
+            }
+        )
+        if identity is not None:
+            params.update(account_id=identity.account_id, user_id=identity.user_id)
+        response = await self._request(
+            "GET", "/api/v1/tasks", params=params, **self._request_options(identity)
+        )
+        result = self._handle_response(response)
+        if not isinstance(result, list):
+            raise ValueError("Task list response must be a list")
+        return result
 
     async def commit_session(
         self,
@@ -939,6 +1236,7 @@ class AsyncHTTPClient(BaseClient):
         telemetry: TelemetryRequest = False,
         *,
         keep_recent_count: int = 0,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
         telemetry = self._validate_telemetry(telemetry)
@@ -946,9 +1244,11 @@ class AsyncHTTPClient(BaseClient):
             "keep_recent_count": keep_recent_count,
             "telemetry": telemetry,
         }
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             f"/api/v1/sessions/{session_id}/commit",
             json=payload,
+            **self._request_options(identity),
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result"), response_data)
@@ -962,6 +1262,10 @@ class AsyncHTTPClient(BaseClient):
         created_at: str | None = None,
         peer_id: str | None = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
+        message_kind: str | None = None,
+        source_message_ids: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Add a message to a session.
 
@@ -988,13 +1292,19 @@ class AsyncHTTPClient(BaseClient):
             payload["created_at"] = created_at
         if peer_id is not None:
             payload["peer_id"] = peer_id
+        if message_kind is not None:
+            payload["message_kind"] = message_kind
+        if source_message_ids is not None:
+            payload["source_message_ids"] = source_message_ids
         if telemetry is not False:
             payload["telemetry"] = telemetry
-        payload = self._attach_legacy_message_scope(payload)
+        payload = self._attach_legacy_message_scope(payload, identity=identity)
 
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             f"/api/v1/sessions/{session_id}/messages",
             json=payload,
+            **self._request_options(identity),
         )
         response_data = self._handle_response_data(response)
         return self._attach_telemetry(response_data.get("result"), response_data)
@@ -1006,6 +1316,8 @@ class AsyncHTTPClient(BaseClient):
         uri: str,
         to: str,
         include_vectors: bool = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> str:
         """Export context as .ovpack file and save to local path.
 
@@ -1032,9 +1344,11 @@ class AsyncHTTPClient(BaseClient):
         to_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Request export and stream response
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/pack/export",
             json={"uri": uri, "include_vectors": include_vectors},
+            **self._request_options(identity),
         )
 
         # Check for errors
@@ -1047,7 +1361,9 @@ class AsyncHTTPClient(BaseClient):
 
         return str(to_path)
 
-    async def backup_ovpack(self, to: str, include_vectors: bool = False) -> str:
+    async def backup_ovpack(
+        self, to: str, include_vectors: bool = False, *, identity: OVIdentity | None = None
+    ) -> str:
         """Back up public scopes as a restore-only .ovpack file."""
         to_path = Path(to)
         if to_path.is_dir():
@@ -1057,9 +1373,11 @@ class AsyncHTTPClient(BaseClient):
 
         to_path.parent.mkdir(parents=True, exist_ok=True)
 
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/pack/backup",
             json={"include_vectors": include_vectors},
+            **self._request_options(identity),
         )
         if not response.is_success:
             self._handle_response(response)
@@ -1075,6 +1393,8 @@ class AsyncHTTPClient(BaseClient):
         parent: str,
         on_conflict: Optional[str] = None,
         vector_mode: Optional[str] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> str:
         """Import .ovpack file."""
         parent = VikingURI.normalize(parent)
@@ -1092,12 +1412,11 @@ class AsyncHTTPClient(BaseClient):
         if not file_path_obj.is_file():
             raise ValueError(f"Path {file_path} is not a file")
 
-        temp_file_id = await self._upload_temp_file(file_path)
+        temp_file_id = await self._upload_temp_file(file_path, **_identity_arguments(identity))
         request_data["temp_file_id"] = temp_file_id
 
-        response = await self._http.post(
-            "/api/v1/pack/import",
-            json=request_data,
+        response = await self._request(
+            "POST", "/api/v1/pack/import", json=request_data, **self._request_options(identity)
         )
         result = self._handle_response(response)
         return result.get("uri", "")
@@ -1107,6 +1426,8 @@ class AsyncHTTPClient(BaseClient):
         file_path: str,
         on_conflict: Optional[str] = None,
         vector_mode: Optional[str] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> str:
         """Restore backup .ovpack file."""
         request_data = {}
@@ -1121,30 +1442,33 @@ class AsyncHTTPClient(BaseClient):
         if not file_path_obj.is_file():
             raise ValueError(f"Path {file_path} is not a file")
 
-        temp_file_id = await self._upload_temp_file(file_path)
+        temp_file_id = await self._upload_temp_file(file_path, **_identity_arguments(identity))
         request_data["temp_file_id"] = temp_file_id
 
-        response = await self._http.post(
-            "/api/v1/pack/restore",
-            json=request_data,
+        response = await self._request(
+            "POST", "/api/v1/pack/restore", json=request_data, **self._request_options(identity)
         )
         result = self._handle_response(response)
         return result.get("uri", "")
 
     # ============= Debug =============
 
-    async def check_consistency(self, uri: str) -> Dict[str, Any]:
+    async def check_consistency(
+        self, uri: str, *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Check filesystem/vector-index consistency for a URI subtree."""
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/system/consistency",
             json={"uri": VikingURI.normalize(uri)},
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
     async def health(self) -> bool:
         """Check server health."""
         try:
-            response = await self._http.get("/health")
+            response = await self._request("GET", "/health")
             data = response.json()
             return data.get("status") == "ok"
         except Exception:
@@ -1155,15 +1479,19 @@ class AsyncHTTPClient(BaseClient):
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Trigger reindex for a URI."""
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/content/reindex",
             json={
                 "uri": uri,
                 "mode": mode,
                 "wait": wait,
             },
+            **self._request_options(identity),
         )
         return self._handle_response(response)
 
@@ -1171,29 +1499,30 @@ class AsyncHTTPClient(BaseClient):
 
     async def _get_queue_status(self) -> Dict[str, Any]:
         """Get queue system status (internal for _HTTPObserver)."""
-        response = await self._http.get("/api/v1/observer/queue")
+        response = await self._request("GET", "/api/v1/observer/queue")
         return self._handle_response(response)
 
     async def _get_vikingdb_status(self) -> Dict[str, Any]:
         """Get VikingDB status (internal for _HTTPObserver)."""
-        response = await self._http.get("/api/v1/observer/vikingdb")
+        response = await self._request("GET", "/api/v1/observer/vikingdb")
         return self._handle_response(response)
 
     async def _get_models_status(self) -> Dict[str, Any]:
         """Get models status (VLM, Embedding, Rerank) (internal for _HTTPObserver)."""
-        response = await self._http.get("/api/v1/observer/models")
+        response = await self._request("GET", "/api/v1/observer/models")
         return self._handle_response(response)
 
     async def _get_system_status(self) -> Dict[str, Any]:
         """Get system overall status (internal for _HTTPObserver)."""
-        response = await self._http.get("/api/v1/observer/system")
+        response = await self._request("GET", "/api/v1/observer/system")
         return self._handle_response(response)
 
     # ============= Admin =============
 
     async def admin_create_account(self, account_id: str, admin_user_id: str) -> Dict[str, Any]:
         """Create a new account with its first admin user."""
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             "/api/v1/admin/accounts",
             json={"account_id": account_id, "admin_user_id": admin_user_id},
         )
@@ -1201,19 +1530,20 @@ class AsyncHTTPClient(BaseClient):
 
     async def admin_list_accounts(self) -> List[Any]:
         """List all accounts."""
-        response = await self._http.get("/api/v1/admin/accounts")
+        response = await self._request("GET", "/api/v1/admin/accounts")
         return self._handle_response(response)
 
     async def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
         """Delete an account and all associated users."""
-        response = await self._http.delete(f"/api/v1/admin/accounts/{account_id}")
+        response = await self._request("DELETE", f"/api/v1/admin/accounts/{account_id}")
         return self._handle_response(response)
 
     async def admin_register_user(
         self, account_id: str, user_id: str, role: str = "user"
     ) -> Dict[str, Any]:
         """Register a new user in an account."""
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             f"/api/v1/admin/accounts/{account_id}/users",
             json={"user_id": user_id, "role": role},
         )
@@ -1221,17 +1551,20 @@ class AsyncHTTPClient(BaseClient):
 
     async def admin_list_users(self, account_id: str) -> List[Any]:
         """List all users in an account."""
-        response = await self._http.get(f"/api/v1/admin/accounts/{account_id}/users")
+        response = await self._request("GET", f"/api/v1/admin/accounts/{account_id}/users")
         return self._handle_response(response)
 
     async def admin_remove_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
         """Remove a user from an account."""
-        response = await self._http.delete(f"/api/v1/admin/accounts/{account_id}/users/{user_id}")
+        response = await self._request(
+            "DELETE", f"/api/v1/admin/accounts/{account_id}/users/{user_id}"
+        )
         return self._handle_response(response)
 
     async def admin_set_role(self, account_id: str, user_id: str, role: str) -> Dict[str, Any]:
         """Change a user's role."""
-        response = await self._http.put(
+        response = await self._request(
+            "PUT",
             f"/api/v1/admin/accounts/{account_id}/users/{user_id}/role",
             json={"role": role},
         )
@@ -1239,7 +1572,8 @@ class AsyncHTTPClient(BaseClient):
 
     async def admin_regenerate_key(self, account_id: str, user_id: str) -> Dict[str, Any]:
         """Regenerate a user's API key. Old key is immediately invalidated."""
-        response = await self._http.post(
+        response = await self._request(
+            "POST",
             f"/api/v1/admin/accounts/{account_id}/users/{user_id}/key",
         )
         return self._handle_response(response)
@@ -1247,7 +1581,7 @@ class AsyncHTTPClient(BaseClient):
     async def admin_migrate(self, cleanup: bool = False) -> Dict[str, Any]:
         """Start legacy data migration or legacy namespace cleanup."""
         action = "cleanup" if cleanup else "migrate"
-        response = await self._http.post("/api/v1/admin/migrate", json={"action": action})
+        response = await self._request("POST", "/api/v1/admin/migrate", json={"action": action})
         return self._handle_response(response)
 
     # ============= New methods for BaseClient interface =============
@@ -1277,7 +1611,7 @@ class AsyncHTTPClient(BaseClient):
             run_async(self.get_session(session_id))
         return Session(self, session_id, self._user)
 
-    async def session_exists(self, session_id: str) -> bool:
+    async def session_exists(self, session_id: str, *, identity: OVIdentity | None = None) -> bool:
         """Check whether a session exists in storage.
 
         Args:
@@ -1287,7 +1621,7 @@ class AsyncHTTPClient(BaseClient):
             True if the session exists, False otherwise
         """
         try:
-            await self.get_session(session_id)
+            await self.get_session(session_id, identity=identity)
             return True
         except NotFoundError:
             return False
