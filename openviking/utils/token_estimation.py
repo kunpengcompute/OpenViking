@@ -33,11 +33,16 @@ def _code_point_weight(code_point: int) -> float:
     return 0.25
 
 
+def text_token_weight(text: str | None) -> float:
+    """Return additive token weight before rounding, including rendered separators."""
+    if not text:
+        return 0.0
+    return sum(_code_point_weight(ord(char)) for char in text)
+
+
 def estimate_text_tokens(text: str | None) -> int:
     """Estimate tokens with a CJK-aware fallback."""
-    if not text:
-        return 0
-    return math.ceil(sum(_code_point_weight(ord(char)) for char in text))
+    return math.ceil(text_token_weight(text))
 
 
 def estimate_serialized_tokens(value: Any) -> int:
