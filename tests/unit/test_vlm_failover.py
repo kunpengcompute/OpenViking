@@ -195,7 +195,7 @@ class TestLegacyProvidersDictMigration:
         assert cfg.is_available() is True
 
     def test_providers_only_propagates_extra_fields(self):
-        """extra_headers / extra_request_body / api_version / stream all propagate."""
+        """extra_headers / extra_request_body / api_version all propagate."""
         cfg = VLMConfig(
             model="gpt-4o",
             providers={
@@ -205,7 +205,6 @@ class TestLegacyProvidersDictMigration:
                     "api_version": "2024-01-01",
                     "extra_headers": {"X-Trace": "1"},
                     "extra_request_body": {"foo": "bar"},
-                    "stream": True,
                 }
             },
         )
@@ -217,7 +216,6 @@ class TestLegacyProvidersDictMigration:
         assert cred.api_version == "2024-01-01"
         assert cred.extra_headers == {"X-Trace": "1"}
         assert cred.extra_request_body == {"foo": "bar"}
-        assert cred.stream is True
 
     def test_explicit_credentials_take_precedence_over_legacy(self):
         """When ``credentials`` is set, legacy providers dict is not migrated again."""
@@ -315,14 +313,13 @@ class TestLegacyProvidersDictMigration:
         assert cfg.is_available() is True
 
     def test_legacy_backup_propagates_extra_fields_via_match_provider(self):
-        """Backup migration via providers dict propagates extra_headers / stream / etc."""
+        """Backup migration via providers dict propagates provider-specific fields."""
         cfg = VLMConfig(
             model="gpt-4o",
             providers={
                 "openai": {
                     "api_key": "sk-primary",
                     "extra_headers": {"X-Trace": "p"},
-                    "stream": True,
                 }
             },
             backup=VLMConfig(
@@ -332,7 +329,6 @@ class TestLegacyProvidersDictMigration:
                         "api_key": "sk-backup",
                         "extra_headers": {"X-Trace": "b"},
                         "extra_request_body": {"foo": "bar"},
-                        "stream": False,
                     }
                 },
             ),
@@ -341,13 +337,11 @@ class TestLegacyProvidersDictMigration:
         primary = cfg.credentials[0]
         assert primary.api_key == "sk-primary"
         assert primary.extra_headers == {"X-Trace": "p"}
-        assert primary.stream is True
 
         backup = cfg.credentials[1]
         assert backup.api_key == "sk-backup"
         assert backup.extra_headers == {"X-Trace": "b"}
         assert backup.extra_request_body == {"foo": "bar"}
-        assert backup.stream is False
 
 
 class TestFailoverVLM:

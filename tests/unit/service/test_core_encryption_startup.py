@@ -8,9 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from openviking.pyagfs.exceptions import AGFSNotFoundError
+from openviking.pyagfs.exceptions import AGFSConfigError
 from openviking.service.core import OpenVikingService
-from openviking.utils.agfs_utils import RagfsBindingConfig
+from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+from openviking_cli.utils.config.agfs_config import AGFSConfig
 
 
 class _FakeConfig:
@@ -67,38 +68,33 @@ async def test_build_ragfs_binding_config_works_inside_running_event_loop(monkey
     assert isinstance(service._encryptor, _FakeEncryptor)
 
 
-@pytest.mark.parametrize(
-    ("encrypted_mode", "raw", "message"),
-    [
-        (True, b"{}", "plaintext"),
-        (False, b"OVE1ciphertext", "encrypted"),
-    ],
-)
-def test_probe_storage_shape_rejects_mode_mismatch(encrypted_mode, raw, message):
-    """Reject existing system metadata whose shape differs from current encryption mode."""
-
-    class _Client:
-        def read_raw(self, path: str) -> bytes:
-            assert path == "/local/_system/accounts.json"
-            return raw
-
-    service = OpenVikingService.__new__(OpenVikingService)
-
-    with pytest.raises(RuntimeError, match=message):
-        service._probe_storage_shape(_Client(), encrypted_mode)
+def _storage_config(tmp_path, encrypted):
+    return RagfsBindingConfig(
+        agfs=AGFSConfig(backend="local", path=str(tmp_path)),
+        root_key=b"k" * 32 if encrypted else None,
+        provider_type=1 if encrypted else None,
+    )
 
 
-def test_probe_storage_shape_allows_empty_system():
-    """Treat missing system metadata as a fresh system."""
+@pytest.mark.parametrize("encrypted_mode", [False, True])
+def test_binding_rejects_storage_encryption_mode_change(tmp_path, encrypted_mode):
+    """RAGFS validates physical storage shape when mounting an existing backend."""
+    original = create_agfs_client(_storage_config(tmp_path, not encrypted_mode))
+    guard = tmp_path / "viking" / "backend_meta.json"
+    before = guard.read_bytes()
+    with pytest.raises(AGFSConfigError, match="storage shape mismatch"):
+        create_agfs_client(_storage_config(tmp_path, encrypted_mode))
+    assert guard.read_bytes() == before
+    assert original is not None
 
-    class _Client:
-        def read_raw(self, path: str) -> bytes:
-            assert path == "/local/_system/accounts.json"
-            raise AGFSNotFoundError("not found")
 
-    service = OpenVikingService.__new__(OpenVikingService)
-
-    service._probe_storage_shape(_Client(), encrypted_mode=True)
+@pytest.mark.parametrize("encrypted_mode", [False, True])
+def test_binding_allows_empty_storage(tmp_path, encrypted_mode):
+    """A new backend receives a shape guard matching the requested encryption mode."""
+    client = create_agfs_client(_storage_config(tmp_path, encrypted_mode))
+    assert client is not None
+    guard = (tmp_path / "viking" / "backend_meta.json").read_bytes()
+    assert guard.startswith(b"OVE1") == encrypted_mode
 
 
 def test_ensure_data_dir_lock_acquired_once(monkeypatch, tmp_path):

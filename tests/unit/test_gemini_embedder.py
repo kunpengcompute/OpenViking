@@ -292,13 +292,19 @@ class TestGeminiDenseEmbedderAsyncBatch:
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_client.aio.models.embed_content = AsyncMock(
-            side_effect=APIError(500, {}, response=mock_response)
+            side_effect=[
+                APIError(500, {}, response=mock_response),
+                _make_mock_result([[0.1]]),
+                _make_mock_result([[0.2]]),
+            ]
         )
-        mock_client.models.embed_content.return_value = _make_mock_result([[0.1]])
-        embedder = GeminiDenseEmbedder("gemini-embedding-2-preview", api_key="key", dimension=1)
+        embedder = GeminiDenseEmbedder(
+            "gemini-embedding-2-preview", api_key="key", dimension=1, config={"max_retries": 0}
+        )
         results = await embedder.async_embed_batch(["a", "b"])
         assert len(results) == 2
-        assert mock_client.models.embed_content.call_count == 2
+        assert mock_client.aio.models.embed_content.await_count == 3
+        assert [result.dense_vector for result in results] == [[0.1], [0.2]]
 
     @patch("openviking.models.embedder.gemini_embedders.genai.Client")
     @pytest.mark.anyio
@@ -308,15 +314,19 @@ class TestGeminiDenseEmbedderAsyncBatch:
         embedder = GeminiDenseEmbedder("gemini-embedding-2-preview", api_key="key")
         assert await embedder.async_embed_batch([]) == []
 
-    @patch("openviking.models.embedder.gemini_embedders._ANYIO_AVAILABLE", False)
     @patch("openviking.models.embedder.gemini_embedders.genai.Client")
     @pytest.mark.anyio
-    async def test_async_embed_batch_raises_without_anyio(self, mock_client_class):
+    async def test_async_embed_batch_uses_native_asyncio_without_anyio_flag(
+        self, mock_client_class
+    ):
         from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
 
-        embedder = GeminiDenseEmbedder("gemini-embedding-2-preview", api_key="key")
-        with pytest.raises(ImportError, match="anyio is required"):
-            await embedder.async_embed_batch(["text"])
+        client = mock_client_class.return_value
+        client.aio.models.embed_content = AsyncMock(return_value=_make_mock_result([[0.3]]))
+        embedder = GeminiDenseEmbedder("gemini-embedding-2-preview", api_key="key", dimension=1)
+        results = await embedder.async_embed_batch(["text"])
+        assert [result.dense_vector for result in results] == [[0.3]]
+        client.aio.models.embed_content.assert_awaited_once()
 
 
 class TestGeminiValidation:
