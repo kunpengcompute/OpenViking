@@ -456,7 +456,8 @@ class OpenVikingBuildExt(build_ext):
 
         self.spawn([self.cmake_executable] + cmake_args)
 
-        build_args = ["--build", str(build_dir), "--config", "Release", f"-j{os.cpu_count() or 4}"]
+        jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or str(os.cpu_count() or 4)
+        build_args = ["--build", str(build_dir), "--config", "Release", "--parallel", jobs]
         self.spawn([self.cmake_executable] + build_args)
 
 
