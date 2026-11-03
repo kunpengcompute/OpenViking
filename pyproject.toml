@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+[project]
+name = "openviking-patch-tools"
+version = "0.1.0"
+description = "OpenViking master branch patch delivery tools"
+requires-python = ">=3.10"
+# Patch 工具使用 Python 标准库，Git 由 CI 镜像提供。
+dependencies = []
+
+[project.optional-dependencies]
+# 现有流水线通过这两个 extra 同步依赖。
+test = []
+gemini = []
+
+[tool.uv]
+package = false

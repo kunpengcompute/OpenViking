@@ -1,0 +1,11 @@
+version = 1
+revision = 5
+requires-python = ">=3.10"
+
+[[package]]
+name = "openviking-patch-tools"
+version = "0.1.0"
+source = { virtual = "." }
+
+[package.metadata]
+provides-extras = ["test", "gemini"]
