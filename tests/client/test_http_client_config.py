@@ -16,6 +16,10 @@ class FakeSearchHTTP:
     def __init__(self):
         self.calls: list[tuple[str, dict[str, object]]] = []
 
+    async def request(self, method, url, **kwargs):
+        assert method == "POST"
+        return await self.post(httpx.URL(url).path, kwargs["json"])
+
     async def post(self, path: str, json: dict[str, object]):
         self.calls.append((path, json))
         return httpx.Response(
@@ -167,6 +171,7 @@ async def test_async_http_client_sends_configured_identity_headers(tmp_path, mon
     monkeypatch.setattr("openviking_cli.client.http.httpx.AsyncClient", FakeAsyncClient)
 
     client = AsyncHTTPClient(
+        auth_mode="trusted",
         url="http://explicit-host:1933",
         api_key="explicit-key",
         account="explicit-account",

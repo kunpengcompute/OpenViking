@@ -5,6 +5,7 @@
 
 import json
 
+import httpx
 import pytest
 
 from openviking_cli.client.http import AsyncHTTPClient
@@ -14,6 +15,13 @@ from openviking_cli.utils.config import OPENVIKING_CLI_CONFIG_ENV
 class _FakeHTTPClient:
     def __init__(self):
         self.calls = []
+
+    async def request(self, method, url, **kwargs):
+        assert method == "POST"
+        return await self.post(
+            httpx.URL(url).path,
+            **{key: value for key, value in kwargs.items() if key in ("json", "files", "data")},
+        )
 
     async def post(self, path, json=None, files=None, data=None):
         self.calls.append({"path": path, "json": json, "files": files, "data": data})
