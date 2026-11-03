@@ -314,6 +314,7 @@ async def test_get_session_context_includes_incomplete_archive_messages(
     )
     commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
     assert commit_resp.status_code == 200
+    await _wait_for_task(client, commit_resp.json()["result"]["task_id"])
 
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     session = service.sessions.session(ctx, session_id)
@@ -793,7 +794,7 @@ async def test_extract_session_jsonable_regression(client: httpx.AsyncClient, se
     assert body["result"] == [{"uri": "viking://user/memories/mock.md"}]
 
 
-async def test_get_session_context_endpoint_returns_trimmed_latest_archive_and_messages(
+async def test_get_session_context_endpoint_requires_complete_summary_budget(
     client: httpx.AsyncClient,
 ):
     create_resp = await client.post("/api/v1/sessions", json={})
@@ -827,12 +828,14 @@ async def test_get_session_context_endpoint_returns_trimmed_latest_archive_and_m
     )
 
     resp = await client.get(f"/api/v1/sessions/{session_id}/context?token_budget=1")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "ok"
+    assert resp.status_code == 429
+    assert resp.json()["error"]["code"] == "RESOURCE_EXHAUSTED"
 
-    result = body["result"]
-    assert result["latest_archive_overview"] == ""
+    resp = await client.get(f"/api/v1/sessions/{session_id}/context?token_budget=128000")
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    assert result["latest_archive_overview"]
+    assert result["latest_finished_archive_id"] == "archive_001"
     assert result["pre_archive_abstracts"] == []
     assert len(result["messages"]) == 1
     assert result["messages"][0]["role"] == "assistant"
@@ -840,10 +843,6 @@ async def test_get_session_context_endpoint_returns_trimmed_latest_archive_and_m
         part["type"] == "tool" and part["tool_id"] == "tool_123"
         for part in result["messages"][0]["parts"]
     )
-    assert result["stats"]["totalArchives"] == 1
-    assert result["stats"]["includedArchives"] == 0
-    assert result["stats"]["droppedArchives"] == 1
-    assert result["stats"]["failedArchives"] == 0
 
 
 async def test_get_session_archive_endpoint_returns_archive_details(client: httpx.AsyncClient):
