@@ -8,7 +8,7 @@ import os
 import zipfile
 from typing import Any, Optional
 
-from openviking.core.namespace import context_type_for_uri, relative_uri_path
+from openviking.core.namespace import context_type_for_uri, is_session_uri, relative_uri_path
 from openviking.server.identity import RequestContext
 from openviking.storage.index_consistency import check_index_consistency
 from openviking.storage.ovpack.format import (
@@ -38,7 +38,6 @@ from openviking.storage.ovpack.manifest import (
     validate_manifest_root_matches_zip,
 )
 from openviking.storage.ovpack.policy import (
-    NON_VECTOR_SCOPES,
     PUBLIC_SCOPES,
     backup_scopes_from_manifest,
     is_backup_package,
@@ -68,6 +67,8 @@ from openviking_cli.utils.logger import get_logger
 from openviking_cli.utils.uri import VikingURI
 
 logger = get_logger(__name__)
+
+OPTIONAL_SEMANTIC_SIDECARS = frozenset({".abstract.md", ".overview.md"})
 
 
 def _index_records_by_level(
@@ -148,6 +149,38 @@ def _exportable_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return exportable
 
 
+def _is_optional_semantic_sidecar(entry: dict[str, Any]) -> bool:
+    if entry.get("isDir"):
+        return False
+    rel_path = str(entry.get("rel_path") or "")
+    return leaf_name(rel_path) in OPTIONAL_SEMANTIC_SIDECARS
+
+
+async def _filter_existing_optional_sidecars(
+    viking_fs,
+    root_uri: str,
+    entries: list[dict[str, Any]],
+    ctx: RequestContext,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for entry in entries:
+        if not _is_optional_semantic_sidecar(entry):
+            filtered.append(entry)
+            continue
+
+        rel_path = str(entry.get("rel_path") or "")
+        uri = entry.get("uri") or join_uri(root_uri, rel_path)
+        try:
+            exists = await viking_fs.exists(uri, ctx=ctx)
+        except Exception:
+            exists = False
+        if exists:
+            filtered.append(entry)
+        else:
+            logger.info(f"[ovpack] Skipping missing semantic sidecar: {uri}")
+    return filtered
+
+
 async def _enqueue_direct_vectorization(
     viking_fs,
     uri: str,
@@ -155,6 +188,10 @@ async def _enqueue_direct_vectorization(
     index_records: Optional[list[dict[str, Any]]] = None,
     manifest_path_root_uri: Optional[str] = None,
 ) -> None:
+    if is_session_uri(uri):
+        logger.info(f"[ovpack] Skipped vectorization for session namespace: {uri}")
+        return
+
     index_records = index_records or []
     manifest_path_root_uri = manifest_path_root_uri or uri
     entries = await viking_fs.tree(uri, node_limit=None, level_limit=None, ctx=ctx)
@@ -163,6 +200,8 @@ async def _enqueue_direct_vectorization(
     for entry in entries:
         entry_uri = entry.get("uri")
         if not entry_uri:
+            continue
+        if is_session_uri(entry_uri):
             continue
         rel_path = entry.get("rel_path") or relative_uri_path(uri, entry_uri)
         manifest_rel_path = relative_uri_path(manifest_path_root_uri, entry_uri)
@@ -284,7 +323,7 @@ async def import_ovpack(
 
         index_records = validate_manifest_content(zf, manifest, infolist, base_name)
         dense_vectors = read_dense_vectors(zf, manifest, base_name, index_records)
-        if VikingURI(root_uri).scope not in NON_VECTOR_SCOPES:
+        if not is_session_uri(root_uri):
             vector_action = choose_vector_restore_action(
                 manifest,
                 index_records,
@@ -312,7 +351,7 @@ async def import_ovpack(
 
     logger.info(f"[ovpack] Successfully imported {file_path} to {root_uri}")
 
-    if VikingURI(root_uri).scope not in NON_VECTOR_SCOPES:
+    if not is_session_uri(root_uri):
         if vector_action == "restore":
             await restore_vector_snapshot(vector_store, root_uri, index_records, dense_vectors, ctx)
             logger.info(f"[ovpack] Restored vector snapshot for: {root_uri}")
@@ -325,7 +364,7 @@ async def import_ovpack(
             )
             logger.info(f"[ovpack] Enqueued direct vectorization for: {root_uri}")
     else:
-        logger.info(f"[ovpack] Skipped vectorization for non-vector scope: {root_uri}")
+        logger.info(f"[ovpack] Skipped vectorization for session namespace: {root_uri}")
 
     return root_uri
 
@@ -475,6 +514,7 @@ async def export_ovpack(
             ctx=ctx,
         )
     )
+    entries = await _filter_existing_optional_sidecars(viking_fs, uri, entries, ctx)
     if include_vectors:
         ensure_dense_snapshot_supported(vector_store)
         report = await check_index_consistency(
@@ -529,6 +569,7 @@ async def backup_ovpack(
         to = ensure_ovpack_extension(to)
 
     entries = await _backup_entries(viking_fs, ctx)
+    entries = await _filter_existing_optional_sidecars(viking_fs, "viking://", entries, ctx)
     if include_vectors:
         ensure_dense_snapshot_supported(vector_store)
         report = await check_index_consistency(
@@ -652,9 +693,6 @@ async def restore_ovpack(
         return root_uri
 
     for scope in backup_scopes:
-        if scope in NON_VECTOR_SCOPES:
-            logger.info(f"[ovpack] Skipped vectorization for non-vector scope: {scope}")
-            continue
         scope_uri = f"viking://{scope}"
         await _enqueue_direct_vectorization(
             viking_fs,

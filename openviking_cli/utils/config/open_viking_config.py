@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -50,6 +50,54 @@ def _get_config_warning_logger():
     return logging.getLogger(__name__)
 
 
+class ParserApiConfig(BaseModel):
+    """Configuration for the Understanding files/responses API."""
+
+    enable: bool = False
+    extensions: List[str] = Field(default_factory=list)
+    host: str = ""
+    api_key: str = ""
+    enable_resumable_upload: bool = False
+    upload_simple_max_bytes: int = 512 * 1024 * 1024
+    upload_part_size_bytes: int = 8 * 1024 * 1024
+    http_timeout_seconds: float = 10.0
+    response_timeout_seconds: int = 1800
+    poll_interval_ms: int = 3000
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _normalize_and_validate(self) -> "ParserApiConfig":
+        normalized_extensions: List[str] = []
+        for ext in self.extensions or []:
+            s = str(ext).strip().lower()
+            if not s:
+                continue
+            if s.startswith("."):
+                s = s[1:]
+            normalized_extensions.append(s)
+        self.extensions = normalized_extensions
+
+        if self.enable:
+            if not self.host.strip():
+                raise ValueError("parser_api.host is required when parser_api.enable=true")
+            if not self.api_key.strip():
+                raise ValueError("parser_api.api_key is required when parser_api.enable=true")
+        if self.host and "://" not in self.host:
+            raise ValueError("parser_api.host must include scheme (e.g., https://...)")
+        if self.upload_simple_max_bytes <= 0:
+            raise ValueError("parser_api.upload_simple_max_bytes must be > 0")
+        if self.upload_part_size_bytes <= 0:
+            raise ValueError("parser_api.upload_part_size_bytes must be > 0")
+        if self.http_timeout_seconds <= 0:
+            raise ValueError("parser_api.http_timeout_seconds must be > 0")
+        if self.response_timeout_seconds <= 0:
+            raise ValueError("parser_api.response_timeout_seconds must be > 0")
+        if self.poll_interval_ms <= 0:
+            raise ValueError("parser_api.poll_interval_ms must be > 0")
+        return self
+
+
 class OpenVikingConfig(BaseModel):
     """Main configuration for OpenViking."""
 
@@ -57,7 +105,10 @@ class OpenVikingConfig(BaseModel):
         default="default", description="Default account identifier"
     )
     default_user: Optional[str] = Field(default="default", description="Default user identifier")
-    default_agent: Optional[str] = Field(default="default", description="Default agent identifier")
+    default_agent: Optional[str] = Field(
+        default=None,
+        description="Deprecated and ignored. User is the only data-plane identity.",
+    )
 
     storage: StorageConfig = Field(
         default_factory=StorageConfig, description="Storage configuration"
@@ -68,6 +119,14 @@ class OpenVikingConfig(BaseModel):
     )
 
     vlm: VLMConfig = Field(default_factory=VLMConfig, description="VLM configuration")
+
+    query_planner: Optional[VLMConfig] = Field(
+        default=None,
+        description=(
+            "Optional lightweight model configuration for retrieval intent analysis and query "
+            "planning. Falls back to vlm when unset or empty."
+        ),
+    )
 
     rerank: RerankConfig = Field(default_factory=RerankConfig, description="Rerank configuration")
 
@@ -118,6 +177,11 @@ class OpenVikingConfig(BaseModel):
     semantic: SemanticConfig = Field(
         default_factory=SemanticConfig,
         description="Semantic processing configuration (overview/abstract limits)",
+    )
+
+    parser_api: ParserApiConfig = Field(
+        default_factory=ParserApiConfig,
+        description="Third-party parser API configuration (files/responses)",
     )
 
     auto_generate_l0: bool = Field(
@@ -254,16 +318,16 @@ class OpenVikingConfig(BaseModel):
 
             # Apply memory configuration
             if memory_config_data is not None:
-                if (
-                    isinstance(memory_config_data, dict)
-                    and "agent_scope_mode" in memory_config_data
-                ):
-                    _get_config_warning_logger().warning(
-                        "memory.agent_scope_mode is deprecated and ignored. "
-                        "User/agent namespace behavior is now controlled by per-account "
-                        "namespace policy."
-                    )
-                instance.memory = MemoryConfig.from_dict(memory_config_data)
+                try:
+                    instance.memory = MemoryConfig.from_dict(memory_config_data)
+                except ValidationError as e:
+                    raise ValueError(
+                        format_validation_error(
+                            root_model=MemoryConfig,
+                            error=e,
+                            path_prefix="memory",
+                        )
+                    ) from e
 
             # Apply parser configurations
             for parser_type, parser_data in parser_configs.items():
@@ -292,6 +356,12 @@ class OpenVikingConfig(BaseModel):
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
         return self.model_dump()
+
+    def get_query_planner(self) -> VLMConfig:
+        """Return the model config used for retrieval intent analysis and query planning."""
+        if self.query_planner is not None and self.query_planner._has_any_config():
+            return self.query_planner
+        return self.vlm
 
 
 class OpenVikingConfigSingleton:
@@ -488,7 +558,6 @@ def initialize_openviking_config(
         # Set user if provided, like a email address or a account_id
         config.default_account = user._account_id
         config.default_user = user._user_id
-        config.default_agent = user._agent_id
 
     # Configure storage based on provided parameters
     if path:
