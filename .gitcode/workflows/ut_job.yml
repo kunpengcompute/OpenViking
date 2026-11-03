@@ -1,0 +1,61 @@
+name: UT Job
+
+on:
+  workflow_call:
+    inputs:
+      runs_on_flavor:
+        required: true
+        type: string
+      docker_img:
+        required: true
+        type: string
+      pr_id:
+        required: true
+        type: string
+      branch:            # PR 目标分支
+        required: true
+        type: string
+      default_branch:    # 默认分支（脚本回退用的检出位置）
+        required: true
+        type: string
+
+jobs:
+  JOB_UT:
+    name: UT
+    select: selected_by_default
+    runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, "large" ]
+    container:
+      image: ${{ inputs.docker_img }}
+    steps:
+      - name: fast_checkout
+        identifier: fast_checkout
+        uses: checkout
+        with:
+          allow-unsafe-pr-checkout: true
+          ref: refs/merge-requests/${{ inputs.pr_id }}/merge
+      - name: checkout_default_scripts   # 预合入代码缺脚本时用默认分支副本
+        uses: checkout
+        with:
+          ref: ${{ inputs.default_branch }}
+          path: base-scripts
+      - name: setup_deps   # 复用镜像内预建的 /opt/ov-venv；严格模式：lock 过期则直接失败
+        run: |-
+          set -euo pipefail
+          ln -sfn /opt/ov-venv .venv
+          uv sync --frozen --inexact --no-install-project --extra test --extra gemini
+      - name: ut   # ut 作业自行准备环境（形态①独立构建：编译扩展 + editable 安装）
+        run: |-
+          export UV_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple
+          export UV_DEFAULT_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
+          export UV_HTTP_TIMEOUT=600
+          export UV_HTTP_RETRIES=5
+          export OV_SKIP_UV_SYNC=1   # 依赖与构建后端已由 setup_deps 装好
+          if [ -f ut_ci.sh ]; then
+            bash ut_ci.sh
+          elif [ -f base-scripts/ut_ci.sh ]; then
+            mkdir -p .gitcode/scripts
+            cp base-scripts/ut_ci.sh ut_ci.sh
+            bash ut_ci.sh
+          else
+            echo "ERROR: ut_ci.sh 在预合入代码和基分支中均不存在"; exit 1
+          fi
