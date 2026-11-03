@@ -5,9 +5,6 @@ on: # 自动触发工作流运行的触发条件
   pull_request_target:          # MR 事件触发
     types: ["open", "reopen", "update"]
     branches: [ "*" ]
-  pr_comment:                    # PR 评论触发
-    types: [ created ]
-    keyword: '^(?:\/)?compile*'
   pull_request_comment:          # 标准 PR 评论触发事件
     types: [created]
     branches: [ '*' ]
@@ -21,12 +18,12 @@ concurrency: # 并发控制（GitCode 原生语法）
     enable: true
     events: [mr_id]
 
+permissions:
   project: read
   repository: read
   id-token: write
   pr: write
   note: write
-
 env:
   pr_id: ${{ atomgit.event.pull_request.number }}
   branch: ${{ atomgit.event.pull_request.base.ref }}
