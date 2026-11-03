@@ -5,7 +5,7 @@
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.peer_id import normalize_peer_selector
@@ -16,6 +16,7 @@ from openviking.server.identity import AuthMode, RequestContext
 from openviking.server.models import ErrorInfo, Response
 from openviking.server.responses import error_response
 from openviking.server.telemetry import run_operation
+from openviking.session.tool_views import add_messages_with_tool_views_async
 from openviking.telemetry import TelemetryRequest
 from openviking_cli.utils import get_logger
 
@@ -90,7 +91,18 @@ class AddMessageRequest(BaseModel):
     content: Optional[str] = None
     parts: Optional[List[Dict[str, Any]]] = None
     created_at: Optional[str] = None
+    message_kind: Optional[
+        Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
+    ] = None
+    source_message_ids: Optional[List[str]] = None
     telemetry: TelemetryRequest = False
+
+    @field_validator("source_message_ids")
+    @classmethod
+    def validate_source_message_ids(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is not None and any(not item.strip() for item in value):
+            raise ValueError("source_message_ids must contain non-empty strings")
+        return value
 
     @model_validator(mode="after")
     def validate_content_or_parts(self) -> "AddMessageRequest":
@@ -240,6 +252,7 @@ async def get_session(
     result["uri"] = session.uri
     result["user"] = session.user.to_dict()
     result["pending_tokens"] = int(session.meta.pending_tokens or 0)
+    result["latest_finished_archive_id"] = await session.get_latest_finished_archive_id()
     return Response(status="ok", result=result)
 
 
@@ -320,8 +333,7 @@ async def get_session_context(
         )
 
     service = get_service()
-    session = await service.sessions.get(session_id, _ctx, auto_create=False)
-    result = await session.get_session_context(token_budget=token_budget)
+    result = await service.sessions.get_context(session_id, _ctx, token_budget=token_budget)
     return Response(status="ok", result=_to_jsonable(result))
 
 
@@ -493,14 +505,12 @@ async def batch_add_messages(
                     "parts": parts,
                     "peer_id": msg_request.peer_id,
                     "created_at": msg_request.created_at,
+                    "message_kind": msg_request.message_kind,
+                    "source_message_ids": msg_request.source_message_ids,
                 }
             )
-        msgs = session.add_messages(specs)
-        return {
-            "session_id": session_id,
-            "message_count": len(session.messages),
-            "added": len(msgs),
-        }
+        result = await add_messages_with_tool_views_async(session, specs)
+        return result
 
     execution = await run_operation(
         operation="session.batch_add_messages",

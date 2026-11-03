@@ -16,19 +16,34 @@ from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.service.task_store import SYSTEM_TASK_ACCOUNT_ID, SYSTEM_TASK_USER_ID
 from openviking.service.task_tracker import get_task_tracker
-from openviking_cli.exceptions import OpenVikingError
+from openviking_cli.exceptions import InvalidArgumentError, OpenVikingError, PermissionDeniedError
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
+
+
+def _scoped_owner(
+    ctx: RequestContext, account_id: str | None, user_id: str | None
+) -> tuple[str | None, str | None]:
+    if (account_id is None) != (user_id is None):
+        raise InvalidArgumentError("Task account_id and user_id must be provided together")
+    if ctx.role != Role.ROOT:
+        if account_id is not None and (account_id, user_id) != (ctx.account_id, ctx.user.user_id):
+            raise PermissionDeniedError("Task owner must match authenticated identity")
+        return ctx.account_id, ctx.user.user_id
+    return account_id, user_id
 
 
 @router.get("/tasks/{task_id}")
 async def get_task(
     task_id: str,
+    account_id: Optional[str] = Query(None, min_length=1, description="Exact task owner account"),
+    user_id: Optional[str] = Query(None, min_length=1, description="Exact task owner user"),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Get the status of a single background task."""
     tracker = get_task_tracker()
-    if _ctx.role == Role.ROOT:
+    account_id, user_id = _scoped_owner(_ctx, account_id, user_id)
+    if _ctx.role == Role.ROOT and account_id is None:
         task = await tracker.get(task_id)
         if task is None:
             task = await tracker.get(
@@ -39,8 +54,8 @@ async def get_task(
     else:
         task = await tracker.get(
             task_id,
-            account_id=_ctx.account_id,
-            user_id=_ctx.user.user_id,
+            account_id=account_id,
+            user_id=user_id,
         )
     if not task:
         raise OpenVikingError(
@@ -59,11 +74,14 @@ async def list_tasks(
     ),
     resource_id: Optional[str] = Query(None, description="Filter by resource ID (e.g. session_id)"),
     limit: int = Query(50, le=200, description="Max results"),
+    account_id: Optional[str] = Query(None, min_length=1, description="Exact task owner account"),
+    user_id: Optional[str] = Query(None, min_length=1, description="Exact task owner user"),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """List background tasks with optional filters."""
     tracker = get_task_tracker()
-    if _ctx.role == Role.ROOT:
+    account_id, user_id = _scoped_owner(_ctx, account_id, user_id)
+    if _ctx.role == Role.ROOT and account_id is None:
         system_tasks = await tracker.list_tasks(
             task_type=task_type,
             status=status,
@@ -87,7 +105,7 @@ async def list_tasks(
             status=status,
             resource_id=resource_id,
             limit=limit,
-            account_id=_ctx.account_id,
-            user_id=_ctx.user.user_id,
+            account_id=account_id,
+            user_id=user_id,
         )
     return Response(status="ok", result=[t.to_dict() for t in tasks])
