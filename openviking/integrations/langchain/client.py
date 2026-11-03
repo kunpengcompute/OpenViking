@@ -66,6 +66,8 @@ class OpenVikingConnection:
     actor_peer_id: str | None = None
     path: str | None = None
     timeout: float = 60.0
+    auth_mode: str = "trusted"
+    http_client: Any = None
     extra_headers: dict[str, str] | None = None
     auto_initialize: bool = True
 
