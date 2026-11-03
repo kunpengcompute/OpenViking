@@ -1,5 +1,6 @@
 """Budget formulas and bounded operation observations."""
 
+import logging
 from copy import deepcopy
 
 import pytest
@@ -70,7 +71,12 @@ def test_latency_is_bounded_and_partitioned_by_status():
     assert rows["error"]["count"] == 1
 
 
-def test_observation_sink_failure_does_not_break_the_operation(caplog):
+def test_observation_sink_failure_does_not_break_the_operation(caplog, monkeypatch):
+    logger = logging.getLogger("openviking.integrations.langchain.ov_context.metrics")
+    caplog.set_level(logging.WARNING, logger=logger.name)
+    monkeypatch.setattr(logger, "disabled", False)
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+
     def broken(event, **fields):
         raise OSError("unavailable")
 
