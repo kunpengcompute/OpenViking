@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0
+
 import importlib.util
 import json
 import sys
