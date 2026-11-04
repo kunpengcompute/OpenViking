@@ -219,5 +219,3 @@ curl -fsS -H "X-API-Key: $OPENVIKING_API_KEY" "$OV_HOST/metrics" \
 在测试窗口前后各抓一次 `/metrics`：`requests_total` 的 `result="hit"` 增加，表示命中文件或目录缓存；`backend_fallbacks_total` 增加，表示缓存未命中后成功读取 LocalFS。它不覆盖所有后端操作，也不等于底层磁盘 I/O 次数。Redis 自身的命中数同样不能代替文件缓存命中率。
 
 LocalFS 本身可能很快，尤其文件已经进入操作系统页缓存时，访问 Redis 的开销可能抵消收益，甚至增加时延，应如实记录。两轮使用相同磁盘和数据，不额外清理某一组的系统页缓存。测试时还要留意 Redis 内存及淘汰、本机 CPU 和网络。目录可能包含隐藏元数据，总 entry 超过 4096 时不会缓存该目录。
-
-配套测试脚本位于 `ov_cache_test` 目录。更多指标操作可参考 [/metrics 实测说明](ov_cache_test/metrics-cache-guide.md)，缓存配置说明见 [RAGFS 缓存指南](https://github.com/volcengine/OpenViking/blob/main/docs/zh/guides/14-ragfs-cache.md)。
