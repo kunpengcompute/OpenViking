@@ -1,3 +1,4 @@
+from openviking_cli.retrieve.context import ContextEntry, ContextSearchResult, RecallPolicy
 from openviking_cli.retrieve.types import (
     ContextType,
     FindResult,
@@ -9,6 +10,9 @@ from openviking_cli.retrieve.types import (
 )
 
 __all__ = [
+    "ContextEntry",
+    "ContextSearchResult",
+    "RecallPolicy",
     # Types
     "ContextType",
     "TypedQuery",

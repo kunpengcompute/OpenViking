@@ -353,13 +353,17 @@ class LocalClient(BaseClient):
         until: Optional[str] = None,
         time_field: Optional[str] = None,
         level: Optional[List[int]] = None,
+        **context_options: Any,
     ) -> Any:
         """Semantic search with optional session context."""
+        from openviking_cli.retrieve.context import ContextSearchOptions
+
+        options = ContextSearchOptions(**context_options)
         resolved_filter = _resolve_search_filter(filter, context_type, since, until, time_field)
 
         async def _search():
             session = None
-            if session_id:
+            if session_id and options.mode == "list":
                 session = self._service.sessions.session(self._ctx, session_id)
                 await session.load()
             return await self._service.search.search(
@@ -371,6 +375,7 @@ class LocalClient(BaseClient):
                 score_threshold=score_threshold,
                 filter=resolved_filter,
                 level=level,
+                **options.context_kwargs(),
             )
 
         execution = await run_with_telemetry(

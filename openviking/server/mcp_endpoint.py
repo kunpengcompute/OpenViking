@@ -238,12 +238,18 @@ async def search(
     limit: int = 10,
     min_score: float = 0.35,
     level: Optional[List[int]] = None,
+    mode: Literal["list", "context"] = "list",
+    quotas: Optional[dict[str, int]] = None,
+    detail: str | dict[str, str] | None = None,
+    max_tokens: int = 1600,
+    exclude_uris: Optional[List[str]] = None,
+    recall_policy: Optional[dict[str, Any]] = None,
 ) -> str:
-    """Deep semantic retrieval with optional session context and intent analysis. Returns ranked memories, resources, and skills with URI, abstract, and score."""
+    """Retrieve ranked hits (list) or budgeted text (context). Context mode uses the original query and never loads a session or invokes intent analysis."""
     service = get_service()
     ctx = _get_ctx()
     session = None
-    if session_id:
+    if session_id and mode == "list":
         session = service.sessions.session(ctx, session_id)
         await session.load()
     result = await service.search.search(
@@ -254,7 +260,21 @@ async def search(
         limit=limit,
         score_threshold=min_score,
         level=level,
+        **(
+            {
+                "mode": mode,
+                "quotas": quotas,
+                "detail": detail,
+                "max_tokens": max_tokens,
+                "exclude_uris": exclude_uris or [],
+                "recall_policy": recall_policy,
+            }
+            if mode == "context"
+            else {}
+        ),
     )
+    if mode == "context":
+        return result["rendered"]
     return _format_search_result(result)
 
 

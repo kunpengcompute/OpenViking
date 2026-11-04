@@ -186,6 +186,7 @@ class BaseClient(ABC):
         filter: Optional[Dict] = None,
         context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
+        **context_options: Any,
     ) -> Any:
         """Semantic search with optional session context."""
         ...

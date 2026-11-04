@@ -40,6 +40,7 @@ from openviking_cli.exceptions import (
     UnimplementedError,
     VLMFailedError,
 )
+from openviking_cli.retrieve.context import ContextSearchResult
 from openviking_cli.retrieve.types import FindResult
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger, run_async
@@ -929,8 +930,13 @@ class AsyncHTTPClient(BaseClient):
         telemetry: TelemetryRequest = False,
         *,
         identity: OVIdentity | None = None,
-    ) -> FindResult:
+        mode: str = "list",
+        **context_options: Any,
+    ) -> Union[FindResult, "ContextSearchResult"]:
         """Semantic search with optional session context."""
+        from openviking_cli.retrieve.context import ContextSearchOptions, parse_context_result
+
+        options = ContextSearchOptions(mode=mode, **context_options)
         telemetry = self._validate_telemetry(telemetry)
         normalized_target = self._normalize_target_uri(target_uri)
         actual_limit = node_limit if node_limit is not None else limit
@@ -948,10 +954,13 @@ class AsyncHTTPClient(BaseClient):
             },
             identity=identity,
         )
+        payload.update(options.context_kwargs())
         response = await self._request(
             "POST", "/api/v1/search/search", json=payload, **self._request_options(identity)
         )
         response_data = self._handle_response_data(response)
+        if options.mode == "context":
+            return parse_context_result(response_data.get("result"))
         return FindResult.from_dict(response_data.get("result") or {})
 
     async def grep(
