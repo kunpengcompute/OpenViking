@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-# 在 CI 镜像内执行：bash scripts/ut_ci.sh [pytest 用例路径及参数]
+# 在 CI 镜像内执行：bash ut_ci.sh [pytest 用例路径及参数]
 # UT_SCOPE=unit|gate|full；OV_SKIP_BUILD=1 复用本作业已验证的编译结果。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_DIR="$(cd "${OV_SOURCE_DIR:-$SCRIPT_DIR/..}" && pwd)"
+SOURCE_DIR="$(cd "${OV_SOURCE_DIR:-$SCRIPT_DIR}" && pwd)"
 cd "$SOURCE_DIR"
 [[ -f pyproject.toml && -d tests/unit ]] || {
     echo 'ERROR: OV_SOURCE_DIR 必须指向完整的 OpenViking 源码目录' >&2; exit 2;

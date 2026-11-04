@@ -7,14 +7,14 @@ docker pull swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler24.03_lts_s
 docker run --rm --cpus=8 --memory=24g \
   -v "$PWD:/work" -w /work \
   swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler24.03_lts_sp3:OpenViking_26.3.0.04 \
-  bash -lc 'bash scripts/build_ci.sh && OV_SKIP_BUILD=1 bash scripts/ut_ci.sh'
+  bash -lc 'bash build_ci.sh && OV_SKIP_BUILD=1 bash ut_ci.sh'
 ```
 
 在 dev 分支的流水线容器内执行：
 
 ```bash
-bash scripts/build_ci.sh
-OV_SKIP_BUILD=1 bash scripts/ut_ci.sh
+bash build_ci.sh
+OV_SKIP_BUILD=1 bash ut_ci.sh
 ```
 
 `build_ci.sh` 按 `uv.lock` 同步依赖，通过项目构建后端编译 Rust CLI、RAGFS 绑定和 C++ VectorDB，生成 wheel，并验证原生模块加载及 wheel 内的必需产物。`ut_ci.sh` 默认自行构建后执行 `tests/unit` 全集；同一作业已完成编译时通过 `OV_SKIP_BUILD=1` 复用产物。
@@ -34,7 +34,7 @@ OV_SKIP_BUILD=1 bash scripts/ut_ci.sh
 指定用例及 pytest 参数：
 
 ```bash
-OV_SKIP_BUILD=1 bash scripts/ut_ci.sh tests/unit/ov_context -x
+OV_SKIP_BUILD=1 bash ut_ci.sh tests/unit/ov_context -x
 ```
 
-测试失败、收集失败或零用例均保留 pytest 退出码，作为门禁失败处理。`full` 范围使用对应集成测试所需的服务与配置。流水线自动识别 dev 分支 `scripts/` 下的两个入口。
+测试失败、收集失败或零用例均保留 pytest 退出码，作为门禁失败处理。`full` 范围使用对应集成测试所需的服务与配置。流水线调用 dev 分支仓库根目录的 `build_ci.sh` 和 `ut_ci.sh`。

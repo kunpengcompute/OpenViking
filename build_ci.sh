@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-# 在 CI 镜像内执行：bash scripts/build_ci.sh
+# 在 CI 镜像内执行：bash build_ci.sh
 # OV_SOURCE_DIR：待编译源码；UV_PROJECT_ENVIRONMENT：虚拟环境；REPORT_DIR：产物目录。
 # OV_SKIP_UV_SYNC=1：复用流水线已同步的依赖；CI_BUILD_JOBS：原生编译并行度。
 set -euo pipefail
 
-SOURCE_DIR="$(cd "${OV_SOURCE_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd)"
+SOURCE_DIR="$(cd "${OV_SOURCE_DIR:-$(dirname "${BASH_SOURCE[0]}")}" && pwd)"
 cd "$SOURCE_DIR"
 [[ -f setup.py && -f pyproject.toml && -f Cargo.toml ]] || {
     echo 'ERROR: OV_SOURCE_DIR 必须指向完整的 OpenViking 源码目录' >&2; exit 2;
