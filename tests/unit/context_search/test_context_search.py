@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from openviking.client.local import LocalClient
+from openviking.integrations.ov_memoryRetrieve import MemoryReaderConfig, OVContextReader
 from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.models.embedder.query_cache import query_embed_cache_scope
 from openviking.retrieve.intent_analyzer import IntentAnalyzer
@@ -948,3 +949,239 @@ async def test_list_mode_rejects_context_only_options_without_retrieving(api, op
         await sdk.search("q", **options)
     assert not fs.calls
     fs.search.assert_not_called()
+
+
+@pytest.mark.parametrize("config", [None, MemoryReaderConfig()])
+async def test_reader_default_context_has_one_find_one_embedding_no_session(
+    api, monkeypatch, config
+):
+    fs, service, sdk = api
+    search = AsyncMock(wraps=sdk.search)
+    monkeypatch.setattr(sdk, "search", search)
+    monkeypatch.setattr(
+        sdk, "find", AsyncMock(side_effect=AssertionError("Default must use search"))
+    )
+    reader = OVContextReader(sdk) if config is None else OVContextReader(sdk, config)
+    assert reader.config.search_mode == "context"
+    result = await reader.recall("  original query  ", session_id="ignored-session")
+    assert result.status == "success" and result.count == 5
+    assert len(fs.calls) == 1 and fs.embedder.calls == 1
+    assert fs.calls[0][0] == "  original query  "
+    assert fs.calls[0][2] == "viking://user/memories" and fs.calls[0][3] == 20
+    assert not fs.reads and len(result.content) <= 4000
+    search.assert_awaited_once()
+    assert search.await_args.kwargs["mode"] == "context"
+    sdk.find.assert_not_awaited()
+    service.sessions.session.assert_not_called()
+    fs.search.assert_not_called()
+    IntentAnalyzer.analyze.assert_not_called()
+
+
+async def test_reader_four_buckets_share_embedding_and_read_complete_experience(api):
+    fs, service, sdk = api
+    cfg = MemoryReaderConfig(
+        search_mode="context",
+        experience_enabled=True,
+        recall_quotas={"events": 2, "entities": 1, "preferences": 1, "experiences": 1},
+    )
+    result = await OVContextReader(sdk, cfg).recall("hello", session_id="ignored")
+    assert result.status == "success" and result.count == 5
+    assert len(fs.calls) == 8 and fs.embedder.calls == 1
+    assert "recorded request ID" in result.content
+    assert 'type="experiences"' in result.content
+    assert all("/experiences/" in uri for uri, _ in fs.reads)
+    assert all(call[0] == "hello" for call in fs.calls)
+    service.sessions.session.assert_not_called()
+
+
+async def test_reader_custom_scopes_and_other_memory_types_are_preserved(api):
+    fs, _, sdk = api
+    cfg = MemoryReaderConfig(
+        search_mode="context", target_uris=("viking://user/alice/memories/cases",)
+    )
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.count == 1 and "/cases/0.md" in result.content
+    assert fs.calls[0][2] == cfg.target_uris[0]
+
+
+async def test_reader_multiple_reader_scopes_share_one_embedding(api):
+    fs, _, sdk = api
+    cfg = MemoryReaderConfig(
+        search_mode="context",
+        target_uris=(
+            "viking://user/alice/memories/cases",
+            "viking://user/alice/memories/preferences",
+        ),
+    )
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.count == 3
+    assert len(fs.calls) == 2 and fs.embedder.calls == 1
+
+
+async def test_reader_context_scope_failure_can_return_other_scope_results(api, monkeypatch):
+    fs, _, sdk = api
+    original = fs.find
+
+    async def find(query, *, target_uri, **kwargs):
+        if target_uri.endswith("/unavailable"):
+            raise RuntimeError("offline scope")
+        return await original(query, target_uri=target_uri, **kwargs)
+
+    monkeypatch.setattr(fs, "find", find)
+    cfg = MemoryReaderConfig(
+        search_mode="context",
+        target_uris=(
+            "viking://user/alice/memories/unavailable",
+            "viking://user/alice/memories/cases",
+        ),
+    )
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.status == "success" and result.count == 1
+
+
+async def test_reader_auth_errors_are_raised_but_optional_failures_are_diagnosed(api):
+    fs, _, sdk = api
+    reader = OVContextReader(sdk, MemoryReaderConfig(search_mode="context"))
+    fs.error = PermissionDeniedError("forbidden")
+    with pytest.raises(PermissionDeniedError):
+        await reader.recall("q")
+    fs.error = RuntimeError("unavailable")
+    assert (await reader.recall("q")).status == "error"
+
+
+async def test_reader_timeout_cleans_up_shared_embedding(api):
+    fs, _, sdk = api
+    fs.embedder.release.clear()
+    cfg = MemoryReaderConfig(
+        search_mode="context", recall_timeout=0.03, recall_quotas={"events": 1, "preferences": 1}
+    )
+    assert (await OVContextReader(sdk, cfg).recall("q")).status == "timeout"
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert fs.embedder.cancelled == 1
+
+
+async def test_reader_memories_quota_rejected_at_reader_sdk_service_and_http(api):
+    fs, service, sdk = api
+    from openviking_cli.exceptions import InvalidArgumentError
+
+    with pytest.raises(ValueError):
+        MemoryReaderConfig(search_mode="context", recall_quotas={"memories": 1})
+    with pytest.raises(ValueError):
+        await sdk.search("q", mode="context", quotas={"memories": 1})
+    with pytest.raises(InvalidArgumentError):
+        await service.search.search("q", ctx=context(), mode="context", quotas={"memories": 1})
+    response = await sdk._http.post(
+        "http://fixture/api/v1/search/search",
+        json={"query": "q", "mode": "context", "quotas": {"memories": 1}},
+    )
+    assert response.status_code == 422
+    assert not fs.calls and fs.embedder.calls == 0
+    assert ContextSearchOptions(mode="context", detail={"memories": "abstract"}).detail
+
+
+async def test_reader_recalls_all_six_buckets_with_local_skill_roots(api):
+    fs, _, sdk = api
+    fs.extra_items = [
+        hit("viking://user/alice/resources/guide.md", ContextType.RESOURCE),
+        hit("viking://user/alice/skills/deploy/SKILL.md", ContextType.SKILL),
+        hit("viking://user/alice/memories/skills/usage.md"),
+        hit("viking://user/bob/skills/private/SKILL.md", ContextType.SKILL, 0.99),
+    ]
+    quotas = dict.fromkeys(
+        ("events", "entities", "preferences", "experiences", "resources", "skills"), 1
+    )
+    cfg = MemoryReaderConfig(search_mode="context", recall_quotas=quotas, recall_limit=1)
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.status == "success" and result.count == 6
+    for category in quotas:
+        assert f'type="{category}"' in result.content
+    assert "usage.md" not in result.content and "/bob/" not in result.content
+    targets = {c[2] for c in fs.calls}
+    assert "viking://user/alice/skills" in targets
+    assert "viking://agent/skills" not in targets
+    assert fs.embedder.calls == 1
+
+
+async def test_reader_quota_scope_prevents_named_and_nested_category_starvation(api):
+    fs, _, sdk = api
+    fs.categories = {"events": 50, "preferences": 1}
+    fs.extra_items = [
+        hit(f"viking://user/alice/memories/custom/preferences/{i}.md", score=0.99)
+        for i in range(50)
+    ]
+    cfg = MemoryReaderConfig(
+        search_mode="context", candidate_limit=20, recall_quotas={"preferences": 1}
+    )
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.count == 1 and "/memories/preferences/0.md" in result.content
+    assert all(c[2].endswith("/memories/preferences") for c in fs.calls)
+
+
+@pytest.mark.parametrize(
+    "target", ["viking://user/alice/memories", "viking://user/alice/memories/cases"]
+)
+async def test_reader_explicit_memory_scope_never_expands_to_resources_or_skills(api, target):
+    fs, _, sdk = api
+    cfg = MemoryReaderConfig(
+        search_mode="context",
+        target_uris=(target,),
+        recall_quotas={"resources": 1, "skills": 1},
+    )
+    assert (await OVContextReader(sdk, cfg).recall("q")).status == "empty"
+    assert not fs.calls
+
+
+async def test_reader_quotas_override_legacy_switches_and_counts_but_preserve_budgets(api):
+    _, _, sdk = api
+    cfg = MemoryReaderConfig(
+        search_mode="context",
+        enabled=False,
+        experience_enabled=False,
+        recall_limit=0,
+        experience_limit=0,
+        candidate_limit=1,
+        experience_candidate_limit=1,
+        recall_quotas={"events": 6, "experiences": 2},
+        recall_max_tokens=8000,
+    )
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.count == 8
+    limited = MemoryReaderConfig(
+        search_mode="context",
+        recall_quotas={"events": 6},
+        max_injected_chars=1,
+    )
+    assert (await OVContextReader(sdk, limited).recall("q")).count == 0
+
+
+async def test_reader_flat_recall_keeps_other_memory_category_but_skips_profile_and_preset_root(
+    api,
+):
+    fs, _, sdk = api
+    fs.categories = {"trajectories": 1, "tools": 1, "skills": 1, "custom": 1}
+    root = "viking://user/alice/memories"
+    fs.extra_items = [hit(f"{root}/{name}.md") for name in ("profile", "identity", "soul")]
+    fs.extra_items += [
+        hit(f"{root}/{name}.md", level=level)
+        for name, level in ((".abstract", 0), (".overview", 1))
+    ]
+    fs.extra_items += [hit(f"{root}/custom/experiences/nested.md")]
+    cfg = MemoryReaderConfig(
+        search_mode="context",
+        recall_limit=20,
+        recall_detail={"memories": "abstract"},
+    )
+    result = await OVContextReader(sdk, cfg).recall("q")
+    assert result.count == 7
+    assert "profile.md" not in result.content
+    assert "/memories/.abstract.md" not in result.content
+    assert "/memories/.overview.md" not in result.content
+    assert result.content.count('type="memories"') == 7
+
+
+async def test_reader_explicit_empty_reader_scope_disables_quota_search(api):
+    fs, _, sdk = api
+    cfg = MemoryReaderConfig(search_mode="context", target_uris=(), recall_quotas={"events": 1})
+    assert (await OVContextReader(sdk, cfg).recall("q")).status == "empty"
+    assert not fs.calls
