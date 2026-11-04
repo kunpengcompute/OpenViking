@@ -585,6 +585,33 @@ async def test_add_message_request_persists_peer_id(service, monkeypatch):
     assert session.messages[-1].peer_id == "assistant-b"
 
 
+@pytest.mark.parametrize(
+    "role,message_kind,source_message_ids",
+    [
+        ("user", "user_query", ["original-user-id"]),
+        ("assistant", "checkpoint", ["original-ai-id", "original-tool-id"]),
+    ],
+)
+async def test_add_message_persists_source_metadata(
+    service, monkeypatch, role, message_kind, source_message_ids
+):
+    session_id = "source-metadata"
+    ctx = RequestContext(user=UserIdentifier("acct_trusted", "caller"), role=Role.USER)
+    payload = _message_request(role, content="preserve source", peer_id="mail-agent")
+    payload.update(message_kind=message_kind, source_message_ids=source_message_ids)
+
+    response = await _call_add_message_route(
+        service, monkeypatch, ctx=ctx, payload=payload, session_id=session_id
+    )
+
+    assert response.result["message_count"] == 1
+    session = await service.sessions.get(session_id, ctx, auto_create=False)
+    stored = session.messages[-1]
+    assert stored.message_kind == message_kind
+    assert stored.source_message_ids == source_message_ids
+    assert stored.peer_id == "mail-agent"
+
+
 async def test_add_multiple_messages(client: httpx.AsyncClient):
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]
