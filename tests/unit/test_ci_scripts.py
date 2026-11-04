@@ -2,13 +2,14 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -109,3 +110,22 @@ def test_invalid_test_settings_fail_the_job(ci_env, key, value):
     assert result.returncode == 2
     assert key in result.stdout
     assert not Path(ci_env["ARGS_FILE"]).exists()
+
+
+@pytest.mark.parametrize("script", ["build_ci.sh", "ut_ci.sh"])
+def test_root_entrypoints_resolve_source_and_sibling_build(ci_env, tmp_path, script):
+    source = Path(ci_env["OV_SOURCE_DIR"])
+    for name in ("build_ci.sh", "ut_ci.sh"):
+        shutil.copy2(SCRIPTS / name, source / name)
+    env = {key: value for key, value in ci_env.items() if key != "OV_SOURCE_DIR"}
+    env["OV_SKIP_BUILD"] = "0"
+    result = subprocess.run(
+        ["bash", str(source / script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 17, result.stdout + result.stderr
+    assert "退出码 17" in result.stdout
