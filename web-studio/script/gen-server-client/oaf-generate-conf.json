@@ -1,8 +1,0 @@
-{
-  "output": "./script/gen-server-client/generate/openapi-formatted.json",
-  "sort": true,
-  "generateSet": {
-    "operationIdTemplate": "<pathRef>",
-    "overwriteExisting": true
-  }
-}
