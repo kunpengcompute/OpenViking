@@ -465,6 +465,8 @@ async def add_message(
                     "parts": parts,
                     "peer_id": request.peer_id,
                     "created_at": request.created_at,
+                    "message_kind": request.message_kind,
+                    "source_message_ids": request.source_message_ids,
                 }
             ]
         )
