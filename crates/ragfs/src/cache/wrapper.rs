@@ -1,6 +1,7 @@
 //! A transparent [`FileSystem`](crate::FileSystem) cache wrapper.
 
 use super::envelope::{CacheEnvelope, CacheObjectKind, GenerationSnapshot};
+use super::query::QueryCache;
 use super::{CacheMetrics, CachePolicy, CacheTraversalMode};
 use crate::cache_runtime::{CacheError, CacheResult, CacheRuntime, SetOptions, SetResult};
 use crate::core::filesystem::{
@@ -17,7 +18,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use regex::Regex;
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
@@ -61,6 +65,7 @@ pub struct CachedFileSystem {
     bypass_scopes: RwLock<Vec<String>>,
     generation_epoch: u64,
     generations: RwLock<HashMap<String, u64>>,
+    queries: QueryCache,
 }
 
 impl CachedFileSystem {
@@ -80,17 +85,26 @@ impl CachedFileSystem {
         namespace: CacheNamespace,
         policy: CachePolicy,
     ) -> Self {
+        let metrics = Arc::new(CacheMetrics::default());
+        let generation_epoch = nonzero_random_u64();
+        let queries = QueryCache::new(
+            namespace.as_str(),
+            generation_epoch,
+            Arc::clone(&runtime),
+            Arc::clone(&metrics),
+        );
         Self {
             backend,
             runtime,
             namespace,
             policy,
-            metrics: Arc::new(CacheMetrics::default()),
+            metrics,
             operation_lock: RwLock::new(()),
             inflight: Mutex::new(HashMap::new()),
             bypass_scopes: RwLock::new(Vec::new()),
-            generation_epoch: nonzero_random_u64(),
+            generation_epoch,
             generations: RwLock::new(HashMap::new()),
+            queries,
         }
     }
 
@@ -984,12 +998,87 @@ impl CachedFileSystem {
         }
     }
 
+    async fn cached_query<T, F>(&self, path: &str, op: &str, params: Value, load: F) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync,
+        F: Future<Output = Result<T>> + Send,
+    {
+        if !self.policy.cache_directory(path) || self.is_runtime_bypassed(path).await {
+            return load.await;
+        }
+        self.queries.get_or_load(path, op, params, load).await
+    }
+
+    async fn read_dir_cached(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<ListSortBy>,
+        sort_order: Option<SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
+        if !self.policy.cache_directory(path) || self.is_runtime_bypassed(path).await {
+            self.metrics.policy_bypass();
+            return self
+                .backend
+                .read_dir(path, offset, limit, sort_by, sort_order)
+                .await;
+        }
+
+        let _operation_guard = self.operation_lock.read().await;
+        if self.is_runtime_bypassed(path).await {
+            self.metrics.policy_bypass();
+            return self
+                .backend
+                .read_dir(path, offset, limit, sort_by, sort_order)
+                .await;
+        }
+
+        let normalized = normalize_path(path);
+        let key = self.directory_key(&normalized);
+        if let Some(entries) = self.probe_directory(&key, &normalized, true).await {
+            return Ok(apply_read_dir_options(
+                entries, offset, limit, sort_by, sort_order,
+            ));
+        }
+        self.metrics.read_dir_miss();
+
+        let (inflight, leader) = self.acquire_inflight(&key).await;
+        if leader {
+            self.metrics.inflight_leader();
+        } else {
+            self.metrics.inflight_follower();
+        }
+        let inflight_guard = inflight.lock().await;
+
+        if !leader {
+            if let Some(entries) = self.probe_directory(&key, &normalized, false).await {
+                self.metrics.inflight_backend_saved();
+                drop(inflight_guard);
+                self.release_inflight(&key, &inflight).await;
+                return Ok(apply_read_dir_options(
+                    entries, offset, limit, sort_by, sort_order,
+                ));
+            }
+        }
+
+        let entries = self.backend.read_dir(path, None, None, None, None).await;
+        if let Ok(value) = &entries {
+            self.metrics.backend_fallback(0);
+            self.fill_directory(&key, &normalized, value).await;
+        }
+        drop(inflight_guard);
+        self.release_inflight(&key, &inflight).await;
+        entries.map(|entries| apply_read_dir_options(entries, offset, limit, sort_by, sort_order))
+    }
+
     async fn invalidate_path_objects(&self, path: &str) {
         self.cache_delete(&self.file_key(path), path).await;
         self.cache_delete(&self.directory_key(path), path).await;
     }
 
     async fn invalidate_parent_directory(&self, path: &str) {
+        self.queries.invalidate(path).await;
         let parent = parent_path(path);
         self.cache_delete(&self.directory_key(&parent), &parent)
             .await;
@@ -1136,63 +1225,22 @@ impl FileSystem for CachedFileSystem {
         sort_by: Option<ListSortBy>,
         sort_order: Option<SortOrder>,
     ) -> Result<Vec<FileInfo>> {
-        if !self.policy.cache_directory(path) || self.is_runtime_bypassed(path).await {
-            self.metrics.policy_bypass();
-            return self
-                .backend
-                .read_dir(path, offset, limit, sort_by, sort_order)
-                .await;
-        }
+        self.cached_query(
+            path,
+            "read_dir",
+            json!([offset, limit, sort_by, sort_order]),
+            self.read_dir_cached(path, offset, limit, sort_by, sort_order),
+        )
+        .await
+    }
 
-        let _operation_guard = self.operation_lock.read().await;
-        if self.is_runtime_bypassed(path).await {
-            self.metrics.policy_bypass();
-            return self
-                .backend
-                .read_dir(path, offset, limit, sort_by, sort_order)
-                .await;
-        }
-
-        let normalized = normalize_path(path);
-        let key = self.directory_key(&normalized);
-        if let Some(entries) = self.probe_directory(&key, &normalized, true).await {
-            return Ok(apply_read_dir_options(
-                entries, offset, limit, sort_by, sort_order,
-            ));
-        }
-        self.metrics.read_dir_miss();
-
-        let (inflight, leader) = self.acquire_inflight(&key).await;
-        if leader {
-            self.metrics.inflight_leader();
-        } else {
-            self.metrics.inflight_follower();
-        }
-        let inflight_guard = inflight.lock().await;
-
-        if !leader {
-            if let Some(entries) = self.probe_directory(&key, &normalized, false).await {
-                self.metrics.inflight_backend_saved();
-                drop(inflight_guard);
-                self.release_inflight(&key, &inflight).await;
-                return Ok(apply_read_dir_options(
-                    entries, offset, limit, sort_by, sort_order,
-                ));
-            }
-        }
-
-        let entries = self.backend.read_dir(path, None, None, None, None).await;
-        if let Ok(value) = &entries {
-            self.metrics.backend_fallback(0);
-            self.fill_directory(&key, &normalized, value).await;
-        }
-        drop(inflight_guard);
-        self.release_inflight(&key, &inflight).await;
-        entries.map(|entries| apply_read_dir_options(entries, offset, limit, sort_by, sort_order))
+    async fn read_internal_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
+        self.backend.read_internal_dir(path).await
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo> {
-        self.backend.stat(path).await
+        self.cached_query(path, "stat", json!([]), self.backend.stat(path))
+            .await
     }
 
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
@@ -1242,6 +1290,7 @@ impl FileSystem for CachedFileSystem {
     async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> Result<()> {
         let _guard = self.operation_lock.write().await;
         self.backend.ensure_parent_dirs(path, mode).await?;
+        self.queries.invalidate(&parent_path(path)).await;
         for scope in ancestor_scopes(&parent_path(path)) {
             self.cache_delete(&self.directory_key(&scope), &scope).await;
         }
@@ -1254,13 +1303,30 @@ impl FileSystem for CachedFileSystem {
         pattern: &str,
         options: GrepOptions<'_>,
     ) -> Result<GrepResult> {
-        if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
-            && !self.wraps_multiwrite()
-        {
-            return self.grep_via_cache(path, pattern, options).await;
-        }
+        self.cached_query(
+            path,
+            "grep",
+            json!([
+                pattern,
+                options.recursive,
+                options.case_insensitive,
+                options.node_limit,
+                options.exclude_path,
+                options.level_limit,
+                options.before_context,
+                options.after_context
+            ]),
+            async {
+                if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
+                    && !self.wraps_multiwrite()
+                {
+                    return self.grep_via_cache(path, pattern, options).await;
+                }
 
-        self.backend.grep(path, pattern, options).await
+                self.backend.grep(path, pattern, options).await
+            },
+        )
+        .await
     }
 
     async fn tree_directory(
@@ -1274,35 +1340,51 @@ impl FileSystem for CachedFileSystem {
         sort_order: Option<SortOrder>,
         directories_only: bool,
     ) -> Result<Vec<TreeEntry>> {
-        if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
-            && !self.wraps_multiwrite()
-        {
-            return self
-                .tree_directory_via_cache(
-                    path,
-                    show_hidden,
-                    node_limit,
-                    level_limit,
-                    offset,
-                    sort_by,
-                    sort_order,
-                    directories_only,
-                )
-                .await;
-        }
-
-        self.backend
-            .tree_directory(
-                path,
+        self.cached_query(
+            path,
+            "tree_directory",
+            json!([
                 show_hidden,
                 node_limit,
                 level_limit,
                 offset,
                 sort_by,
                 sort_order,
-                directories_only,
-            )
-            .await
+                directories_only
+            ]),
+            async {
+                if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
+                    && !self.wraps_multiwrite()
+                {
+                    return self
+                        .tree_directory_via_cache(
+                            path,
+                            show_hidden,
+                            node_limit,
+                            level_limit,
+                            offset,
+                            sort_by,
+                            sort_order,
+                            directories_only,
+                        )
+                        .await;
+                }
+
+                self.backend
+                    .tree_directory(
+                        path,
+                        show_hidden,
+                        node_limit,
+                        level_limit,
+                        offset,
+                        sort_by,
+                        sort_order,
+                        directories_only,
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     async fn glob_directory(
@@ -1314,20 +1396,34 @@ impl FileSystem for CachedFileSystem {
         level_limit: Option<usize>,
         continuation_token: Option<String>,
     ) -> Result<GlobPage> {
-        self.backend
-            .glob_directory(
-                path,
+        self.cached_query(
+            path,
+            "glob_directory",
+            json!([
                 pattern,
                 show_hidden,
                 page_size,
                 level_limit,
-                continuation_token,
-            )
-            .await
+                continuation_token
+            ]),
+            async {
+                self.backend
+                    .glob_directory(
+                        path,
+                        pattern,
+                        show_hidden,
+                        page_size,
+                        level_limit,
+                        continuation_token,
+                    )
+                    .await
+            },
+        )
+        .await
     }
 }
 
-fn normalize_path(path: &str) -> String {
+pub(super) fn normalize_path(path: &str) -> String {
     if path.is_empty() || path == "/" {
         "/".to_string()
     } else {
@@ -1352,7 +1448,7 @@ fn parent_path(path: &str) -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
-fn ancestor_scopes(path: &str) -> Vec<String> {
+pub(super) fn ancestor_scopes(path: &str) -> Vec<String> {
     let normalized = normalize_path(path);
     if normalized == "/" {
         return vec!["/".to_string()];
@@ -1376,7 +1472,7 @@ fn is_same_or_descendant(path: &str, scope: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn stable_hash(bytes: &[u8]) -> u64 {
+pub(super) fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);

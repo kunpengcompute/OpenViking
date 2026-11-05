@@ -7,6 +7,7 @@
 mod envelope;
 mod metrics;
 mod policy;
+mod query;
 mod wrapper;
 
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
