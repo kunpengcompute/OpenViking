@@ -3,9 +3,6 @@ name: UT Job
 on:
   workflow_call:
     inputs:
-      runs_on_flavor:
-        required: true
-        type: string
       docker_img:
         required: true
         type: string
@@ -23,7 +20,7 @@ jobs:
   JOB_UT:
     name: UT
     select: selected_by_default
-    runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, "large" ]
+    runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=large ]
     container:
       image: ${{ inputs.docker_img }}
     steps:

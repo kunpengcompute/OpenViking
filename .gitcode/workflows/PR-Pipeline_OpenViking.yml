@@ -5,9 +5,6 @@ on: # 自动触发工作流运行的触发条件
   pull_request_target:          # MR 事件触发
     types: ["open", "reopen", "update"]
     branches: [ "*" ]
-  pr_comment:                    # PR 评论触发
-    types: [ created ]
-    keyword: '^(?:\/)?compile*'
   pull_request_comment:          # 标准 PR 评论触发事件
     types: [created]
     branches: [ '*' ]
@@ -21,12 +18,12 @@ concurrency: # 并发控制（GitCode 原生语法）
     enable: true
     events: [mr_id]
 
+permissions:
   project: read
   repository: read
   id-token: write
   pr: write
   note: write
-
 env:
   pr_id: ${{ atomgit.event.pull_request.number }}
   branch: ${{ atomgit.event.pull_request.base.ref }}
@@ -104,14 +101,14 @@ stages:
                 echo "need_build=yes" >> "$ATOMGIT_OUTPUT"
               fi
 
-      sca-pr: # SCA 扫描（project-name 取上游组织名 volcengine）
+      sca-pr: # SCA 扫描（project-name 取上游组织名 boostkit）
         name: sca-pr
         runs-on: ["ubuntu-latest", "x64", "slim"]
         steps:
           - name: sca pr scan
             uses: openlibing/sca-action/sca-pr-action@v1.0.0
             with:
-              project-name: "volcengine"
+              project-name: "boostkit"
 
       malicious-scan: # 恶意代码扫描
         name: malicious-scan
@@ -120,7 +117,7 @@ stages:
           - name: malicious code scan
             uses: openlibing/malicious-code-scan-action/malicious-code-pr-scan-action@v1.0.0
             with:
-              project-name: "volcengine"
+              project-name: "boostkit"
 
       pre-commit: # 代码风格检查（仓库 .pre-commit-config.yaml 仅 ruff hook）
         name: pre-commit
