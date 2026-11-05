@@ -31,18 +31,32 @@ class OVContextConfig:
             raise ValueError("summary_check_interval must be a positive integer")
         if self.context_failure not in ("raise", "host"):
             raise ValueError("Invalid context failure policy")
+        for name in ("base_context_ratio", "capacity_ratio"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+            ):
+                raise ValueError(f"{name} must be a finite number")
         if not 0 < self.base_context_ratio < self.capacity_ratio < 1:
             raise ValueError("Require 0 < base_context_ratio < capacity_ratio < 1")
-        if any(
-            not isfinite(v) or v <= 0
-            for v in (self.commit_wait_timeout, self.poll_interval, self.poll_max_interval)
-        ):
-            raise ValueError("Timeouts must be positive")
+        for name in ("commit_wait_timeout", "poll_interval", "poll_max_interval"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive finite number")
         for value in (self.context_window, self.max_input_tokens):
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError("Model limits must be positive integers")
-        if min(self.output_reserve, self.safety_margin) < 0:
-            raise ValueError("Budget reserves must not be negative")
+        for name in ("output_reserve", "safety_margin"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
         if (
             isinstance(self.retry_attempts, bool)
             or not isinstance(self.retry_attempts, int)

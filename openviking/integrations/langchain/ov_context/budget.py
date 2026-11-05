@@ -37,9 +37,15 @@ class BudgetSpec:
             raise ValueError("Budget values must be integers")
         if self.output_reserve < 0 or self.safety_margin < 0 or self.input_limit <= 0:
             raise ValueError("Invalid model budget")
-        if not all(isfinite(v) for v in (self.base_context_ratio, self.capacity_ratio)) or not (
-            0 < self.base_context_ratio < self.capacity_ratio < 1
-        ):
+        for name in ("base_context_ratio", "capacity_ratio"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+            ):
+                raise ValueError(f"{name} must be a finite number")
+        if not 0 < self.base_context_ratio < self.capacity_ratio < 1:
             raise ValueError("Require 0 < base_context_ratio < capacity_ratio < 1")
         if not 0 < self.base_context_limit < self.capacity_limit < self.input_limit:
             raise ValueError("Require base_context_limit < capacity_limit < input_limit")
