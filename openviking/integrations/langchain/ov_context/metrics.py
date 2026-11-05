@@ -28,8 +28,26 @@ class Metrics:
                 self.sink(event, **fields)
             else:
                 logging.getLogger(__name__).info("ov_context.%s %s", event, fields)
-        except Exception:
-            logging.getLogger(__name__).warning("ov_context.metrics_sink_failed")
+        except Exception as exc:
+            context = {
+                name: fields[name]
+                for name in (
+                    "account_id",
+                    "user_id",
+                    "actor_peer_id",
+                    "session_id",
+                    "run_id",
+                    "model_call_id",
+                )
+                if isinstance(fields.get(name), str)
+            }
+            logging.getLogger(__name__).warning(
+                "ov_context.metrics_sink_failed event=%s context=%s error_type=%s",
+                event,
+                context,
+                type(exc).__name__,
+                exc_info=True,
+            )
 
 
 class LatencySummary(TypedDict):

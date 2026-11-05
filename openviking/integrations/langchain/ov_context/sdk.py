@@ -65,6 +65,8 @@ class OVSessionClient(Protocol):
 
 
 class AsyncClientHandle:
+    """Initialize owned SDKs; borrow application-initialized SDKs without mutation."""
+
     def __init__(self, connection: OpenVikingConnection) -> None:
         self.connection = connection
         self.client = connection.client
@@ -74,6 +76,15 @@ class AsyncClientHandle:
 
     async def get(self) -> Any:
         async with self.lock:
+            if not self.owned:
+                self.ready = False
+                http = getattr(self.client, "_http", None)
+                if http is not None and getattr(http, "is_closed", False):
+                    raise RuntimeError("The application-owned HTTP client is closed")
+                if http is None and not getattr(self.client, "_initialized", False):
+                    raise RuntimeError("Initialize the borrowed async OV client in the application")
+                self.ready = True
+                return self.client
             if self.ready:
                 return self.client
             if self.client is None:
