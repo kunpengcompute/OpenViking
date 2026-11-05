@@ -710,7 +710,7 @@ impl CachedFileSystem {
             }
         };
 
-        let envelope = match CacheEnvelope::decode(&value) {
+        let envelope = match CacheEnvelope::decode(value) {
             Ok(envelope) if envelope.matches(CacheObjectKind::File, path) => envelope,
             _ => {
                 self.metrics.error();
@@ -728,7 +728,7 @@ impl CachedFileSystem {
                     if record_hit {
                         self.metrics.file_hit(data.len());
                     }
-                    Some(data)
+                    Some(data.to_vec())
                 }
                 Err(_) => {
                     self.metrics.error();
@@ -774,7 +774,7 @@ impl CachedFileSystem {
             }
         };
 
-        let envelope = match CacheEnvelope::decode(&value) {
+        let envelope = match CacheEnvelope::decode(value) {
             Ok(envelope) if envelope.matches(CacheObjectKind::Directory, path) => envelope,
             _ => {
                 self.metrics.error();
@@ -1036,7 +1036,7 @@ impl CachedFileSystem {
     fn object_key(&self, kind: &str, path: &str) -> String {
         let normalized = normalize_path(path);
         format!(
-            "ragfs:v1:{}:{}:{:016x}",
+            "ragfs:v2:{}:{}:{:016x}",
             self.namespace.as_str(),
             kind,
             stable_hash(normalized.as_bytes())
