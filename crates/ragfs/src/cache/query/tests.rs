@@ -28,13 +28,7 @@ async fn query(cache: &QueryCache, path: &str, value: usize) -> usize {
 #[tokio::test]
 async fn buckets_keep_operations_and_complete_parameters_separate() {
     let (cache, _, _) = fixture();
-    for op in [
-        "stat",
-        "read_dir",
-        "tree_directory",
-        "glob_directory",
-        "grep",
-    ] {
+    for op in ["stat", "tree_directory", "glob_directory", "grep"] {
         for params in [json!([]), json!([null]), json!([0]), json!([1, "a"])] {
             let expected = format!("{op}:{params}");
             let first = cache
@@ -121,7 +115,7 @@ async fn concurrent_parameter_variants_do_not_overwrite_each_other() {
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
             worker
-                .get_or_load("/docs", "read_dir", json!([variant]), async {
+                .get_or_load("/docs", "glob_directory", json!([variant]), async {
                     barrier.wait().await;
                     Ok(variant)
                 })
@@ -134,7 +128,7 @@ async fn concurrent_parameter_variants_do_not_overwrite_each_other() {
     }
     for variant in [1usize, 2] {
         let hit: usize = cache
-            .get_or_load("/docs", "read_dir", json!([variant]), async {
+            .get_or_load("/docs", "glob_directory", json!([variant]), async {
                 panic!("concurrent fill lost a query variant")
             })
             .await
@@ -205,7 +199,7 @@ async fn seed(fs: &CachedFileSystem) {
 }
 
 #[tokio::test]
-async fn all_five_apis_serve_cached_results_and_parameter_variants() {
+async fn query_apis_serve_cached_results_and_parameter_variants() {
     let fs = filesystem(CacheTraversalMode::Backend);
     seed(&fs).await;
     let stat = fs.stat("/docs/a.txt").await.unwrap();

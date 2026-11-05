@@ -1009,69 +1009,6 @@ impl CachedFileSystem {
         self.queries.get_or_load(path, op, params, load).await
     }
 
-    async fn read_dir_cached(
-        &self,
-        path: &str,
-        offset: Option<usize>,
-        limit: Option<usize>,
-        sort_by: Option<ListSortBy>,
-        sort_order: Option<SortOrder>,
-    ) -> Result<Vec<FileInfo>> {
-        if !self.policy.cache_directory(path) || self.is_runtime_bypassed(path).await {
-            self.metrics.policy_bypass();
-            return self
-                .backend
-                .read_dir(path, offset, limit, sort_by, sort_order)
-                .await;
-        }
-
-        let _operation_guard = self.operation_lock.read().await;
-        if self.is_runtime_bypassed(path).await {
-            self.metrics.policy_bypass();
-            return self
-                .backend
-                .read_dir(path, offset, limit, sort_by, sort_order)
-                .await;
-        }
-
-        let normalized = normalize_path(path);
-        let key = self.directory_key(&normalized);
-        if let Some(entries) = self.probe_directory(&key, &normalized, true).await {
-            return Ok(apply_read_dir_options(
-                entries, offset, limit, sort_by, sort_order,
-            ));
-        }
-        self.metrics.read_dir_miss();
-
-        let (inflight, leader) = self.acquire_inflight(&key).await;
-        if leader {
-            self.metrics.inflight_leader();
-        } else {
-            self.metrics.inflight_follower();
-        }
-        let inflight_guard = inflight.lock().await;
-
-        if !leader {
-            if let Some(entries) = self.probe_directory(&key, &normalized, false).await {
-                self.metrics.inflight_backend_saved();
-                drop(inflight_guard);
-                self.release_inflight(&key, &inflight).await;
-                return Ok(apply_read_dir_options(
-                    entries, offset, limit, sort_by, sort_order,
-                ));
-            }
-        }
-
-        let entries = self.backend.read_dir(path, None, None, None, None).await;
-        if let Ok(value) = &entries {
-            self.metrics.backend_fallback(0);
-            self.fill_directory(&key, &normalized, value).await;
-        }
-        drop(inflight_guard);
-        self.release_inflight(&key, &inflight).await;
-        entries.map(|entries| apply_read_dir_options(entries, offset, limit, sort_by, sort_order))
-    }
-
     async fn invalidate_path_objects(&self, path: &str) {
         self.cache_delete(&self.file_key(path), path).await;
         self.cache_delete(&self.directory_key(path), path).await;
@@ -1225,13 +1162,59 @@ impl FileSystem for CachedFileSystem {
         sort_by: Option<ListSortBy>,
         sort_order: Option<SortOrder>,
     ) -> Result<Vec<FileInfo>> {
-        self.cached_query(
-            path,
-            "read_dir",
-            json!([offset, limit, sort_by, sort_order]),
-            self.read_dir_cached(path, offset, limit, sort_by, sort_order),
-        )
-        .await
+        if !self.policy.cache_directory(path) || self.is_runtime_bypassed(path).await {
+            self.metrics.policy_bypass();
+            return self
+                .backend
+                .read_dir(path, offset, limit, sort_by, sort_order)
+                .await;
+        }
+
+        let _operation_guard = self.operation_lock.read().await;
+        if self.is_runtime_bypassed(path).await {
+            self.metrics.policy_bypass();
+            return self
+                .backend
+                .read_dir(path, offset, limit, sort_by, sort_order)
+                .await;
+        }
+
+        let normalized = normalize_path(path);
+        let key = self.directory_key(&normalized);
+        if let Some(entries) = self.probe_directory(&key, &normalized, true).await {
+            return Ok(apply_read_dir_options(
+                entries, offset, limit, sort_by, sort_order,
+            ));
+        }
+        self.metrics.read_dir_miss();
+
+        let (inflight, leader) = self.acquire_inflight(&key).await;
+        if leader {
+            self.metrics.inflight_leader();
+        } else {
+            self.metrics.inflight_follower();
+        }
+        let inflight_guard = inflight.lock().await;
+
+        if !leader {
+            if let Some(entries) = self.probe_directory(&key, &normalized, false).await {
+                self.metrics.inflight_backend_saved();
+                drop(inflight_guard);
+                self.release_inflight(&key, &inflight).await;
+                return Ok(apply_read_dir_options(
+                    entries, offset, limit, sort_by, sort_order,
+                ));
+            }
+        }
+
+        let entries = self.backend.read_dir(path, None, None, None, None).await;
+        if let Ok(value) = &entries {
+            self.metrics.backend_fallback(0);
+            self.fill_directory(&key, &normalized, value).await;
+        }
+        drop(inflight_guard);
+        self.release_inflight(&key, &inflight).await;
+        entries.map(|entries| apply_read_dir_options(entries, offset, limit, sort_by, sort_order))
     }
 
     async fn read_internal_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
