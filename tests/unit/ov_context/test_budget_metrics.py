@@ -71,14 +71,46 @@ def test_latency_is_bounded_and_partitioned_by_status():
     assert rows["error"]["count"] == 1
 
 
-def test_observation_sink_failure_does_not_break_the_operation(caplog, monkeypatch):
+@pytest.mark.parametrize("error_type", [OSError, TypeError])
+def test_observation_sink_failure_does_not_break_the_operation(caplog, monkeypatch, error_type):
     logger = logging.getLogger("openviking.integrations.langchain.ov_context.metrics")
     caplog.set_level(logging.WARNING, logger=logger.name)
     monkeypatch.setattr(logger, "disabled", False)
     monkeypatch.setattr(logger, "handlers", [caplog.handler])
 
     def broken(event, **fields):
-        raise OSError("unavailable")
+        raise error_type("sink failed")
 
-    Metrics(broken).emit("write", status="ok")
-    assert "metrics_sink_failed" in caplog.text
+    Metrics(broken).emit(
+        "write",
+        status="ok",
+        session_id="session-1",
+        run_id="run-1",
+        account_id="account-1",
+        user_id="user-1",
+        actor_peer_id="peer-1",
+        model_call_id="call-1",
+        prompt="private-message-body",
+        api_key="private-credential",
+        payload=object(),
+    )
+    record = next(record for record in caplog.records if "metrics_sink_failed" in record.message)
+    assert "event=write" in record.message
+    for value in ("session-1", "run-1", "account-1", "user-1", "peer-1", "call-1"):
+        assert value in record.message
+    assert f"error_type={error_type.__name__}" in record.message
+    assert record.exc_info[0] is error_type
+    assert record.exc_info[2] is not None
+    assert "broken" in caplog.text
+    assert "private-message-body" not in caplog.text
+    assert "private-credential" not in caplog.text
+
+
+def test_metrics_does_not_intercept_cancellation():
+    from asyncio import CancelledError
+
+    def cancelled(event, **fields):
+        raise CancelledError
+
+    with pytest.raises(CancelledError):
+        Metrics(cancelled).emit("write")
