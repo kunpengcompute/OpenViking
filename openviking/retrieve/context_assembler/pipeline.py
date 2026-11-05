@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 """Deterministic context assembly over identity-scoped find, without a planner."""
 
 from __future__ import annotations
@@ -104,6 +107,10 @@ def _render_entry(entry: dict[str, Any]) -> str:
     def attr(value: str) -> str:
         return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
+    # Escape the container's tags so untrusted memory text cannot forge entry
+    # boundaries. Preserve other markup for Markdown/code fidelity. This is
+    # not a prompt-injection sanitizer: consuming prompts must treat recalled
+    # text as untrusted data, including any instructions it contains.
     text = re.sub(r"<(/?)memory(?=[\s/>])", r"<\\\1memory", entry["text"], flags=re.I)
     return (
         f'<memory uri="{attr(entry["uri"])}" type="{attr(entry["category"])}"'
@@ -190,7 +197,7 @@ async def assemble_context(
     started = time.monotonic()
     if not query.strip():
         raise InvalidArgumentError("Search query must not be empty.")
-    if not 1 <= limit <= 200:
+    if options.quotas is None and not 1 <= limit <= 200:
         raise InvalidArgumentError("Context limit must be between 1 and 200")
     if score_threshold is not None and (
         not math.isfinite(score_threshold) or not 0 <= score_threshold <= 1
@@ -466,25 +473,23 @@ async def assemble_context(
             continue
         chosen = pin(c)
         summary = (c.item.abstract or c.item.overview or "").strip()
+        summary_detail = "abstract" if c.item.abstract else "overview"
         if (chosen != "abstract" or not summary) and content_uri(c) not in reads:
             reads[content_uri(c)] = asyncio.create_task(read_body(content_uri(c)))
             await reads[content_uri(c)]
         body = reads[content_uri(c)].result().strip() if content_uri(c) in reads else ""
-        full = body or summary
-        texts = [
-            (
-                chosen,
-                full
-                if chosen == "full"
-                else (_overview(body) or summary)
-                if chosen == "overview"
-                else summary or body,
-            )
-        ]
+        body_detail = "overview" if c.item.level in (0, 1) else "full"
         if chosen == "full":
-            texts.append(("overview", _overview(full)))
+            texts = [(body_detail if body else summary_detail, body or summary)]
+        elif chosen == "overview":
+            overview = _overview(body)
+            texts = [("overview" if overview else summary_detail, overview or summary)]
+        else:
+            texts = [(summary_detail if summary else body_detail, summary or body)]
+        if chosen == "full":
+            texts.append(("overview" if body else summary_detail, _overview(body or summary)))
         if chosen != "abstract":
-            texts.append(("abstract", summary))
+            texts.append((summary_detail, summary))
         for detail, text in texts:
             if not text:
                 continue

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 """Offline contracts through the SDK, router and search service; Reader tests land separately."""
 
 import asyncio
@@ -216,6 +219,30 @@ async def test_empty_quotas_do_not_call_embedding_or_storage(api, quotas):
     assert not fs.calls and fs.embedder.calls == 0
 
 
+@pytest.mark.parametrize("limit", [-1, 0, 201])
+@pytest.mark.parametrize("quotas", [{"events": 1}, {}, {"events": 0}])
+async def test_quota_mode_ignores_out_of_range_limit(api, limit, quotas):
+    fs, _, sdk = api
+    result = await sdk.search("q", mode="context", quotas=quotas, limit=limit)
+    assert len(result["entries"]) == sum(quotas.values())
+    assert result["stats"]["ignored"] == ["limit"]
+    if quotas.get("events", 0):
+        assert result["entries"][0]["category"] == "events"
+        assert all(call[3] == 1 for call in fs.calls)
+    else:
+        assert not fs.calls and not fs.embedder.calls
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 201])
+async def test_context_without_quotas_still_rejects_out_of_range_limit(api, limit):
+    fs, service, sdk = api
+    with pytest.raises(InvalidArgumentError, match="Context limit must be between 1 and 200"):
+        await sdk.search("q", mode="context", limit=limit)
+    with pytest.raises(InvalidArgumentError, match="Context limit must be between 1 and 200"):
+        await service.search.search("q", ctx=context(), mode="context", limit=limit)
+    assert not fs.calls and not fs.embedder.calls
+
+
 async def test_body_prefetch_is_bounded_by_final_output_count(api):
     fs, _, sdk = api
     result = await sdk.search(
@@ -364,12 +391,86 @@ async def test_legacy_list_still_dispatches_to_old_search(api):
     service.sessions.session.assert_not_called()
 
 
-async def test_read_failure_falls_back_to_summary(api):
+@pytest.mark.parametrize("detail", ["full", "overview"])
+@pytest.mark.parametrize("summary_detail", ["abstract", "overview"])
+@pytest.mark.parametrize("read_failure", ["error", "empty"])
+async def test_read_failure_falls_back_to_actual_summary_detail(
+    api, detail, summary_detail, read_failure
+):
     fs, _, sdk = api
-    fs.read_error = RuntimeError("unavailable")
-    result = await sdk.search("q", mode="context", quotas={"experiences": 1}, detail="full")
-    assert result["entries"] and result["stats"]["read_errors"]
-    assert "experiences fact" in result["rendered"]
+    fs.categories = {}
+    fs.extra_items = [
+        MatchedContext(
+            uri="viking://user/alice/memories/experiences/fallback.md",
+            context_type=ContextType.MEMORY,
+            category="experiences",
+            score=0.9,
+            **{summary_detail: "Fallback summary."},
+        )
+    ]
+    fs.body = ""
+    if read_failure == "error":
+        fs.read_error = RuntimeError("unavailable")
+    result = await sdk.search("q", mode="context", quotas={"experiences": 1}, detail=detail)
+    assert len(result["entries"]) == len(fs.reads) == 1
+    assert result["entries"][0]["text"] == "Fallback summary."
+    assert result["entries"][0]["detail"] == summary_detail
+    assert f'detail="{summary_detail}"' in result["rendered"]
+    assert bool(result["stats"]["read_errors"]) == (read_failure == "error")
+    exact_budget = estimate_text_tokens(result["rendered"])
+    assert result["stats"]["used_tokens"] == exact_budget
+    assert result["stats"]["used_chars"] == len(result["rendered"])
+
+    fits = await sdk.search(
+        "q", mode="context", quotas={"experiences": 1}, detail=detail, max_tokens=exact_budget
+    )
+    assert fits["entries"] == result["entries"]
+    assert fits["rendered"] == result["rendered"]
+    too_small = await sdk.search(
+        "q", mode="context", quotas={"experiences": 1}, detail=detail, max_tokens=exact_budget - 1
+    )
+    assert too_small["entries"] == [] and too_small["rendered"] == ""
+
+
+@pytest.mark.parametrize(
+    "level,detail,abstract,overview,body,expected_detail,expected_text",
+    [
+        (2, "full", "summary", "", "full body", "full", "full body"),
+        (0, "full", "summary", "", "directory overview", "overview", "directory overview"),
+        (1, "full", "summary", "", "directory overview", "overview", "directory overview"),
+        (2, "overview", "summary", "", "# Summary\n\npreview", "overview", "preview"),
+        (2, "overview", "summary", "", "# Summary\n\n## Details", "abstract", "summary"),
+        (2, "abstract", "", "stored overview", "", "overview", "stored overview"),
+        (2, "abstract", "", "", "full body", "full", "full body"),
+        (0, "abstract", "", "", "directory overview", "overview", "directory overview"),
+    ],
+)
+async def test_detail_reflects_selected_content_source(
+    api, level, detail, abstract, overview, body, expected_detail, expected_text
+):
+    fs, _, sdk = api
+    fs.categories = {}
+    uri = "viking://user/alice/memories/events/source"
+    if level == 2:
+        uri += ".md"
+    fs.extra_items = [
+        MatchedContext(
+            uri=uri,
+            context_type=ContextType.MEMORY,
+            category="events",
+            score=0.9,
+            level=level,
+            abstract=abstract,
+            overview=overview,
+        )
+    ]
+    fs.body = body
+    result = await sdk.search("q", mode="context", quotas={"events": 1}, detail=detail)
+    assert len(result["entries"]) == 1
+    assert result["entries"][0]["detail"] == expected_detail
+    assert result["entries"][0]["text"] == expected_text
+    assert f'detail="{expected_detail}"' in result["rendered"]
+    assert result["stats"]["used_tokens"] == estimate_text_tokens(result["rendered"])
 
 
 async def test_cache_separates_input_models_and_resource_writes():
