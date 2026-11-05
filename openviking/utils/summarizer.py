@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from openviking.core.namespace import context_type_for_uri
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
-from openviking.storage.transaction import NO_LOCK, LockLease
-from openviking.storage.viking_fs import get_viking_fs
+from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
+from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
+from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.uri import VikingURI
 
@@ -31,12 +32,76 @@ class Summarizer:
     def __init__(self, vlm_processor: "VLMProcessor"):
         self.vlm_processor = vlm_processor
 
+    async def refresh_file_parent(
+        self,
+        *,
+        file_uri: str,
+        ctx: "RequestContext",
+        skip_vectorization: bool = False,
+        ingest_options: IngestOptions | None = None,
+        created: bool = False,
+        file_md5: str | None = None,
+        file_abstract: str = "",
+    ) -> Dict[str, Any]:
+        """Summarize one flat file and refresh its parent directory semantics."""
+        parent = VikingURI(file_uri).parent
+        if parent is None:
+            return {"status": "error", "message": f"file has no parent URI: {file_uri}"}
+
+        queue_manager = get_queue_manager()
+        semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
+        telemetry_id = get_current_telemetry().telemetry_id
+        parent_uri = parent.uri.rstrip("/")
+        msg = SemanticMsg(
+            uri=parent_uri,
+            context_type=context_type_for_uri(file_uri),
+            recursive=False,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            peer_id=ctx.user.user_id,
+            role=str(ctx.role),
+            skip_vectorization=skip_vectorization,
+            telemetry_id=telemetry_id,
+            changes={"added" if created else "modified": [file_uri]},
+            coalesce_key=build_semantic_coalesce_key(
+                context_type=context_type_for_uri(file_uri),
+                uri=parent_uri,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                peer_id=ctx.user.user_id,
+            ),
+            ingest_options=ingest_options,
+            file_md5s={file_uri: file_md5} if file_md5 else None,
+            file_abstracts={file_uri: file_abstract} if file_abstract else None,
+        )
+        if telemetry_id:
+            get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
+        try:
+            enqueue_id = await semantic_queue.enqueue(msg)
+        except Exception as exc:
+            if telemetry_id:
+                get_request_wait_tracker().mark_semantic_failed(
+                    telemetry_id,
+                    msg.id,
+                    str(exc),
+                )
+            raise
+        if enqueue_id == "deduplicated":
+            if telemetry_id:
+                get_request_wait_tracker().mark_semantic_done(
+                    telemetry_id,
+                    msg.id,
+                    processed_delta=0,
+                )
+            return {"status": "success", "enqueued_count": 0}
+        return {"status": "success", "enqueued_count": 1}
+
     async def summarize(
         self,
         resource_uris: List[str],
         ctx: "RequestContext",
         skip_vectorization: bool = False,
-        lock: LockLease = NO_LOCK,
+        lock: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -47,6 +112,20 @@ class Summarizer:
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
 
         temp_uris = kwargs.get("temp_uris", [])
+        ingest_options = IngestOptions.from_value(kwargs.get("ingest_options"))
+        source = kwargs.get("semantic_source")
+        generation_trigger = str(kwargs.get("generation_trigger") or "manual_refresh")
+        # Pre-computed change set (local incremental import): when present, the
+        # semantic tree restricts re-summarization/vectorization to these files
+        # instead of diffing the whole tree.
+        changes = kwargs.get("changes")
+        # Per-file md5 (target-URI keyed) for those changed files, so the tree executor's
+        # re-vectorization records the fresh fingerprint.
+        file_md5s = kwargs.get("file_md5s") or {}
+        artifact_ref = kwargs.get("artifact_ref")
+        artifact_files = kwargs.get("artifact_files") or []
+        file_abstracts = kwargs.get("file_abstracts") or {}
+        semantic_plan = kwargs.get("semantic_plan")
         if not temp_uris:
             temp_uris = resource_uris
         if len(temp_uris) != len(resource_uris):
@@ -60,28 +139,18 @@ class Summarizer:
         enqueued_count = 0
 
         telemetry = get_current_telemetry()
-        lock_handoff = lock.to_handoff()
-        target_preexisting_arg = kwargs.get("target_preexisting")
-
-        def resolve_target_preexisting(index: int, target_uri: str) -> Optional[bool]:
-            if target_preexisting_arg is None:
-                return None
-            if isinstance(target_preexisting_arg, dict):
-                value = target_preexisting_arg.get(target_uri)
-                return None if value is None else bool(value)
-            if isinstance(target_preexisting_arg, (list, tuple)):
-                if index >= len(target_preexisting_arg):
-                    return None
-                value = target_preexisting_arg[index]
-                return None if value is None else bool(value)
-            return bool(target_preexisting_arg)
+        lock_handoff: Optional[Dict[str, Any]] = None
+        if lock is not None:
+            lock_handoff = await get_viking_fs()._async_agfs.pathlock_to_handoff(lock)
 
         def is_resources_root(uri: str) -> bool:
             return (uri or "").rstrip("/") == "viking://resources"
 
         async def list_top_children(temp_uri: str) -> List[Tuple[str, str]]:
             viking_fs = get_viking_fs()
-            entries = await viking_fs.ls(temp_uri, show_all_hidden=True, ctx=ctx)
+            entries = await viking_fs.ls(
+                temp_uri, show_all_hidden=True, node_limit=LS_ALL_NODES, ctx=ctx
+            )
             children: List[Tuple[str, str]] = []
             for entry in entries:
                 name = entry.get("name", "")
@@ -109,20 +178,29 @@ class Summarizer:
             else:
                 enqueue_units.append((uri, temp_uri))
 
-            for idx, (target_uri, source_uri) in enumerate(enqueue_units):
+            for target_uri, source_uri in enqueue_units:
                 msg = SemanticMsg(
                     uri=source_uri,
                     context_type=context_type,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
-                    agent_id=ctx.user.agent_id,
-                    role=ctx.role.value,
+                    group_ids=ctx.group_ids,
+                    peer_id=ctx.user.user_id,
+                    role=str(ctx.role),
                     skip_vectorization=skip_vectorization,
                     telemetry_id=telemetry.telemetry_id,
                     target_uri=target_uri if target_uri != source_uri else None,
                     lock_handoff=lock_handoff,
                     is_code_repo=kwargs.get("is_code_repo", False),
-                    target_preexisting=resolve_target_preexisting(idx, target_uri),
+                    ingest_options=ingest_options,
+                    source=source,
+                    generation_trigger=generation_trigger,
+                    changes=changes,
+                    file_md5s=file_md5s,
+                    artifact_ref=artifact_ref,
+                    artifact_files=artifact_files,
+                    file_abstracts=file_abstracts,
+                    plan=semantic_plan,
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)

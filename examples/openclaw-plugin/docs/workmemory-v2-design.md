@@ -204,7 +204,7 @@ commit 归档时不全量清空消息，保留最近 N 条维持上下文连贯�
   ├── addSessionMessage → 逐条 POST /sessions/{id}/messages
   │     服务端: append msg + 滑动窗口更新 pending_tokens + save meta
   ├── GET /sessions/{id} → 返回 pending_tokens（O(1)）
-  └── pending_tokens >= commitTokenThreshold?
+  └── pending_tokens >= tokenBudget * commitTokenThresholdRatio?
         │
         YES → commitSession(wait=false, keepRecentCount=cfg.commitKeepRecentCount)
               │
@@ -226,7 +226,7 @@ commit 归档时不全量清空消息，保留最近 N 条维持上下文连贯�
                    │          → _merge_wm_sections 段级合并
                    │   NO  → ov_wm_v2 prompt 全量创建
                    ├── 写入 archive_NNN/.overview.md + .abstract.md + .meta.json
-                   ├── 提取 long-term memory（compressor_v2，需 archive_uri 才能写 memory_diff.json）
+                   ├── 提取 long-term memory（SessionCompressorV3，需 archive_uri 才能写 memory_diff.json）
                    ├── 等待 embedding / semantic 队列排空（wait_for_request）
                    └── 写入 .done（最后写，标志该 archive 全部状态终结）
 ```

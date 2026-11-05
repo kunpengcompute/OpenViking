@@ -15,6 +15,8 @@ class OutboundEventType(str, Enum):
     TOOL_CALL = "tool_call"  # Tool being called
     TOOL_RESULT = "tool_result"  # Result from tool execution
     REASONING = "reasoning"  # Reasoning content
+    CONTENT_DELTA = "content_delta"  # Streaming response text delta
+    REASONING_DELTA = "reasoning_delta"  # Streaming reasoning text delta
     ITERATION = "iteration"  # Iteration marker
     NO_REPLY = "no_reply"  # No reply required
     RESPONSE_COMPLETED = "response_completed"  # Analytics-only response fact
@@ -31,11 +33,13 @@ class InboundMessage:
     sender_id: str  # User identifier
     content: str  # Message text
     session_key: SessionKey
+    actor_peer_id: str | None = None  # Authenticated OpenViking peer identity
     timestamp: datetime = field(default_factory=datetime.now)
     sender_name: str | None = None
     need_reply: bool = True
-    media: list[str] = field(default_factory=list)  # Media URLs
+    media: list[str | dict[str, Any]] = field(default_factory=list)  # Paths or image_url parts
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
+    openviking_connection: dict[str, Any] | None = None  # Internal OpenViking identity
 
 
 @dataclass

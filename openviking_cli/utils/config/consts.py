@@ -24,7 +24,6 @@ OPENVIKING_ROOT_API_KEY_ENV = "OPENVIKING_ROOT_API_KEY"
 OPENVIKING_API_KEY_ENV = "OPENVIKING_API_KEY"
 OPENVIKING_ACCOUNT_ENV = "OPENVIKING_ACCOUNT"
 OPENVIKING_USER_ENV = "OPENVIKING_USER"
-OPENVIKING_AGENT_ID_ENV = "OPENVIKING_AGENT_ID"
 
 # Embedding & VLM
 OPENVIKING_EMBEDDING_API_KEY_ENV = "OPENVIKING_EMBEDDING_API_KEY"
@@ -74,6 +73,17 @@ OPENVIKING_REPO_ENV = "OPENVIKING_REPO"
 OPENVIKING_GO_PATH_ENV = "OPENVIKING_GO_PATH"
 OPENVIKING_GOPATH_ENV = "OPENVIKING_GOPATH"
 OPENVIKING_GOPROXY_ENV = "OPENVIKING_GOPROXY"
+
+# =============================================================================
+# Conversation-log ingest (openviking-server ingest)
+# =============================================================================
+
+OPENVIKING_INGEST_ENABLED_ENV = "OPENVIKING_INGEST_ENABLED"
+OPENVIKING_INGEST_SERVER_URL_ENV = "OPENVIKING_INGEST_SERVER_URL"
+OPENVIKING_INGEST_API_KEY_ENV = "OPENVIKING_INGEST_API_KEY"
+
+# Per-(harness, session) read-cursor state lives here (NEVER under tool-specific dirs).
+DEFAULT_INGEST_STATE_DIR = DEFAULT_CONFIG_DIR / "ingest"
 
 # =============================================================================
 # Default filenames

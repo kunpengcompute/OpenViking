@@ -13,6 +13,8 @@ The actual MetricRegistry writes are performed by HTTPCollector.
 
 from __future__ import annotations
 
+from typing import Any
+
 from .base import EventMetricDataSource
 
 
@@ -34,8 +36,11 @@ class HttpRequestLifecycleDataSource(EventMetricDataSource):
         account_id: str | None = None,
         request_id: str | None = None,
         user_id: str | None = None,
-        agent_id: str | None = None,
         url_path: str | None = None,
+        result_count: int | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        error_details: dict[str, Any] | None = None,
     ) -> None:
         """
         Emit a completed-request event with normalized method, route, status, and duration data.
@@ -54,10 +59,16 @@ class HttpRequestLifecycleDataSource(EventMetricDataSource):
             payload["request_id"] = str(request_id)
         if user_id is not None:
             payload["user_id"] = str(user_id)
-        if agent_id is not None:
-            payload["agent_id"] = str(agent_id)
         if url_path is not None:
             payload["url_path"] = str(url_path)
+        if result_count is not None:
+            payload["result_count"] = max(int(result_count), 0)
+        if error_code is not None:
+            payload["error_code"] = str(error_code)
+        if error_message is not None:
+            payload["error_message"] = str(error_message)
+        if error_details is not None:
+            payload["error_details"] = dict(error_details)
         EventMetricDataSource._emit("http.request", payload)
 
     @staticmethod

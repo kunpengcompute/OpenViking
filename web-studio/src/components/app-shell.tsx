@@ -1,23 +1,28 @@
 import * as React from 'react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
-  BlocksIcon,
+  MessagesSquareIcon,
   BookOpenIcon,
+  BracesIcon,
+  BrainIcon,
   ChevronRightIcon,
-  FolderTreeIcon,
+  ListChecksIcon,
+  HistoryIcon,
   HomeIcon,
   GithubIcon,
   KeyRoundIcon,
-  LanguagesIcon,
-  LoaderIcon,
-  MessageSquareIcon,
   MoonIcon,
-  PlusIcon,
-  PlugZapIcon,
+  ActivityIcon,
+  BotIcon,
+  PanelsTopLeftIcon,
+  CableIcon,
   ScrollTextIcon,
   SearchIcon,
+  SparklesIcon,
   SunIcon,
-  TrashIcon,
+  UsersRoundIcon,
+  WaypointsIcon,
+  WorkflowIcon,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useTheme } from 'next-themes'
@@ -27,28 +32,21 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '#/components/ui/collapsible'
-import { ConnectionDialog } from '#/components/connection-dialog'
-import { OAuthSetupDialog } from '#/components/oauth-setup-dialog'
-import { buttonVariants } from '#/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-} from '#/components/ui/dropdown-menu'
+import { CrossDeviceVerifyDialog } from '#/components/cross-device-verify-dialog'
+import { AccountSwitcher } from '#/components/account-switcher'
+import { CurrentUserMenu } from '#/components/current-user-menu'
+import { GeneratedCredentialDialog } from '#/components/generated-credential-dialog'
 import { ScrollArea } from '#/components/ui/scroll-area'
 import {
   Sidebar,
   SidebarContent,
-  SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
+  SidebarGroupLabel,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
-  SidebarMenuAction,
+  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -61,20 +59,14 @@ import {
   AppConnectionProvider,
   useAppConnection,
 } from '#/hooks/use-app-connection'
-import {
-  useSessionList,
-  useCreateSession,
-  useDeleteSession,
-} from '#/lib/sessions/use-sessions'
-import {
-  useSessionTitles,
-  setSessionTitle,
-  removeSessionTitle,
-} from '#/lib/sessions/use-session-titles'
+import type { ServerMode } from '#/hooks/use-server-mode'
+import { cn } from '#/lib/utils'
+import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
 
 type NavItem = {
   icon: React.ComponentType
   id: string
+  section: 'workspace' | 'operations'
   titleKey: string
   to: string
   children?: readonly NavSubItem[]
@@ -98,47 +90,116 @@ const NAV_ITEMS: readonly NavItem[] = [
   {
     icon: HomeIcon,
     id: 'home',
+    section: 'workspace',
     titleKey: 'navigation.home.title',
     to: '/home',
   },
   {
-    icon: FolderTreeIcon,
-    id: 'resources',
-    titleKey: 'navigation.resources.title',
-    to: '/resources',
+    icon: PanelsTopLeftIcon,
+    id: 'filesystem',
+    section: 'workspace',
+    titleKey: 'navigation.filesystem.title',
+    to: '/filesystem',
+  },
+  {
+    icon: BotIcon,
+    id: 'vikingbot',
+    section: 'workspace',
+    titleKey: 'vikingbot:title',
+    to: '/vikingbot',
   },
   {
     icon: SearchIcon,
     id: 'retrieval',
+    section: 'workspace',
     titleKey: 'navigation.retrieval.title',
     to: '/retrieval',
   },
   {
+    icon: SparklesIcon,
+    id: 'skills',
+    section: 'workspace',
+    titleKey: 'navigation.skills.title',
+    to: '/skills',
+  },
+
+  {
+    icon: WorkflowIcon,
+    id: 'compile',
+    section: 'workspace',
+    titleKey: 'navigation.compile.title',
+    to: '/compile',
+  },
+  {
+    icon: MessagesSquareIcon,
+    id: 'sessions',
+    section: 'operations',
+    titleKey: 'navigation.sessions.title',
+    to: '/sessions',
+  },
+  {
+    icon: BrainIcon,
+    id: 'agentExperience',
+    section: 'operations',
+    titleKey: 'navigation.agentExperience.title',
+    to: '/agent-experience',
+  },
+  {
     icon: ScrollTextIcon,
     id: 'requestLogs',
+    section: 'operations',
     titleKey: 'navigation.requestLogs.title',
     to: '/request-logs',
   },
   {
-    icon: BlocksIcon,
-    id: 'sessions',
-    titleKey: 'navigation.sessions.title',
-    to: '/sessions',
+    icon: ListChecksIcon,
+    id: 'tasks',
+    section: 'operations',
+    titleKey: 'navigation.tasks.title',
+    to: '/tasks',
+  },
+  {
+    icon: HistoryIcon,
+    id: 'watches',
+    section: 'operations',
+    titleKey: 'navigation.watches.title',
+    to: '/watches',
+  },
+  {
+    icon: ActivityIcon,
+    id: 'monitoring',
+    section: 'operations',
+    titleKey: 'navigation.monitoring.title',
+    to: '/monitoring',
+  },
+] as const
+
+const NAV_SECTIONS = [
+  {
+    id: 'workspace',
+    titleKey: 'sidebar.groups.workspace',
+  },
+  {
+    id: 'operations',
+    titleKey: 'sidebar.groups.operations',
   },
 ] as const
 
 const LANGUAGE_OPTIONS = [
   {
+    shortLabel: '中',
+    title: '中文',
+    value: 'zh-CN',
+  },
+  {
     shortLabel: 'EN',
     title: 'English',
     value: 'en',
   },
-  {
-    shortLabel: '中文',
-    title: '中文',
-    value: 'zh-CN',
-  },
 ] as const
+
+const HEADER_ICON_BUTTON_CLASS =
+  'relative inline-flex h-8 w-8 items-center justify-center rounded-lg border border-border/80 bg-muted/60 text-muted-foreground shadow-xs transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
 
 function resolveLanguage(
   value: string | undefined,
@@ -205,146 +266,33 @@ function NavGroupItem({ item, pathname, title, t }: NavGroupItemProps) {
   )
 }
 
-function NavSessionsItem({
-  pathname,
-  title,
-}: {
-  pathname: string
-  title: string
-}) {
-  const { t } = useTranslation(['appShell', 'sessions'])
-  const navigate = useNavigate()
-  const isActive = pathname === '/sessions' || pathname.startsWith('/sessions/')
-  const [open, setOpen] = React.useState(isActive)
-
-  const { data: sessions, isLoading } = useSessionList()
-  const { getTitle } = useSessionTitles()
-  const createSession = useCreateSession()
-  const deleteSession = useDeleteSession()
-
-  const activeSessionId = useRouterState({
-    select: (s) => {
-      const search = s.location.search as { s?: string }
-      return search.s ?? null
-    },
-  })
-
-  React.useEffect(() => {
-    if (isActive) setOpen(true)
-  }, [isActive])
-
-  const handleNewSession = React.useCallback(async () => {
-    const result = await createSession.mutateAsync(undefined)
-    setSessionTitle(
-      result.session_id,
-      t('threadList.newSession', { ns: 'sessions' }),
-    )
-    void navigate({ to: '/sessions', search: { s: result.session_id } })
-  }, [createSession, navigate, t])
-
-  const handleDeleteSession = React.useCallback(
-    async (e: React.MouseEvent, id: string) => {
-      e.stopPropagation()
-      e.preventDefault()
-      await deleteSession.mutateAsync(id)
-      removeSessionTitle(id)
-      if (activeSessionId === id) {
-        void navigate({
-          to: '/sessions',
-          search: { s: undefined } as { s?: string },
-        })
-      }
-    },
-    [deleteSession, activeSessionId, navigate],
-  )
-
-  const reversedSessions = React.useMemo(
-    () => (sessions ?? []).slice().reverse(),
-    [sessions],
-  )
-
-  return (
-    <Collapsible
-      open={open}
-      onOpenChange={setOpen}
-      className="group/collapsible"
-    >
-      <SidebarMenuItem>
-        <CollapsibleTrigger
-          render={
-            <SidebarMenuButton tooltip={title} className="text-base">
-              <BlocksIcon />
-              <span>{title}</span>
-              <ChevronRightIcon className="ml-auto transition-transform duration-200 group-data-[open]/collapsible:rotate-90" />
-            </SidebarMenuButton>
-          }
-        />
-        <SidebarMenuAction
-          onClick={handleNewSession}
-          title={t('threadList.newSession', { ns: 'sessions' })}
-        >
-          <PlusIcon className="size-4" />
-        </SidebarMenuAction>
-        <CollapsibleContent>
-          <SidebarMenuSub>
-            {isLoading ? (
-              <SidebarMenuSubItem>
-                <div className="flex items-center gap-2 px-2 py-1.5 text-xs text-muted-foreground">
-                  <LoaderIcon className="size-3 animate-spin" />
-                  <span>
-                    {t('sidebar.loadingSessions', { ns: 'appShell' })}
-                  </span>
-                </div>
-              </SidebarMenuSubItem>
-            ) : reversedSessions.length === 0 ? (
-              <SidebarMenuSubItem>
-                <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                  {t('sidebar.noSessions', { ns: 'appShell' })}
-                </div>
-              </SidebarMenuSubItem>
-            ) : (
-              reversedSessions.map((s) => {
-                const sessionTitle = getTitle(s.session_id)
-                const isSessionActive = activeSessionId === s.session_id
-
-                return (
-                  <SidebarMenuSubItem
-                    key={s.session_id}
-                    className="group/session"
-                  >
-                    <SidebarMenuSubButton
-                      render={
-                        <Link to="/sessions" search={{ s: s.session_id }} />
-                      }
-                      isActive={isSessionActive}
-                    >
-                      <MessageSquareIcon className="size-3.5 shrink-0 opacity-60" />
-                      <span className="truncate">{sessionTitle}</span>
-                    </SidebarMenuSubButton>
-                    <button
-                      type="button"
-                      onClick={(e) => handleDeleteSession(e, s.session_id)}
-                      className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/session:opacity-100"
-                    >
-                      <TrashIcon className="size-3" />
-                    </button>
-                  </SidebarMenuSubItem>
-                )
-              })
-            )}
-          </SidebarMenuSub>
-        </CollapsibleContent>
-      </SidebarMenuItem>
-    </Collapsible>
-  )
-}
-
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <AppConnectionProvider>
-      <AppShellInner>{children}</AppShellInner>
+      <IdentityScopedAppShell>{children}</IdentityScopedAppShell>
     </AppConnectionProvider>
   )
+}
+
+function IdentityScopedAppShell({ children }: { children: React.ReactNode }) {
+  const { identityScopeKey, serverMode } = useAppConnection()
+  return (
+    <AppShellInner key={identityScopeKey}>
+      <ConnectionScopedRouteContent serverMode={serverMode}>
+        {children}
+      </ConnectionScopedRouteContent>
+    </AppShellInner>
+  )
+}
+
+export function ConnectionScopedRouteContent({
+  children,
+  serverMode,
+}: {
+  children: React.ReactNode
+  serverMode: ServerMode
+}) {
+  return serverMode === 'checking' ? null : children
 }
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
@@ -353,20 +301,36 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   })
-  const { openConnectionDialog } = useAppConnection()
   const { setTheme, resolvedTheme } = useTheme()
   const currentLanguage = resolveLanguage(
     i18n.resolvedLanguage ?? i18n.language,
   )
-  const currentLanguageOption =
-    LANGUAGE_OPTIONS.find((item) => item.value === currentLanguage) ??
-    LANGUAGE_OPTIONS[0]
-  const [oauthSetupOpen, setOauthSetupOpen] = React.useState(false)
-  const oauthSetupActive =
-    pathname === '/oauth/setup' || pathname.startsWith('/oauth/setup/')
+  const agentIntegrationsHref = `https://docs.openviking.ai/${
+    currentLanguage === 'zh-CN' ? 'zh' : 'en'
+  }/agent-integrations/01-overview`
+  const sdkApiHref = `https://docs.openviking.ai/${
+    currentLanguage === 'zh-CN' ? 'zh' : 'en'
+  }/api/01-overview`
+  const [crossDeviceVerifyOpen, setCrossDeviceVerifyOpen] =
+    React.useState(false)
+  const { connection, connectionRole, isConnectionRoleLoading, serverMode } =
+    useAppConnection()
+  const settingsActive = pathname === '/settings'
+  const usersActive = pathname === '/users' || pathname.startsWith('/users/')
+  const gatewayActive =
+    pathname === '/gateway' || pathname.startsWith('/gateway/')
+  const { canManageUsers } = resolveStudioManagementCapabilities({
+    hasControlCredential: Boolean(connection.adminApiKey.trim()),
+    isRoleLoading: isConnectionRoleLoading,
+    role: connectionRole,
+    serverMode,
+  })
+  const crossDeviceVerifyActive =
+    pathname === '/oauth/verify' || pathname.startsWith('/oauth/verify/')
+  const visibleNavItems = NAV_ITEMS
 
-  function openOAuthSetup(): void {
-    if (oauthSetupActive) {
+  function openCrossDeviceVerify(): void {
+    if (crossDeviceVerifyActive) {
       return
     }
     // Desktop: open the dialog so the user keeps the current page underneath.
@@ -377,9 +341,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(min-width: 768px)').matches
     if (useDialog) {
-      setOauthSetupOpen(true)
+      setCrossDeviceVerifyOpen(true)
     } else {
-      void navigate({ to: '/oauth/setup' })
+      void navigate({ to: '/oauth/verify' })
     }
   }
 
@@ -388,185 +352,263 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       defaultOpen
       className="flex h-svh overflow-hidden bg-sidebar"
     >
-      <Sidebar variant="sidebar" collapsible="icon" className="!border-r-0">
-        <SidebarHeader className="border-b border-sidebar-border/70 p-2">
-          <div className="flex items-center justify-between gap-2 group-data-[collapsible=icon]:justify-center">
-            <span className="truncate px-2 text-base font-semibold group-data-[collapsible=icon]:hidden">
-              {t('sidebar.workspaceGroupLabel', { ns: 'appShell' })}
-            </span>
+      <Sidebar variant="sidebar" collapsible="icon">
+        <SidebarHeader className="h-12 border-b border-sidebar-border/70 px-2 py-0">
+          <div className="flex h-full items-center justify-between gap-2 group-data-[collapsible=icon]:justify-center">
+            <div className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
+              <AccountSwitcher />
+            </div>
             <SidebarTrigger className="hidden shrink-0 md:inline-flex" />
           </div>
         </SidebarHeader>
 
-        <SidebarContent>
-          <SidebarGroup>
+        <SidebarContent className="gap-0 py-1">
+          {NAV_SECTIONS.map((section) => (
+            <SidebarGroup key={section.id} className="pb-1">
+              <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
+                {t(section.titleKey, { ns: 'appShell' })}
+              </SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {visibleNavItems
+                    .filter((item) => item.section === section.id)
+                    .map((item) => {
+                      const isActive =
+                        pathname === item.to ||
+                        pathname.startsWith(`${item.to}/`)
+                      const title = t(item.titleKey, { ns: 'appShell' })
+
+                      if (item.children) {
+                        return (
+                          <NavGroupItem
+                            key={item.id}
+                            item={
+                              item as NavItem & {
+                                children: readonly NavSubItem[]
+                              }
+                            }
+                            pathname={pathname}
+                            title={title}
+                            t={t}
+                          />
+                        )
+                      }
+
+                      const Icon = item.icon
+
+                      return (
+                        <SidebarMenuItem key={item.id}>
+                          <SidebarMenuButton
+                            render={<Link to={item.to} />}
+                            isActive={isActive}
+                            tooltip={title}
+                            className="h-9"
+                          >
+                            <Icon />
+                            <span>{title}</span>
+                          </SidebarMenuButton>
+                        </SidebarMenuItem>
+                      )
+                    })}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          ))}
+
+          <SidebarGroup className="pb-1">
+            <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
+              {t('sidebar.groups.settings', { ns: 'appShell' })}
+            </SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                {NAV_ITEMS.map((item) => {
-                  const isActive =
-                    pathname === item.to || pathname.startsWith(`${item.to}/`)
-                  const title = t(item.titleKey, { ns: 'appShell' })
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    render={<Link to="/settings" />}
+                    isActive={settingsActive}
+                    tooltip={t('footer.connection', { ns: 'appShell' })}
+                    className="h-9"
+                  >
+                    <CableIcon />
+                    <span>{t('footer.connection', { ns: 'appShell' })}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                {canManageUsers ? (
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      render={<Link to="/gateway" />}
+                      isActive={gatewayActive}
+                      tooltip={t('footer.gatewayBeta', {
+                        ns: 'appShell',
+                      })}
+                      className="h-9 pr-12"
+                    >
+                      <WaypointsIcon />
+                      <span>{t('footer.gateway', { ns: 'appShell' })}</span>
+                    </SidebarMenuButton>
+                    {/* Hidden while the sidebar is collapsed; the tooltip says Beta then. */}
+                    <SidebarMenuBadge className="h-4.5 rounded-full border border-sidebar-border px-1.5 text-[10px] font-medium text-sidebar-foreground/55 peer-data-[size=default]/menu-button:top-[9px]">
+                      {t('footer.beta', { ns: 'appShell' })}
+                    </SidebarMenuBadge>
+                  </SidebarMenuItem>
+                ) : null}
+                {canManageUsers ? (
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      render={<Link to="/users" />}
+                      isActive={usersActive}
+                      tooltip={t('footer.users', { ns: 'appShell' })}
+                      className="h-9"
+                    >
+                      <UsersRoundIcon />
+                      <span>{t('footer.users', { ns: 'appShell' })}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ) : null}
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    onClick={openCrossDeviceVerify}
+                    isActive={crossDeviceVerifyActive}
+                    tooltip={t('navigation.crossDeviceVerify.title', {
+                      ns: 'appShell',
+                    })}
+                    className="h-9"
+                  >
+                    <KeyRoundIcon />
+                    <span>
+                      {t('navigation.crossDeviceVerify.title', {
+                        ns: 'appShell',
+                      })}
+                    </span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
 
-                  if (item.id === 'sessions') {
-                    return (
-                      <NavSessionsItem
-                        key={item.id}
-                        pathname={pathname}
-                        title={title}
+          <SidebarGroup className="pb-1">
+            <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
+              {t('sidebar.groups.resources', { ns: 'appShell' })}
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    render={
+                      <a
+                        href="https://docs.openviking.ai/"
+                        target="_blank"
+                        rel="noreferrer"
                       />
-                    )
-                  }
-
-                  if (item.children) {
-                    return (
-                      <NavGroupItem
-                        key={item.id}
-                        item={
-                          item as NavItem & { children: readonly NavSubItem[] }
-                        }
-                        pathname={pathname}
-                        title={title}
-                        t={t}
+                    }
+                    tooltip={t('footer.docs', { ns: 'appShell' })}
+                    className="h-9"
+                  >
+                    <BookOpenIcon />
+                    <span>{t('footer.docs', { ns: 'appShell' })}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    render={
+                      <a href={sdkApiHref} target="_blank" rel="noreferrer" />
+                    }
+                    tooltip={t('footer.sdkApi', { ns: 'appShell' })}
+                    className="h-9"
+                  >
+                    <BracesIcon />
+                    <span>{t('footer.sdkApi', { ns: 'appShell' })}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    render={
+                      <a
+                        href={agentIntegrationsHref}
+                        target="_blank"
+                        rel="noreferrer"
                       />
-                    )
-                  }
-
-                  const Icon = item.icon
-
-                  return (
-                    <SidebarMenuItem key={item.id}>
-                      <SidebarMenuButton
-                        render={<Link to={item.to} />}
-                        isActive={isActive}
-                        tooltip={title}
-                        className="text-base"
-                      >
-                        <Icon />
-                        <span>{title}</span>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  )
-                })}
+                    }
+                    tooltip={t('footer.agentIntegrations', {
+                      ns: 'appShell',
+                    })}
+                    className="h-9"
+                  >
+                    <BotIcon />
+                    <span>
+                      {t('footer.agentIntegrations', { ns: 'appShell' })}
+                    </span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
         </SidebarContent>
-
-        <SidebarFooter>
-          <SidebarMenu>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                onClick={openConnectionDialog}
-                tooltip={t('footer.connection', { ns: 'appShell' })}
-                className="text-base"
-              >
-                <PlugZapIcon className="size-5" />
-                <span>{t('footer.connection', { ns: 'appShell' })}</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                onClick={openOAuthSetup}
-                isActive={oauthSetupActive}
-                tooltip={t('navigation.oauthSetup.title', { ns: 'appShell' })}
-                className="text-base"
-              >
-                <KeyRoundIcon className="size-5" />
-                <span>{t('navigation.oauthSetup.title', { ns: 'appShell' })}</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                render={
-                  <a
-                    href="https://github.com/volcengine/OpenViking"
-                    target="_blank"
-                    rel="noreferrer"
-                  />
-                }
-                tooltip={t('footer.github', { ns: 'appShell' })}
-                className="text-base"
-              >
-                <GithubIcon className="size-5" />
-                <span>{t('footer.github', { ns: 'appShell' })}</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                render={
-                  <a
-                    href="https://docs.openviking.ai/"
-                    target="_blank"
-                    rel="noreferrer"
-                  />
-                }
-                tooltip={t('footer.docs', { ns: 'appShell' })}
-                className="text-base"
-              >
-                <BookOpenIcon className="size-5" />
-                <span>{t('footer.docs', { ns: 'appShell' })}</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
-        </SidebarFooter>
       </Sidebar>
 
       <SidebarInset className="min-h-0 flex-1 overflow-hidden rounded-none border-0 bg-background shadow-none ring-0 md:m-0 md:ml-0">
-        <header className="flex h-12 shrink-0 items-center justify-end border-b border-border/70 bg-background px-4 backdrop-blur-md md:px-6">
+        <header className="flex h-12 shrink-0 items-center justify-end border-b border-border/70 bg-sidebar px-4 backdrop-blur-md md:px-6">
           <SidebarTrigger className="mr-auto shrink-0 md:hidden" />
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-2">
+            <div
+              aria-label={t('language.label', { ns: 'common' })}
+              className="relative flex h-8 items-center rounded-lg border border-border/80 bg-muted/60 p-1 text-xs shadow-xs"
+              role="group"
+            >
+              <span
+                className={cn(
+                  'absolute h-6 min-w-8 rounded-md bg-background shadow-sm transition-transform duration-200 ease-in-out',
+                  currentLanguage === 'en' && 'translate-x-full',
+                )}
+              />
+              {LANGUAGE_OPTIONS.map((item) => {
+                const isActive = item.value === currentLanguage
+
+                return (
+                  <button
+                    key={item.value}
+                    type="button"
+                    aria-pressed={isActive}
+                    className={cn(
+                      'relative z-10 h-6 min-w-8 rounded-md px-2 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+                      isActive && 'text-foreground',
+                    )}
+                    onClick={() => {
+                      if (!isActive) {
+                        void i18n.changeLanguage(item.value)
+                      }
+                    }}
+                  >
+                    {item.shortLabel}
+                  </button>
+                )
+              })}
+            </div>
+
             <button
               type="button"
               aria-label={t('theme.toggle', { ns: 'common' })}
-              className={buttonVariants({ size: 'sm', variant: 'ghost' })}
+              className={HEADER_ICON_BUTTON_CLASS}
               onClick={() =>
                 setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')
               }
             >
-              <SunIcon className="size-4 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
-              <MoonIcon className="absolute size-4 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
+              <MoonIcon className="size-4 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
+              <SunIcon className="absolute size-4 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
             </button>
 
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                aria-label={t('language.label', { ns: 'common' })}
-                className={buttonVariants({ size: 'sm', variant: 'ghost' })}
-              >
-                <LanguagesIcon />
-                <span className="hidden sm:inline">
-                  {currentLanguageOption.shortLabel}
-                </span>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-32 min-w-32">
-                <DropdownMenuGroup>
-                  <DropdownMenuLabel>
-                    {t('language.label', { ns: 'common' })}
-                  </DropdownMenuLabel>
-                  {LANGUAGE_OPTIONS.map((item) => {
-                    const isActive = item.value === currentLanguage
+            <a
+              href="https://github.com/volcengine/OpenViking"
+              target="_blank"
+              rel="noreferrer"
+              aria-label={t('footer.github', { ns: 'appShell' })}
+              className={HEADER_ICON_BUTTON_CLASS}
+            >
+              <GithubIcon className="size-4" />
+            </a>
 
-                    return (
-                      <DropdownMenuItem
-                        key={item.value}
-                        className="justify-between"
-                        onClick={() => {
-                          if (!isActive) {
-                            void i18n.changeLanguage(item.value)
-                          }
-                        }}
-                      >
-                        <span>{item.title}</span>
-                        {isActive ? (
-                          <span className="text-xs text-muted-foreground">
-                            {t('language.current', { ns: 'common' })}
-                          </span>
-                        ) : null}
-                      </DropdownMenuItem>
-                    )
-                  })}
-                </DropdownMenuGroup>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <div className="h-6 w-px bg-border/80" aria-hidden="true" />
+
+            <CurrentUserMenu />
           </div>
         </header>
 
@@ -577,11 +619,11 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </ScrollArea>
       </SidebarInset>
 
-      <ConnectionDialog />
-      <OAuthSetupDialog
-        open={oauthSetupOpen}
-        onOpenChange={setOauthSetupOpen}
+      <CrossDeviceVerifyDialog
+        open={crossDeviceVerifyOpen}
+        onOpenChange={setCrossDeviceVerifyOpen}
       />
+      <GeneratedCredentialDialog />
     </SidebarProvider>
   )
 }

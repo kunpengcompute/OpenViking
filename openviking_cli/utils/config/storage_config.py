@@ -1,26 +1,18 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 from pathlib import Path
-from typing import Any, Dict, Literal
+from typing import Any, Dict
 
 from pydantic import BaseModel, Field, model_validator
 
 from openviking_cli.utils.logger import get_logger
 
 from .agfs_config import AGFSConfig
+from .parse_output_config import ParseOutputConfig
 from .transaction_config import TransactionConfig
 from .vectordb_config import VectorDBBackendConfig
 
 logger = get_logger(__name__)
-
-
-class TaskTrackerConfig(BaseModel):
-    """Configuration for async task tracking backend."""
-
-    backend: Literal["memory", "persistent"] = Field(
-        default="memory",
-        description="Task tracker backend. 'persistent' enables cross-instance task lookup.",
-    )
 
 
 class StorageConfig(BaseModel):
@@ -32,6 +24,14 @@ class StorageConfig(BaseModel):
     """
 
     workspace: str = Field(default="./data", description="Local data storage path (primary)")
+    skip_process_lock: bool = Field(
+        default=False,
+        description=(
+            "Skip the workspace file lock for embedded vector backends ('local', 'cuvs'). "
+            "Other backends do not acquire this lock. Use only when you explicitly accept "
+            "the risk of multi-process contention on embedded vector storage."
+        ),
+    )
 
     agfs: AGFSConfig = Field(default_factory=AGFSConfig, description="AGFS configuration")
 
@@ -45,19 +45,58 @@ class StorageConfig(BaseModel):
         description="VectorDB backend configuration",
     )
 
-    task_tracker: TaskTrackerConfig = Field(
-        default_factory=TaskTrackerConfig,
-        description="Task tracker backend configuration",
+    parse_output: ParseOutputConfig = Field(
+        default_factory=ParseOutputConfig,
+        description="Where parsers write intermediate artifacts (agfs temp or local dir)",
     )
 
     params: Dict[str, Any] = Field(
         default_factory=dict, description="Additional storage-specific parameters"
     )
 
-    model_config = {"extra": "forbid"}
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_deprecated_task_tracker(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "task_tracker" in data:
+            data = dict(data)
+            data.pop("task_tracker", None)
+            logger.warning(
+                "StorageConfig: 'task_tracker' is deprecated and ignored. "
+                "Task records are always persisted."
+            )
+        return data
 
     @model_validator(mode="after")
     def resolve_paths(self):
+        """Normalize storage paths and map legacy transaction settings into native pathlock config."""
+        if "lock_timeout" in self.transaction.model_fields_set:
+            logger.warning(
+                "StorageConfig: 'transaction.lock_timeout' is deprecated and ignored. "
+                "The runtime wait timeout is fixed at 0.0 seconds."
+            )
+
+        if (
+            "lock_expire" in self.transaction.model_fields_set
+            and "lock_expire_secs" not in self.agfs.pathlock.model_fields_set
+        ):
+            self.agfs.pathlock.lock_expire_secs = self.transaction.lock_expire
+            logger.warning(
+                "StorageConfig: 'transaction.lock_expire' is deprecated. "
+                "Mapped to 'storage.agfs.pathlock.lock_expire_secs'."
+            )
+        elif "lock_expire" in self.transaction.model_fields_set:
+            logger.warning(
+                "StorageConfig: 'transaction.lock_expire' is deprecated and ignored because "
+                "'storage.agfs.pathlock.lock_expire_secs' is set."
+            )
+
+        if "redo_recovery_enabled" in self.transaction.model_fields_set:
+            logger.warning(
+                "StorageConfig: 'transaction.redo_recovery_enabled' is deprecated and ignored. "
+                "Session commit phase-2 recovery now resumes from the persistent "
+                "'session_commit' queue."
+            )
+
         if self.agfs.path is not None:
             logger.warning(
                 f"StorageConfig: 'agfs.path' is deprecated and will be ignored. "
@@ -91,10 +130,8 @@ class StorageConfig(BaseModel):
         return upload_temp_dir
 
     def build_task_tracker(self, agfs: Any):
-        """Build a TaskTracker from storage config."""
+        """Build the persistent TaskTracker from storage config."""
         from openviking.service.task_store import PersistentTaskStore
         from openviking.service.task_tracker import TaskTracker
 
-        if self.task_tracker.backend == "memory":
-            return TaskTracker()
         return TaskTracker(store=PersistentTaskStore(agfs))

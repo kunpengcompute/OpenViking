@@ -1,14 +1,14 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""End-to-end tests for the OAuth flow: DCR → OTP → authorize page → token → /mcp.
+"""End-to-end tests for the OAuth flow: DCR → authorize page → verify → token.
 
 The flow is:
 
 1. Caller registers a client (SDK's RegistrationHandler).
-2. Caller, holding a valid API key, requests an OTP from /api/v1/auth/otp.
-3. Caller hits /authorize, which redirects to /oauth/authorize/page?pending=...
-4. Caller submits the OTP on the authorize page; we 302 back to redirect_uri
-   with a fresh ?code=...
+2. Caller hits /authorize, which redirects to /oauth/authorize/page?pending=...
+3. The page shows a 6-character display_code; a signed-in identity confirms by
+   POSTing it to /api/v1/auth/oauth-verify, which binds the caller identity.
+4. The page polls status and 302s back to redirect_uri with a fresh ?code=...
 5. Caller exchanges the code at /token (PKCE S256) for an opaque access+refresh.
 6. Access token is opaque ovat_-prefixed and resolves through auth.py.
 """
@@ -36,6 +36,7 @@ from openviking.server.identity import Role
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS
 from openviking.server.oauth.provider import (
     FALLBACK_AUTHORIZE_PAGE,
+    MCP_SCOPE,
     OpenVikingOAuthProvider,
 )
 from openviking.server.oauth.router import router as oauth_router
@@ -68,7 +69,6 @@ class _StubOAuthCfg:
     access_token_ttl_seconds: int = 3600
     refresh_token_ttl_seconds: int = 86400
     auth_code_ttl_seconds: int = 300
-    otp_ttl_seconds: int = 300
 
 
 @pytest_asyncio.fixture
@@ -88,9 +88,9 @@ async def app_with_oauth(tmp_path):
 
     app = FastAPI()
     app.state.config = ServerConfig(auth_mode="api_key", root_api_key="root-test-1234567890abcd")
-    # OTP / oauth-verify routes look up the caller's API key fingerprint via
+    # The oauth-verify route looks up the caller's API key fingerprint via
     # ``api_key_manager.get_user_key_fingerprint(account_id, user_id)`` and
-    # refuse to issue OAuth state if the call returns None. Provide a tiny
+    # refuses to bind OAuth state if the call returns None. Provide a tiny
     # stub that returns a stable fingerprint for the fixture's identity.
     app.state.api_key_manager = _FpOnlyKeyManager({("acct1", "alice"): "f" * 64})
     app.state.oauth_store = store
@@ -104,14 +104,14 @@ async def app_with_oauth(tmp_path):
             status_code=ERROR_CODE_TO_HTTP_STATUS.get(exc.code, 500),
         )
 
-    # Override get_request_context so /api/v1/auth/otp can be hit without
-    # a real APIKeyManager. Returns a fixed identity.
+    # Override get_request_context so /api/v1/auth/oauth-verify can be hit
+    # without a real APIKeyManager. Returns a fixed identity.
     from openviking.server.identity import RequestContext
     from openviking_cli.session.user_id import UserIdentifier
 
     def _fixed_ctx() -> RequestContext:
         return RequestContext(
-            user=UserIdentifier("acct1", "alice", "default"),
+            user=UserIdentifier("acct1", "alice"),
             role=Role.USER,
         )
 
@@ -121,7 +121,10 @@ async def app_with_oauth(tmp_path):
     sdk_routes = create_auth_routes(
         provider=provider,
         issuer_url=AnyHttpUrl(issuer),
-        client_registration_options=ClientRegistrationOptions(enabled=True),
+        # Mirror app.py's wiring: default_scopes covers DCRs that omit `scope`.
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, default_scopes=[MCP_SCOPE]
+        ),
         revocation_options=RevocationOptions(enabled=True),
     )
     app.routes.extend(sdk_routes)
@@ -218,29 +221,69 @@ async def test_dcr_registers_client(client):
     assert body["redirect_uris"] == ["https://claude.ai/cb"]
 
 
-# ---------------------------------------------------------------------------
-# OTP issuance
-# ---------------------------------------------------------------------------
+async def _authorize_with_mcp_scope(client, client_id: str, redirect_uri: str) -> str:
+    """GET /authorize requesting scope=mcp; return the redirect Location."""
+    _, challenge = _pkce_pair()
+    resp = await client.get(
+        "/authorize",
+        params={
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": MCP_SCOPE,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": "http://127.0.0.1/mcp",
+            "state": "s1",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302, resp.text
+    return resp.headers["location"]
 
 
 @pytest.mark.asyncio
-async def test_otp_endpoint_returns_code(client):
-    resp = await client.post("/api/v1/auth/otp", json={})
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert len(body["otp"]) == 6
-    assert body["ttl_seconds"] == 300
-    assert body["expires_at"] > 0
+async def test_authorize_scope_mcp_after_scopeless_dcr(client):
+    """ChatGPT regression (#2920/#2921 follow-up): its DCR omits `scope`, then
+    it requests the "mcp" scope advertised in the PRM document at /authorize.
+    Registration must default the scope so authorize proceeds to the consent
+    redirect instead of bouncing back with error=invalid_scope."""
+    redirect_uri = "https://chatgpt.com/connector/oauth/cb"
+    reg = await client.post(
+        "/register",
+        json={
+            "redirect_uris": [redirect_uri],
+            "client_name": "ChatGPT",
+            "token_endpoint_auth_method": "none",
+        },
+    )
+    assert reg.status_code == 201, reg.text
+    assert reg.json().get("scope") == MCP_SCOPE
+
+    location = await _authorize_with_mcp_scope(client, reg.json()["client_id"], redirect_uri)
+    assert FALLBACK_AUTHORIZE_PAGE in location and "pending=" in location
+    assert not location.startswith(redirect_uri)
 
 
 @pytest.mark.asyncio
-async def test_otp_endpoint_rejects_bad_ttl(client):
-    resp = await client.post("/api/v1/auth/otp", json={"ttl_seconds": 5})
-    assert resp.status_code in (400, 422)
+async def test_authorize_scope_mcp_for_legacy_scopeless_client(app_with_oauth, client):
+    """Clients already registered with a NULL scope (rows predating the DCR
+    default) must clear scope validation via the get_client fallback."""
+    _, store, _ = app_with_oauth
+    redirect_uri = "https://chatgpt.com/connector/oauth/cb"
+    record = await store.register_client(
+        redirect_uris=[redirect_uri],
+        client_name="ChatGPT (legacy row)",
+        scope=None,
+    )
+
+    location = await _authorize_with_mcp_scope(client, record["client_id"], redirect_uri)
+    assert FALLBACK_AUTHORIZE_PAGE in location and "pending=" in location
+    assert not location.startswith(redirect_uri)
 
 
 # ---------------------------------------------------------------------------
-# Authorize page + OTP submit + token exchange (full happy path)
+# Authorize page + display_code verify + token exchange (full happy path)
 # ---------------------------------------------------------------------------
 
 
@@ -505,25 +548,10 @@ async def test_refresh_token_rotation(app_with_oauth, client):
 
 
 @pytest.mark.asyncio
-async def test_otp_endpoint_rejects_caller_without_fingerprint(app_with_oauth, client):
-    """If the API-key manager has no fingerprint for the caller (e.g. ROOT or
-    trusted-mode identity), OTP issuance must refuse — there's no key whose
-    lifetime we could bind the resulting OAuth tokens to."""
-    app, _, _ = app_with_oauth
-    # Swap in an empty fingerprint map so get_user_key_fingerprint returns None
-    # for the fixture's (acct1, alice) identity.
-    app.state.api_key_manager = _FpOnlyKeyManager({})
-    resp = await client.post("/api/v1/auth/otp", json={})
-    assert resp.status_code == 400, resp.text
-    body = resp.json()
-    msg = body.get("error_description") or body.get("message") or ""
-    assert "registered API key" in msg
-
-
-@pytest.mark.asyncio
 async def test_oauth_verify_rejects_verifier_without_fingerprint(app_with_oauth, client):
-    """oauth-verify must refuse to bind OAuth state to an identity that has
-    no fingerprint — same invariant as OTP issuance."""
+    """oauth-verify must refuse to bind OAuth state to an identity that has no
+    fingerprint (e.g. ROOT or trusted-mode) — there's no key whose lifetime the
+    resulting OAuth tokens could bind to."""
     app, store, _ = app_with_oauth
     _, pending_id, _, _ = await _start_authorize(client, redirect_uri="https://x.test/cb")
     code = (await store.load_pending_authorization(pending_id))["display_code"]
@@ -565,43 +593,9 @@ async def test_dcr_downgrades_confidential_auth_to_public(app_with_oauth, client
 
 
 @pytest.mark.asyncio
-async def test_otp_rejects_oauth_issued_caller(app_with_oauth, client):
-    """A caller authenticated via an OAuth bearer (from_oauth=True) MUST
-    NOT be able to mint new OTPs — that would let a stolen access token
-    launder itself into a fresh refresh-token chain."""
-    app, _, _ = app_with_oauth
-    from openviking.server.identity import RequestContext
-    from openviking_cli.session.user_id import UserIdentifier
-
-    def _oauth_ctx() -> RequestContext:
-        return RequestContext(
-            user=UserIdentifier("acct1", "alice", "default"),
-            role=Role.USER,
-            from_oauth=True,
-        )
-
-    app.dependency_overrides[get_request_context] = _oauth_ctx
-    try:
-        resp = await client.post("/api/v1/auth/otp", json={})
-        assert resp.status_code == 403, resp.text
-        msg = resp.json().get("error_description") or resp.json().get("message") or ""
-        assert "OAuth-issued tokens" in msg
-    finally:
-        # Reset to the fixture's default (non-OAuth) ctx for other tests.
-        def _fixed_ctx() -> RequestContext:
-            return RequestContext(
-                user=UserIdentifier("acct1", "alice", "default"),
-                role=Role.USER,
-            )
-
-        app.dependency_overrides[get_request_context] = _fixed_ctx
-
-
-@pytest.mark.asyncio
 async def test_oauth_verify_rejects_oauth_issued_caller(app_with_oauth, client):
-    """Same gate as OTP issuance: oauth-verify with an OAuth-issued ctx
-    must be refused, otherwise short-lived bearers can launder into
-    long-lived refresh tokens."""
+    """oauth-verify with an OAuth-issued ctx (from_oauth=True) must be refused,
+    otherwise short-lived bearers can launder into long-lived refresh tokens."""
     app, store, _ = app_with_oauth
     from openviking.server.identity import RequestContext
     from openviking_cli.session.user_id import UserIdentifier
@@ -611,7 +605,7 @@ async def test_oauth_verify_rejects_oauth_issued_caller(app_with_oauth, client):
 
     def _oauth_ctx() -> RequestContext:
         return RequestContext(
-            user=UserIdentifier("acct1", "alice", "default"),
+            user=UserIdentifier("acct1", "alice"),
             role=Role.USER,
             from_oauth=True,
         )
@@ -629,7 +623,7 @@ async def test_oauth_verify_rejects_oauth_issued_caller(app_with_oauth, client):
 
         def _fixed_ctx() -> RequestContext:
             return RequestContext(
-                user=UserIdentifier("acct1", "alice", "default"),
+                user=UserIdentifier("acct1", "alice"),
                 role=Role.USER,
             )
 

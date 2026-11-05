@@ -7,6 +7,8 @@ skill data is None, instead of falling through to the generic
 'Unsupported data type' error.
 """
 
+import shutil
+import zipfile
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -36,16 +38,17 @@ class TestParseSkillNoneData:
     def test_parse_skill_valid_dict_passes(self):
         """A valid dict should not raise."""
         processor = SkillProcessor(vikingdb=None)
-        skill_dict, aux_files, base_path = processor._parse_skill(
+        skill_dict, aux_files, base_path, cleanup_path = processor._parse_skill(
             {"name": "test-skill", "description": "A test skill"}
         )
         assert skill_dict["name"] == "test-skill"
         assert aux_files == []
         assert base_path is None
+        assert cleanup_path is None
 
     def test_parse_skill_normalizes_hyphenated_allowed_tools(self):
         processor = SkillProcessor(vikingdb=None)
-        skill_dict, _, _ = processor._parse_skill(
+        skill_dict, _, _, _ = processor._parse_skill(
             {
                 "name": "test-skill",
                 "description": "A test skill",
@@ -57,6 +60,57 @@ class TestParseSkillNoneData:
         assert skill_dict["allowed_tools"] == ["Read", "Write"]
         assert "allowed-tools" not in skill_dict
         assert skill_dict["tags"] == ["test"]
+
+    def test_parse_skill_zip_returns_cleanup_path(self, tmp_path):
+        processor = SkillProcessor(vikingdb=None)
+        archive = tmp_path / "skill.zip"
+        with zipfile.ZipFile(archive, "w") as zipf:
+            zipf.writestr(
+                "zip-skill/SKILL.md",
+                "---\nname: zip-skill\ndescription: Zip skill\n---\n\n# Zip Skill\n",
+            )
+            zipf.writestr("zip-skill/helper.txt", "helper")
+
+        skill_dict, aux_files, base_path, cleanup_path = processor._parse_skill(archive)
+
+        assert skill_dict["name"] == "zip-skill"
+        assert cleanup_path is not None
+        assert cleanup_path.exists()
+        assert base_path is not None
+        assert base_path.exists()
+        assert len(aux_files) == 1
+        shutil.rmtree(cleanup_path, ignore_errors=True)
+
+    def test_parse_skill_accepts_single_file_with_non_standard_name(self, tmp_path):
+        processor = SkillProcessor(vikingdb=None)
+        skill_file = tmp_path / "custom-name.md"
+        skill_file.write_text(
+            "---\nname: custom-name\ndescription: Custom filename skill\n---\n\n# Skill\n",
+            encoding="utf-8",
+        )
+
+        skill_dict, aux_files, base_path, cleanup_path = processor._parse_skill(skill_file)
+
+        assert skill_dict["name"] == "custom-name"
+        assert skill_dict["source_path"].endswith("custom-name.md")
+        assert aux_files == []
+        assert base_path is None
+        assert cleanup_path is None
+
+    def test_parse_skill_prefers_source_path_hint_for_single_file(self, tmp_path):
+        processor = SkillProcessor(vikingdb=None)
+        uploaded_path = tmp_path / "upload_123.md"
+        uploaded_path.write_text(
+            "---\nname: hinted-skill\ndescription: Hint source path\n---\n\n# Skill\n",
+            encoding="utf-8",
+        )
+
+        skill_dict, _, _, _ = processor._parse_skill(
+            uploaded_path,
+            source_path_hint="hinted-skill.md",
+        )
+
+        assert skill_dict["source_path"] == "hinted-skill.md"
 
     @pytest.mark.parametrize("skill_dict", [{}, {"description": "missing name"}])
     def test_validate_skill_dict_requires_name_field(self, skill_dict):
@@ -98,20 +152,17 @@ class TestParseSkillNoneData:
 
 
 @pytest.mark.asyncio
-async def test_process_skill_preserves_hyphenated_allowed_tools_in_meta(monkeypatch):
-    config = MagicMock()
-    config.vlm.get_completion_async = AsyncMock(return_value="overview")
-    monkeypatch.setattr(
-        "openviking.utils.skill_processor.get_openviking_config",
-        lambda: config,
-    )
-
+async def test_process_skill_preserves_hyphenated_allowed_tools_in_meta():
     vikingdb = MagicMock()
     vikingdb.enqueue_embedding_msg = AsyncMock(return_value=False)
     viking_fs = MagicMock()
     viking_fs.write_context = AsyncMock()
+    viking_fs._async_agfs.pathlock_acquire_tree = AsyncMock(return_value={"lease_ref": "test"})
+    viking_fs._async_agfs.pathlock_release = AsyncMock()
 
     processor = SkillProcessor(vikingdb=vikingdb)
+    processor._write_skill_content = AsyncMock()
+    processor._enqueue_skill_package = AsyncMock()
     result = await processor.process_skill(
         data={
             "name": "dict-skill",
@@ -126,10 +177,14 @@ async def test_process_skill_preserves_hyphenated_allowed_tools_in_meta(monkeypa
     )
 
     assert result["name"] == "dict-skill"
-    written_content = viking_fs.write_context.await_args.kwargs["content"]
-    assert "allowed-tools:" in written_content
-    assert "- Read" in written_content
+    from openviking.core.skill_loader import SkillLoader
+
+    written = processor._write_skill_content.await_args.kwargs
+    assert written["overview"] == "# Dict Skill"
+    written_content = SkillLoader.to_skill_md(written["skill_dict"])
+    assert "allowed-tools: Read" in written_content
     assert "tags:" in written_content
-    embedding_msg = vikingdb.enqueue_embedding_msg.await_args.args[0]
-    assert embedding_msg.context_data["meta"]["allowed_tools"] == ["Read"]
-    assert embedding_msg.context_data["meta"]["tags"] == ["dict"]
+    assert written["skill_dict"]["allowed_tools"] == ["Read"]
+    assert written["skill_dict"]["tags"] == ["dict"]
+    processor._enqueue_skill_package.assert_awaited_once()
+    viking_fs._async_agfs.pathlock_release.assert_not_awaited()

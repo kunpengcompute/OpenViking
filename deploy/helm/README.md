@@ -33,6 +33,9 @@ helm upgrade --install openviking ./deploy/helm/openviking --set image.tag=v0.3.
 helm upgrade --install openviking ./deploy/helm/openviking --set image.tag=
 ```
 
+We recommend the `ghcr.io` image. If `ghcr.io` is hard to reach, add
+`--set image.repository=openviking-cn-beijing.cr.volces.com/volcengine/openviking`.
+
 ### Install with Custom Values
 
 Create a `my-values.yaml` file:
@@ -76,7 +79,7 @@ config:
     api_base: "https://ark.cn-beijing.volces.com/api/v3"
     api_key: "your-volcengine-api-key"
     provider: "volcengine"
-    model: "doubao-seed-2-0-pro-260215"
+    model: "doubao-seed-2-0-lite-260428"
     temperature: 0.0
     max_retries: 2
     thinking: false
@@ -136,6 +139,54 @@ OpenViking expands environment variables inside `ov.conf` at startup, so the
 ConfigMap can contain placeholders while the actual secrets stay in Kubernetes
 Secrets.
 
+### OpenViking Gateway
+
+The chart can run [OpenViking Gateway](https://docs.openviking.ai/en/guides/15-gateway)
+as a second container in the OpenViking pod, sharing its volume and `ov.conf`. The gateway
+requires OpenViking Server to use API key authentication.
+
+Create a Secret with the fixed keys `encryption-key` and `admin-token`:
+
+```bash
+kubectl create secret generic openviking-gateway \
+  --from-literal=encryption-key="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')" \
+  --from-literal=admin-token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+```
+
+Back up the encryption key along with the volume. The gateway can read its stored data only
+with this exact key, and the key can't be rotated.
+
+Then enable the gateway in your values:
+
+```yaml
+gateway:
+  enabled: true
+  existingSecret: openviking-gateway
+  workers: 2
+
+config:
+  server:
+    auth_mode: api_key
+  gateway:
+    public_url: https://ov.example.com
+```
+
+- The chart generates the rest of `config.gateway`: bind address, port, workers,
+  internal URLs and a `storage_path` on the data volume. Values you set under
+  `config.gateway` take precedence.
+- Set `public_url` to the address clients use, written out literally. The gateway does not
+  expand `${VAR}` placeholders, and its container does not receive `extraEnv`.
+- With the ingress enabled, the chart routes `/v1`, `/api/v3`, `/api/compatible/v1` and
+  `/gateway/uploads` to the gateway. It never routes the gateway's `/admin` paths;
+  keep it that way in your own ingress rules.
+- Keep `replicaCount: 1`. The gateway's storage must be used from a single host; scale with
+  `gateway.workers` instead.
+
+The chart does not set ingress annotations. Model requests stream and can be large, so turn off
+proxy buffering and allow 32 MiB request bodies and 600-second read timeouts. For the NGINX
+annotations, Studio setup and troubleshooting, see
+[OpenViking Gateway deployment and operations](https://docs.openviking.ai/en/guides/22-gateway-operations#helm).
+
 ## Configuration
 
 | Parameter | Description | Default |
@@ -160,6 +211,11 @@ Secrets.
 | `config.server.root_api_key` | API key required when server binds to 0.0.0.0 | `""` |
 | `config` | Full ov.conf configuration object | See `values.yaml` |
 | `extraEnv` | Additional environment variables | `[]` |
+| `gateway.enabled` | Run OpenViking Gateway as a second container in the pod | `false` |
+| `gateway.existingSecret` | Secret with `encryption-key` and `admin-token`; required when enabled | `""` |
+| `gateway.workers` | Gateway worker processes | `2` |
+| `gateway.port` | Gateway container and Service port | `1935` |
+| `gateway.resources` | Gateway container resources | `{}` |
 
 ## Upgrading
 
@@ -176,8 +232,8 @@ multiple pods accessing the same RocksDB volume simultaneously.
 helm uninstall openviking
 ```
 
-Note: The PersistentVolumeClaim is not deleted automatically. To remove stored
-data:
+Note: The PersistentVolumeClaim is retained by Helm and becomes orphaned after
+uninstall. Delete it explicitly to remove the stored data:
 
 ```bash
 kubectl delete pvc openviking-data

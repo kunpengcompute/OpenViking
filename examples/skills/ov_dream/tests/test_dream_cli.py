@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def _load_dream_module():
@@ -19,7 +19,9 @@ def _load_dream_module():
 dream = _load_dream_module()
 
 
-def _write_session(path: Path, session_id: str, messages: list[tuple[str, str, str]] | None = None) -> None:
+def _write_session(
+    path: Path, session_id: str, messages: list[tuple[str, str, str]] | None = None
+) -> None:
     rows = [
         {"id": session_id, "timestamp": "2026-04-20T00:00:00Z", "cwd": "/tmp"},
     ]
@@ -34,7 +36,9 @@ def _write_session(path: Path, session_id: str, messages: list[tuple[str, str, s
                 },
             }
         )
-    path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8"
+    )
 
 
 def test_normalize_raw_ov_recall_phrase() -> None:
@@ -48,8 +52,16 @@ def test_recall_expands_default_user_root_to_explicit_user_space(monkeypatch) ->
     assert client._resolve_target_uri("viking://user/default") == "viking://user/default"
     assert client._resolve_target_uri("viking://user/default/") == "viking://user/default"
     assert client._resolve_target_uri("viking://user/memories") == "viking://user/default/memories/"
-    assert client._resolve_target_uri("viking://user/memories/") == "viking://user/default/memories/"
-    assert client._resolve_target_uri("viking://user/default/memories/") == "viking://user/default/memories/"
+    assert (
+        client._resolve_target_uri("viking://user/memories/") == "viking://user/default/memories/"
+    )
+    assert (
+        client._resolve_target_uri("viking://user/default/memories/")
+        == "viking://user/default/memories/"
+    )
+    # Home alias resolves to the same explicit-uid target as the legacy spelling.
+    assert client._resolve_target_uri("viking://~/memories") == "viking://user/default/memories/"
+    assert client._resolve_target_uri("viking://~/memories/") == "viking://user/default/memories/"
 
 
 def test_recall_default_target_uri_is_user_root() -> None:
@@ -60,7 +72,7 @@ def test_recall_default_target_uri_is_user_root() -> None:
             calls.append((method, path, payload))
             return {"memories": []}
 
-    client = RecordingClient(base_url=dream.SERVERLESS_BASE_URL, api_key="test-key", agent_id="test-agent")
+    client = RecordingClient(base_url=dream.SERVERLESS_BASE_URL, api_key="test-key")
 
     client.recall("hello")
 
@@ -77,16 +89,14 @@ def test_recall_default_target_uri_is_user_root() -> None:
     ]
 
 
-def test_serverless_headers_use_bearer_and_agent_id() -> None:
+def test_serverless_headers_use_bearer_auth() -> None:
     client = dream.OpenVikingClient(
         base_url=dream.SERVERLESS_BASE_URL,
         api_key="test-key",
-        agent_id="test-agent",
     )
 
     assert client.auth_mode == "serverless"
     assert client._headers()["Authorization"] == "Bearer test-key"
-    assert client._headers()["X-OpenViking-Agent"] == "test-agent"
     assert "X-API-Key" not in client._headers()
     assert "X-OpenViking-User" not in client._headers()
 
@@ -102,7 +112,6 @@ def test_serverless_sync_reuses_source_session_id_and_uses_parts_payload() -> No
     client = RecordingClient(
         base_url=dream.SERVERLESS_BASE_URL,
         api_key="test-key",
-        agent_id="test-agent",
     )
 
     client.add_session_message("source-session", "user", "hello")
@@ -214,9 +223,15 @@ def test_get_active_sessions_filters_index_entries(tmp_path: Path) -> None:
         json.dumps(
             {
                 "agent:main:main": {"sessionId": "main", "sessionFile": "main.jsonl"},
-                "agent:main:telegram:direct:123": {"sessionId": "direct", "sessionFile": str(kept_direct)},
+                "agent:main:telegram:direct:123": {
+                    "sessionId": "direct",
+                    "sessionFile": str(kept_direct),
+                },
                 "agent:main:cron:daily": {"sessionId": "cron", "sessionFile": str(skipped_cron)},
-                "agent:main:subagent:child": {"sessionId": "subagent", "sessionFile": str(skipped_subagent)},
+                "agent:main:subagent:child": {
+                    "sessionId": "subagent",
+                    "sessionFile": str(skipped_subagent),
+                },
             }
         ),
         encoding="utf-8",
@@ -245,6 +260,17 @@ def test_sync_active_session_syncs_chat_sessions_with_independent_cursors(tmp_pa
         "main",
         [("user", "hello from main", "2026-04-20T00:01:00Z")],
     )
+    with main_file.open("a", encoding="utf-8") as session_file:
+        session_file.write(
+            json.dumps(
+                {
+                    "type": "message",
+                    "timestamp": "2026-04-20T00:01:30Z",
+                    "message": {"role": "assistant", "content": "plain string from main"},
+                }
+            )
+            + "\n"
+        )
     _write_session(
         direct_file,
         "direct",
@@ -259,7 +285,10 @@ def test_sync_active_session_syncs_chat_sessions_with_independent_cursors(tmp_pa
         json.dumps(
             {
                 "agent:main:main": {"sessionId": "main", "sessionFile": str(main_file)},
-                "agent:main:telegram:direct:123": {"sessionId": "direct", "sessionFile": str(direct_file)},
+                "agent:main:telegram:direct:123": {
+                    "sessionId": "direct",
+                    "sessionFile": str(direct_file),
+                },
                 "agent:main:cron:daily": {"sessionId": "cron", "sessionFile": str(cron_file)},
             }
         ),
@@ -282,16 +311,17 @@ def test_sync_active_session_syncs_chat_sessions_with_independent_cursors(tmp_pa
     summary = dream.sync_active_session(client, openclaw_root, state_root)
 
     assert summary["session_count"] == 2
-    assert summary["synced_count"] == 2
+    assert summary["synced_count"] == 3
     assert client.messages == [
         ("main", "user", "hello from main"),
+        ("main", "assistant", "plain string from main"),
         ("direct", "assistant", "hello from direct"),
     ]
     assert client.commits == [("main", True), ("direct", True)]
 
     state = json.loads((state_root / "ov_dream_sync.json").read_text(encoding="utf-8"))
     assert state["sessions"]["main"]["session_key"] == "agent:main:main"
-    assert state["sessions"]["main"]["last_synced_timestamp"] == "2026-04-20T00:01:00Z"
+    assert state["sessions"]["main"]["last_synced_timestamp"] == "2026-04-20T00:01:30Z"
     assert state["sessions"]["direct"]["session_key"] == "agent:main:telegram:direct:123"
     assert state["sessions"]["direct"]["last_synced_timestamp"] == "2026-04-20T00:02:00Z"
     assert "cron" not in state["sessions"]

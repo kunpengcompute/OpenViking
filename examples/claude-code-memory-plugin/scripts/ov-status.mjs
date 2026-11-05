@@ -4,9 +4,9 @@
  * Status report for the OpenViking memory plugin — invoked by the `/ov`
  * slash command. Prints a tight human-readable summary covering:
  *   - Server URL + /health probe
- *   - Resolved identity (account/user/agent)
+ *   - Resolved identity (account/user)
  *   - Last session-start injection (size, age, audit path)
- *   - Last auto-recall (item count, top score, token budget use)
+ *   - Last auto-recall (item count, token budget use)
  *   - Toggle state for the three injection paths
  *   - Auth source — which file/env actually drove url + api_key, mirroring
  *     config.mjs's priority chain (env → ovcli.conf → ov.conf → default)
@@ -73,7 +73,7 @@ async function main() {
   console.log(`OpenViking — ${cfg.baseUrl}  (${health.ok ? "✓" : "✗"} /health ${latency}ms)`);
   console.log(
     `Identity: account=${cfg.accountId || "(unset)"}  ` +
-    `user=${cfg.userId || "(server-resolved)"}  agent=${cfg.agentId}`,
+    `user=${cfg.userId || "(server-resolved)"}`,
   );
   console.log("");
 
@@ -94,12 +94,11 @@ async function main() {
   // 3. Last auto-recall
   const recall = readJsonState("last-recall.json");
   if (recall) {
-    const top = typeof recall.top_score === "number" ? recall.top_score.toFixed(2) : "?";
     const used = recall.tokens_used ?? 0;
     const budget = recall.tokens_budget ?? 0;
     console.log(
       `Last auto-recall: ${fmtAge(recall.ts)} — ${recall.count ?? 0} items, ` +
-      `top ${top}, ${used}/${budget} tokens (${recall.reason || "ok"})`,
+      `${used}/${budget} tokens (${recall.reason || "ok"})`,
     );
   } else {
     console.log("Last auto-recall: (none yet)");
@@ -134,10 +133,10 @@ async function main() {
     : (cliConf?.url) ? cliShort
     : (ovConf?.server?.url) ? ovShort
     : "default";
-  const keySrc = (process.env.OPENVIKING_API_KEY || process.env.OPENVIKING_BEARER_TOKEN) ? "env"
-    : (cliConf?.api_key) ? cliShort
-    : (ovConf?.claude_code?.apiKey) ? ovShort
-    : (ovConf?.server?.root_api_key) ? ovShort
+  // Taken from loadConfig() so this line and the MCP proxy always name the
+  // same file.
+  const keySrc = cfg.apiKeySource === "env" ? "env"
+    : cfg.credentialPath ? homeShort(cfg.credentialPath)
     : "(none)";
   console.log(`Auth: url from ${urlSrc}, api_key from ${keySrc}`);
 }

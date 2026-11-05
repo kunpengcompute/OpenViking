@@ -120,6 +120,15 @@ store backend，而不是让多个实例各写各的本地 SQLite。
 
 `2xx` 和 `3xx` 记为 `success`，`4xx/5xx` 记为 `error`。Dashboard 今日检索只展示成功请求数。
 
+`usage_retrieval_hourly.result_count` 累加成功 HTTP 响应中的最终结果条数：列表模式使用
+`total`，`search` 的 context 模式使用 `entries` 长度。失败请求只增加请求数。
+该值随 `http.request` 写入，不累加内部 `retrieval.completed` 的结果数；一次 HTTP 请求
+可能触发多个内部检索并去重、截断，因此不能直接与进程启动以来的 retrieval observer
+计数对齐。现有统计范围仍为上表两个端点，不包含 MCP 或已弃用的 `/recall`。
+
+结果总数不是零结果请求数，仅凭 `request_count` 和 `result_count` 无法还原零结果率。
+修复前已有桶中的结果数仍为历史零值，不会回填。
+
 ### 上下文提交热力图
 
 来自成功的公开写请求：
@@ -154,13 +163,19 @@ vector filter，也不从历史写入事件累计当前库存。
 - `request_id`
 - `account_id`
 - `user_id`
-- `agent_id`
 - `method`
 - `route`
 - `api_type`
 - `status_code`
 - `duration_ms`
+- `error_code`（仅标准错误响应）
+- `error_message`（仅标准错误响应）
+- `error_details`（仅标准错误响应，可空）
 - `created_at`
+
+错误字段来自 OpenViking 已返回给调用方的标准错误结构，不读取或缓存 HTTP response
+body。`error_details` 经过凭据脱敏和大小限制；它可能包含被拒绝的参数值，但不会额外保存
+原始 request body、header、query string、stack trace 或 exception text。
 
 以下 route 不进入审计：
 
@@ -232,15 +247,6 @@ GET /api/v1/console/dashboard/summary
       "find": 10,
       "search": 4,
       "total": 14
-    },
-    "agent_overview": {
-      "total": 2,
-      "items": [
-        {
-          "agent_id": "agent-1",
-          "last_seen_at": "2026-05-12T10:00:00+08:00"
-        }
-      ]
     }
   }
 }
@@ -343,7 +349,6 @@ curl -X POST "http://127.0.0.1:1933/api/v1/search/find" \
   -H "Authorization: Bearer $OPENVIKING_API_KEY" \
   -H "X-OpenViking-Account: default" \
   -H "X-OpenViking-User: default" \
-  -H "X-OpenViking-Agent: default" \
   -H "Content-Type: application/json" \
   -d '{"query":"hello","limit":3}'
 ```
@@ -355,7 +360,6 @@ curl "http://127.0.0.1:1933/api/v1/console/dashboard/summary" \
   -H "Authorization: Bearer $OPENVIKING_API_KEY" \
   -H "X-OpenViking-Account: default" \
   -H "X-OpenViking-User: default" \
-  -H "X-OpenViking-Agent: default"
 ```
 
 如果使用 Console server，则访问 `/console/api/v1/ov/console/*` 代理路径。

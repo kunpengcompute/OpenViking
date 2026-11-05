@@ -1,8 +1,12 @@
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme;
+use colored::Colorize;
+
 const MAX_COL_WIDTH: usize = 256;
+const MAX_SINGLE_LINE_VALUE_WIDTH: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutputFormat {
@@ -22,7 +26,7 @@ impl From<&str> for OutputFormat {
 pub fn output_success<T: Serialize>(result: T, format: OutputFormat, compact: bool) {
     if matches!(format, OutputFormat::Json) {
         if compact {
-            println!("{}", json!({ "ok": true, "result": result }));
+            println!("{}", compact_success_value(result));
         } else {
             println!(
                 "{}",
@@ -34,22 +38,39 @@ pub fn output_success<T: Serialize>(result: T, format: OutputFormat, compact: bo
     }
 }
 
-#[allow(dead_code)]
-pub fn output_error(code: &str, message: &str, format: OutputFormat, compact: bool) {
-    if matches!(format, OutputFormat::Json) && compact {
-        eprintln!(
-            "{}",
-            json!({
-                "ok": false,
-                "error": {
-                    "code": code,
-                    "message": message
-                }
-            })
-        );
+fn compact_success_value<T: Serialize>(result: T) -> Value {
+    let mut obj = match serde_json::to_value(result).unwrap_or(Value::Null) {
+        Value::Object(obj) => obj,
+        value => return json!({ "ok": true, "result": value }),
+    };
+
+    let had_profile = obj.contains_key("profile");
+    let profile = obj.remove("profile").filter(|value| !value.is_null());
+    let has_more = if obj.contains_key("result") {
+        obj.remove("has_more").filter(|value| !value.is_null())
     } else {
-        eprintln!("ERROR[{}]: {}", code, message);
+        None
+    };
+    let result = if (had_profile || has_more.is_some())
+        && obj.len() == 1
+        && obj.contains_key("result")
+    {
+        obj.remove("result").unwrap_or(Value::Null)
+    } else {
+        Value::Object(obj)
+    };
+
+    let mut response = match profile {
+        Some(profile) => json!({ "status": "ok", "result": result, "profile": profile }),
+        None => json!({ "ok": true, "result": result }),
+    };
+    if let Some(has_more) = has_more {
+        response
+            .as_object_mut()
+            .expect("success response must be an object")
+            .insert("has_more".to_string(), has_more);
     }
+    response
 }
 
 fn print_table<T: Serialize>(result: T, compact: bool) {
@@ -71,7 +92,7 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
 
     // Handle string result
     if let Some(s) = value.as_str() {
-        println!("{}", s);
+        println!("{}", theme::body(s));
         return;
     }
 
@@ -83,7 +104,7 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
                 return;
             }
         } else {
-            println!("(empty)");
+            println!("{}", theme::muted("(empty)"));
             return;
         }
     }
@@ -115,7 +136,7 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
                 let status = obj["status"].as_str().unwrap_or("");
                 println!(
                     "{}",
-                    append_profile_section(format!("[{}] ({})\n{}", name, health, status), obj)
+                    append_profile_section(render_component_status(name, health, status), obj)
                 );
                 return;
             }
@@ -138,13 +159,21 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
                 } else {
                     "unhealthy"
                 };
-                lines.push(format!("[system] ({})", health));
+                lines.push(format!(
+                    "{} {}",
+                    theme::heading("[system]").bold(),
+                    style_health_label(health)
+                ));
                 if let Some(errors) = obj.get("errors") {
                     if let Some(err_list) = errors.as_array() {
                         let error_strs: Vec<&str> =
                             err_list.iter().filter_map(|e| e.as_str()).collect();
                         if !error_strs.is_empty() {
-                            lines.push(format!("Errors: {}", error_strs.join(", ")));
+                            lines.push(format!(
+                                "{} {}",
+                                theme::error("Errors:").bold(),
+                                theme::body(error_strs.join(", "))
+                            ));
                         }
                     }
                 }
@@ -178,9 +207,13 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
                     }
                 }
             }
+            let expandable_lists_are_entire_payload =
+                obj.keys().filter(|key| key.as_str() != "profile").count()
+                    == dict_lists.len() + prim_lists.len();
 
             // Rule 3a: single list[primitive] -> one item per line
-            if dict_lists.is_empty() && prim_lists.len() == 1 {
+            if expandable_lists_are_entire_payload && dict_lists.is_empty() && prim_lists.len() == 1
+            {
                 let (key, items) = &prim_lists[0];
                 let col = if key.ends_with("es") {
                     key.strip_suffix("es").unwrap_or(key)
@@ -202,7 +235,8 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
             }
 
             // Rule 3b: single list[dict] -> render directly
-            if dict_lists.len() == 1 && prim_lists.is_empty() {
+            if expandable_lists_are_entire_payload && dict_lists.len() == 1 && prim_lists.is_empty()
+            {
                 let (_key, items) = &dict_lists[0];
                 if let Some(table) = format_array_to_table(items, compact) {
                     println!("{}", append_profile_section(table, obj));
@@ -211,7 +245,7 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
             }
 
             // Rule 2: multiple list[dict] -> flatten with type column
-            if !dict_lists.is_empty() {
+            if expandable_lists_are_entire_payload && !dict_lists.is_empty() {
                 let mut merged: Vec<serde_json::Value> = Vec::new();
                 for (key, items) in &dict_lists {
                     let type_name = if key.ends_with("es") {
@@ -256,9 +290,13 @@ fn print_table<T: Serialize>(result: T, compact: bool) {
                     }
                     let is_uri = k == "uri";
                     let formatted_value = format_value(v);
-                    let (content, _) = truncate_string(&formatted_value, is_uri, MAX_COL_WIDTH);
+                    let (content, _) = truncate_string(&formatted_value, is_uri, MAX_SINGLE_LINE_VALUE_WIDTH);
                     let padded_key = pad_cell(k, max_key_width, false);
-                    output.push_str(&format!("{}  {}\n", padded_key, content));
+                    output.push_str(&format!(
+                        "{}  {}\n",
+                        theme::muted(padded_key),
+                        style_table_value(&content, is_uri)
+                    ));
                 }
                 println!("{}", append_profile_section(output, obj));
                 return;
@@ -297,7 +335,13 @@ fn value_to_table_with_profile(value: &serde_json::Value, compact: bool) -> Opti
             }
             let is_uri = k == "uri";
             let formatted_value = format_value(v);
-            let (content, _) = truncate_string(&formatted_value, is_uri, MAX_COL_WIDTH);
+            // For single-line key-value pairs, use wider limit for complex values
+            let max_width = if matches!(v, serde_json::Value::Object(_) | serde_json::Value::Array(_)) {
+                MAX_SINGLE_LINE_VALUE_WIDTH
+            } else {
+                MAX_COL_WIDTH
+            };
+            let (content, _) = truncate_string(&formatted_value, is_uri, max_width);
             let padded_key = pad_cell(k, max_key_width, false);
             output.push_str(&format!("{}  {}\n", padded_key, content));
         }
@@ -341,10 +385,7 @@ pub fn render_profiled_scalar_result(value: &serde_json::Value) -> Option<String
     Some(append_profile_section(result.to_string(), obj))
 }
 
-pub fn append_profile_to_rendered(
-    rendered: String,
-    value: &serde_json::Value,
-) -> String {
+pub fn append_profile_to_rendered(rendered: String, value: &serde_json::Value) -> String {
     let Some(obj) = value.as_object() else {
         return rendered;
     };
@@ -377,7 +418,7 @@ fn value_to_table(value: &serde_json::Value, compact: bool) -> Option<String> {
             };
             let name = obj["name"].as_str().unwrap_or("");
             let status = obj["status"].as_str().unwrap_or("");
-            return Some(format!("[{}] ({})\n{}", name, health, status));
+            return Some(render_component_status(name, health, status));
         }
 
         // Extract list fields
@@ -401,9 +442,12 @@ fn value_to_table(value: &serde_json::Value, compact: bool) -> Option<String> {
                 }
             }
         }
+        let expandable_lists_are_entire_payload =
+            obj.keys().filter(|key| key.as_str() != "profile").count()
+                == dict_lists.len() + prim_lists.len();
 
         // Rule 3a: single list[primitive] -> one item per line
-        if dict_lists.is_empty() && prim_lists.len() == 1 {
+        if expandable_lists_are_entire_payload && dict_lists.is_empty() && prim_lists.len() == 1 {
             let (key, items) = &prim_lists[0];
             let col = if key.ends_with("es") {
                 key.strip_suffix("es").unwrap_or(key)
@@ -422,13 +466,13 @@ fn value_to_table(value: &serde_json::Value, compact: bool) -> Option<String> {
         }
 
         // Rule 3b: single list[dict] -> render directly
-        if dict_lists.len() == 1 && prim_lists.is_empty() {
+        if expandable_lists_are_entire_payload && dict_lists.len() == 1 && prim_lists.is_empty() {
             let (_key, items) = &dict_lists[0];
             return format_array_to_table(items, compact);
         }
 
         // Rule 2: multiple list[dict] -> flatten with type column
-        if !dict_lists.is_empty() {
+        if expandable_lists_are_entire_payload && !dict_lists.is_empty() {
             let mut merged: Vec<serde_json::Value> = Vec::new();
             for (key, items) in &dict_lists {
                 let type_name = if key.ends_with("es") {
@@ -696,8 +740,8 @@ fn summarize_message_content(parts: Option<&Vec<serde_json::Value>>) -> String {
 }
 
 struct ColumnInfo {
-    max_width: usize,    // Max width for alignment (capped at 120)
-    is_numeric: bool,    // True if all values in column are numeric
+    max_width: usize,          // Max width for alignment (capped at 120)
+    is_numeric: bool,          // True if all values in column are numeric
     is_unbounded_column: bool, // True if column should respect server-side length
 }
 
@@ -712,7 +756,7 @@ fn format_array_to_table(items: &Vec<serde_json::Value>, compact: bool) -> Optio
         let mut output = String::new();
         for item in items {
             let (content, _) = truncate_string(&format_value(item), false, MAX_COL_WIDTH);
-            output.push_str(&format!("{}\n", content));
+            output.push_str(&format!("{}\n", theme::body(content)));
         }
         return Some(output);
     }
@@ -800,7 +844,11 @@ fn format_array_to_table(items: &Vec<serde_json::Value>, compact: bool) -> Optio
     let header_cells: Vec<String> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| pad_cell(k, column_info[i].max_width, false))
+        .map(|(i, k)| {
+            theme::heading(pad_cell(k, column_info[i].max_width, false))
+                .bold()
+                .to_string()
+        })
         .collect();
     output.push_str(&header_cells.join("  "));
     output.push('\n');
@@ -818,13 +866,15 @@ fn format_array_to_table(items: &Vec<serde_json::Value>, compact: bool) -> Optio
                     let (content, skip_padding) =
                         truncate_string(&value, info.is_unbounded_column, info.max_width);
 
-                    if skip_padding {
+                    let padded = if skip_padding {
                         // Long URI, output as-is without padding
                         content
                     } else {
                         // Normal cell, apply padding and alignment
                         pad_cell(&content, info.max_width, info.is_numeric)
-                    }
+                    };
+
+                    style_table_value(&padded, info.is_unbounded_column).to_string()
                 })
                 .collect();
 
@@ -834,6 +884,66 @@ fn format_array_to_table(items: &Vec<serde_json::Value>, compact: bool) -> Optio
     }
 
     Some(output)
+}
+
+fn render_component_status(name: &str, health: &str, status: &str) -> String {
+    format!(
+        "{} {}\n{}",
+        theme::heading(format!("[{name}]")).bold(),
+        style_health_label(health),
+        theme::body(status)
+    )
+}
+
+fn style_health_label(value: &str) -> String {
+    let styled = match value.to_ascii_lowercase().as_str() {
+        "healthy" | "ok" | "true" => theme::success(value).bold(),
+        "unhealthy" | "error" | "false" => theme::error(value).bold(),
+        _ => theme::warning(value).bold(),
+    };
+    format!("({styled})")
+}
+
+fn style_table_value(value: &str, is_uri: bool) -> String {
+    let trimmed = value.trim();
+    if is_uri
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("~/")
+    {
+        return theme::sky_value(value).bold().to_string();
+    }
+
+    match table_value_tone(trimmed) {
+        TableValueTone::Success => theme::success(value).bold().to_string(),
+        TableValueTone::Warning => theme::warning(value).bold().to_string(),
+        TableValueTone::Error => theme::error(value).bold().to_string(),
+        TableValueTone::Muted => theme::muted(value).to_string(),
+        TableValueTone::Body => theme::body(value).to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableValueTone {
+    Success,
+    Warning,
+    Error,
+    Muted,
+    Body,
+}
+
+fn table_value_tone(trimmed: &str) -> TableValueTone {
+    match trimmed.to_ascii_lowercase().as_str() {
+        "healthy" | "ok" | "true" | "success" | "completed" | "done" | "connected" => {
+            TableValueTone::Success
+        }
+        "running" | "in_progress" | "in-progress" | "pending" | "queued" | "processing"
+        | "cancelling" | "checking" | "warning" => TableValueTone::Warning,
+        "unhealthy" | "failed" | "error" | "false" | "cancelled" | "canceled" | "timeout"
+        | "timed_out" | "unreachable" => TableValueTone::Error,
+        "unknown" | "null" | "(empty)" => TableValueTone::Muted,
+        _ => TableValueTone::Body,
+    }
 }
 
 fn format_value(v: &serde_json::Value) -> String {
@@ -883,12 +993,12 @@ fn truncate_string(s: &str, is_unbounded: bool, max_width: usize) -> (String, bo
     }
 
     // Normal truncation - truncate by display width
-    if display_width > MAX_COL_WIDTH {
+    if display_width > max_width {
         let mut current_width = 0;
         let mut truncated = String::new();
         for ch in s.chars() {
             let ch_width = ch.width().unwrap_or(0);
-            if current_width + ch_width > MAX_COL_WIDTH - 3 {
+            if current_width + ch_width > max_width.saturating_sub(3) {
                 break;
             }
             current_width += ch_width;
@@ -903,6 +1013,7 @@ fn truncate_string(s: &str, is_unbounded: bool, max_width: usize) -> (String, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use colored::Colorize;
     use serde_json::json;
 
     #[test]
@@ -946,6 +1057,44 @@ mod tests {
     }
 
     #[test]
+    fn task_status_values_map_to_severity_tones() {
+        assert_eq!(table_value_tone("completed"), TableValueTone::Success);
+        assert_eq!(table_value_tone("done"), TableValueTone::Success);
+        assert_eq!(table_value_tone("connected"), TableValueTone::Success);
+
+        assert_eq!(table_value_tone("running"), TableValueTone::Warning);
+        assert_eq!(table_value_tone("pending"), TableValueTone::Warning);
+        assert_eq!(table_value_tone("cancelling"), TableValueTone::Warning);
+        assert_eq!(table_value_tone("queued"), TableValueTone::Warning);
+        assert_eq!(table_value_tone("processing"), TableValueTone::Warning);
+
+        assert_eq!(table_value_tone("failed"), TableValueTone::Error);
+        assert_eq!(table_value_tone("cancelled"), TableValueTone::Error);
+        assert_eq!(table_value_tone("unreachable"), TableValueTone::Error);
+
+        assert_eq!(table_value_tone("unknown"), TableValueTone::Muted);
+        assert_eq!(table_value_tone("task-1"), TableValueTone::Body);
+    }
+
+    #[test]
+    fn rendered_status_column_uses_severity_colors() {
+        let rows = vec![json!({
+            "task_id": "task-1",
+            "status": "running"
+        })];
+
+        colored::control::set_override(true);
+        let rendered = format_array_to_table(&rows, true).expect("table should render");
+        let expected = theme::warning("running").bold().to_string();
+        colored::control::unset_override();
+
+        assert!(
+            rendered.contains(&expected),
+            "rendered table should color the running status: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn test_profile_section_is_preserved_for_table_objects_with_list_payloads() {
         let value = json!({
             "items": [
@@ -958,7 +1107,7 @@ mod tests {
             ]
         });
 
-        let rendered = value_to_table_with_profile(&value, true);
+        let rendered = value_to_table_with_profile(&value, true).map(|value| strip_ansi(&value));
 
         assert_eq!(
             rendered,
@@ -975,6 +1124,167 @@ mod tests {
                 ]
                 .join("\n")
             )
+        );
+    }
+
+    #[test]
+    fn test_mixed_object_with_warnings_keeps_scalar_fields() {
+        let value = json!({
+            "status": "success",
+            "root_uri": "viking://resources/www.volcengine.com_1",
+            "task_id": "task-1",
+            "warnings": [
+                "'viking://resources/www.volcengine.com' already exists. Creating 'viking://resources/www.volcengine.com_1'."
+            ]
+        });
+
+        let rendered = value_to_table_with_profile(&value, true).expect("table should render");
+        let rendered = strip_ansi(&rendered);
+
+        assert!(rendered.contains("status"));
+        assert!(rendered.contains("root_uri"));
+        assert!(rendered.contains("task_id"));
+        assert!(rendered.contains("warnings"));
+        assert!(rendered.contains("viking://resources/www.volcengine.com_1"));
+    }
+
+    fn strip_ansi(input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            output.push(ch);
+        }
+
+        output
+    }
+
+    #[test]
+    fn test_compact_json_lifts_profile_next_to_result_for_list_payloads() {
+        let value = json!({
+            "result": [
+                {"id": "1", "name": "alpha"}
+            ],
+            "profile": [
+                "line one"
+            ]
+        });
+
+        let rendered = compact_success_value(value);
+
+        assert_eq!(
+            rendered,
+            json!({
+                "status": "ok",
+                "result": [
+                    {"id": "1", "name": "alpha"}
+                ],
+                "profile": [
+                    "line one"
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_compact_json_lifts_profile_next_to_result_for_object_payloads() {
+        let value = json!({
+            "healthy": true,
+            "version": "0.1.x",
+            "profile": [
+                "line one"
+            ]
+        });
+
+        let rendered = compact_success_value(value);
+
+        assert_eq!(
+            rendered,
+            json!({
+                "status": "ok",
+                "result": {
+                    "healthy": true,
+                    "version": "0.1.x"
+                },
+                "profile": [
+                    "line one"
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_compact_json_treats_null_profile_as_absent() {
+        let value = json!({
+            "result": [
+                {"id": "1", "name": "alpha"}
+            ],
+            "profile": null
+        });
+
+        let rendered = compact_success_value(value.clone());
+
+        assert_eq!(
+            rendered,
+            json!({
+                "ok": true,
+                "result": [
+                    {"id": "1", "name": "alpha"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_compact_json_lifts_has_more_next_to_list_result() {
+        let value = json!({
+            "result": [
+                {"uri": "viking://resources/a.md"}
+            ],
+            "has_more": false
+        });
+
+        let rendered = compact_success_value(value);
+
+        assert_eq!(
+            rendered,
+            json!({
+                "ok": true,
+                "result": [
+                    {"uri": "viking://resources/a.md"}
+                ],
+                "has_more": false
+            })
+        );
+    }
+
+    #[test]
+    fn test_compact_json_keeps_business_has_more_inside_result() {
+        let value = json!({
+            "items": [{"id": "1"}],
+            "has_more": true
+        });
+
+        let rendered = compact_success_value(value);
+
+        assert_eq!(
+            rendered,
+            json!({
+                "ok": true,
+                "result": {
+                    "items": [{"id": "1"}],
+                    "has_more": true
+                }
+            })
         );
     }
 
@@ -1022,17 +1332,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            Some(
-                [
-                    "content",
-                    "",
-                    "profile",
-                    "line one",
-                    "line two",
-                    "",
-                ]
-                .join("\n")
-            )
+            Some(["content", "", "profile", "line one", "line two", "",].join("\n"))
         );
     }
 }

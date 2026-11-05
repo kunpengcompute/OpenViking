@@ -1,4 +1,5 @@
 import os
+import time
 
 import psutil
 import pytest
@@ -11,6 +12,7 @@ TEST_CASE_DESCRIPTIONS = {
     "test_wait_processed.py::TestWaitProcessed::test_wait_processed": "等待资源处理完成",
     "test_fs_ls.py::TestFsLs::test_fs_ls_root": "列出文件系统根目录",
     "test_fs_mkdir.py::TestFsMkdir::test_fs_mkdir": "创建目录",
+    "test_fs_cp.py::TestFsCp::test_cp_file_preserves_source_and_content": "复制文件和向量",
     "test_fs_mv.py::TestFsMv::test_fs_mv": "移动文件/目录",
     "test_fs_read_write.py::TestFsReadWrite::test_fs_read": "读取文件内容",
     "test_fs_rm.py::TestFsRm::test_fs_rm": "删除文件/目录",
@@ -18,13 +20,11 @@ TEST_CASE_DESCRIPTIONS = {
     "test_fs_tree.py::TestFsTree::test_fs_tree": "获取目录树结构",
     "test_get_abstract.py::TestGetAbstract::test_get_abstract": "获取内容摘要",
     "test_get_overview.py::TestGetOverview::test_get_overview": "获取内容概览",
-    "test_link_relations.py::TestLinkRelations::test_link_relations_unlink": "管理内容关联关系",
     "test_add_message.py::TestAddMessage::test_add_message": "向会话添加消息",
     "test_create_session.py::TestCreateSession::test_create_session": "创建会话",
     "test_delete_session.py::TestDeleteSession::test_delete_session": "删除会话",
     "test_get_session.py::TestGetSession::test_get_session": "获取会话信息",
     "test_list_sessions.py::TestListSessions::test_list_sessions": "列出所有会话",
-    "test_session_used_commit.py::TestSessionUsedCommit::test_session_used_commit": "会话使用和提交",
     "test_find.py::TestFind::test_find_basic": "基础查找搜索",
     "test_find.py::TestFind::test_find_with_different_query": "不同查询的查找搜索",
     "test_search.py::TestSearch::test_basic_search": "基础语义搜索",
@@ -50,7 +50,6 @@ TEST_CASE_DESCRIPTIONS = {
     "test_delete_sync.py::TestDeleteSync::test_resource_deletion_index_sync": "资源删除索引同步",
     "test_pack_consistency.py::TestPackConsistency::test_pack_export_import_consistency": "批量导入导出一致性",
     "test_intent_extended_search.py::TestIntentExtendedSearch::test_intent_extended_search": "意图扩展搜索",
-    "test_relation_link.py::TestRelationLink::test_relation_link": "关系链接验证",
     "test_watch_update.py::TestWatchUpdate::test_watch_update": "定时监听更新",
     "test_session_commit.py::TestSessionCommit::test_session_persistence_and_commit": "对话持久化与Commit",
     "test_long_context_recall.py::TestLongContextRecall::test_long_context_recall": "长程上下文召回",
@@ -110,6 +109,7 @@ TEST_CASE_APIS = {
     "test_wait_processed.py::TestWaitProcessed::test_wait_processed": "/api/v1/resources/wait",
     "test_fs_ls.py::TestFsLs::test_fs_ls_root": "/api/v1/fs/ls",
     "test_fs_mkdir.py::TestFsMkdir::test_fs_mkdir": "/api/v1/fs/mkdir",
+    "test_fs_cp.py::TestFsCp::test_cp_file_preserves_source_and_content": "/api/v1/fs/cp",
     "test_fs_mv.py::TestFsMv::test_fs_mv": "/api/v1/fs/mv",
     "test_fs_read_write.py::TestFsReadWrite::test_fs_read": "/api/v1/fs/read",
     "test_fs_rm.py::TestFsRm::test_fs_rm": "/api/v1/fs/rm",
@@ -117,13 +117,11 @@ TEST_CASE_APIS = {
     "test_fs_tree.py::TestFsTree::test_fs_tree": "/api/v1/fs/tree",
     "test_get_abstract.py::TestGetAbstract::test_get_abstract": "/api/v1/fs/abstract",
     "test_get_overview.py::TestGetOverview::test_get_overview": "/api/v1/fs/overview",
-    "test_link_relations.py::TestLinkRelations::test_link_relations_unlink": "/api/v1/fs/relations",
     "test_add_message.py::TestAddMessage::test_add_message": "/api/v1/sessions/messages",
     "test_create_session.py::TestCreateSession::test_create_session": "/api/v1/sessions",
     "test_delete_session.py::TestDeleteSession::test_delete_session": "/api/v1/sessions",
     "test_get_session.py::TestGetSession::test_get_session": "/api/v1/sessions",
     "test_list_sessions.py::TestListSessions::test_list_sessions": "/api/v1/sessions",
-    "test_session_used_commit.py::TestSessionUsedCommit::test_session_used_commit": "/api/v1/sessions/commit",
     "test_find.py::TestFind::test_find_basic": "/api/v1/search/find",
     "test_find.py::TestFind::test_find_with_different_query": "/api/v1/search/find",
     "test_search.py::TestSearch::test_basic_search": "/api/v1/search",
@@ -149,7 +147,6 @@ TEST_CASE_APIS = {
     "test_delete_sync.py::TestDeleteSync::test_resource_deletion_index_sync": "/api/v1/resources,/api/v1/fs/rm,/api/v1/search/find",
     "test_pack_consistency.py::TestPackConsistency::test_pack_export_import_consistency": "/api/v1/resources/pack/export,/api/v1/resources/pack/import",
     "test_intent_extended_search.py::TestIntentExtendedSearch::test_intent_extended_search": "/api/v1/sessions,/api/v1/search",
-    "test_relation_link.py::TestRelationLink::test_relation_link": "/api/v1/fs/relations/link,/api/v1/search/find",
     "test_watch_update.py::TestWatchUpdate::test_watch_update": "/api/v1/resources,/api/v1/system/wait,/api/v1/search",
     "test_session_commit.py::TestSessionCommit::test_session_persistence_and_commit": "/api/v1/sessions,/api/v1/sessions/messages,/api/v1/sessions/commit",
     "test_long_context_recall.py::TestLongContextRecall::test_long_context_recall": "/api/v1/sessions/messages,/api/v1/sessions/commit,/api/v1/search",
@@ -299,37 +296,147 @@ def get_test_category(nodeid):
     return "其他"
 
 
+def _extract_user_key(users, user_id):
+    for user in users:
+        if isinstance(user, dict) and user.get("user_id") == user_id:
+            return user.get("api_key")
+    return None
+
+
+def _fallback_api_test_key(reason: str) -> str:
+    if (
+        Config.OPENVIKING_ROOT_API_KEY
+        and Config.OPENVIKING_API_KEY == Config.OPENVIKING_ROOT_API_KEY
+    ):
+        raise RuntimeError(
+            f"{reason}; refusing to fall back to the ROOT API key for tenant-scoped "
+            "API tests. Bootstrap a user/admin key first, or run in trusted mode "
+            "with explicit account/user identity headers."
+        )
+    print(f"{reason}, 使用配置的 API Key")
+    return Config.OPENVIKING_API_KEY
+
+
+def _extract_user_key_from_response(resp, user_id: str) -> str | None:
+    if resp.status_code != 200:
+        return None
+    users = resp.json().get("result", [])
+    return _extract_user_key(users, user_id)
+
+
+def _retry_existing_user_key(
+    root_client,
+    account_id: str,
+    user_id: str,
+    *,
+    reason: str,
+) -> str | None:
+    for attempt in range(3):
+        resp = root_client.admin_list_users(account_id)
+        user_key = _extract_user_key_from_response(resp, user_id)
+        if user_key:
+            print(f"{reason}; 复用测试用户 {account_id}/{user_id}")
+            return user_key
+        if resp.status_code not in (200, 404):
+            print(f"{reason}; 查询用户列表失败({resp.status_code}): {resp.text[:200]}")
+            return None
+        time.sleep(0.2 * (attempt + 1))
+    return None
+
+
+def _ensure_api_test_user_key(root_client, account_id: str, user_id: str) -> str:
+    resp = root_client.admin_list_users(account_id)
+    if resp.status_code == 404:
+        create_resp = root_client.admin_create_account(account_id, user_id)
+        if create_resp.status_code in (200, 201):
+            data = create_resp.json()
+            user_key = data.get("result", {}).get("user_key")
+            if user_key:
+                print(f"已创建测试账户和用户 {account_id}/{user_id}")
+                return user_key
+        elif create_resp.status_code == 409:
+            user_key = _retry_existing_user_key(
+                root_client,
+                account_id,
+                user_id,
+                reason=f"测试账户/用户并发创建冲突({create_resp.status_code})",
+            )
+            if user_key:
+                return user_key
+        print(f"创建测试账户失败({create_resp.status_code}): {create_resp.text[:200]}")
+        return _fallback_api_test_key("创建测试账户失败")
+
+    if resp.status_code != 200:
+        return _fallback_api_test_key(f"无法查询用户列表({resp.status_code}): {resp.text[:200]}")
+
+    users = resp.json().get("result", [])
+    user_key = _extract_user_key(users, user_id)
+    if user_key:
+        print(f"复用测试用户 {account_id}/{user_id}")
+        return user_key
+
+    user_exists = any(
+        (isinstance(u, dict) and u.get("user_id") == user_id)
+        or (isinstance(u, str) and u == user_id)
+        for u in users
+    )
+    if not user_exists:
+        reg_resp = root_client.admin_register_user(account_id, user_id, role="admin")
+        if reg_resp.status_code in (200, 201):
+            data = reg_resp.json()
+            user_key = data.get("result", {}).get("user_key")
+            if user_key:
+                print(f"已注册测试用户 {account_id}/{user_id}")
+                return user_key
+        elif reg_resp.status_code == 409:
+            user_key = _retry_existing_user_key(
+                root_client,
+                account_id,
+                user_id,
+                reason=f"测试用户并发注册冲突({reg_resp.status_code})",
+            )
+            if user_key:
+                return user_key
+        print(f"注册测试用户失败({reg_resp.status_code}): {reg_resp.text[:200]}")
+        return _fallback_api_test_key("注册测试用户失败")
+
+    role_resp = root_client.admin_set_role(account_id, user_id, "admin")
+    if role_resp.status_code != 200:
+        print(f"设置测试用户角色失败({role_resp.status_code}): {role_resp.text[:200]}")
+
+    key_resp = root_client.admin_regenerate_key(account_id, user_id)
+    if key_resp.status_code == 200:
+        user_key = key_resp.json().get("result", {}).get("user_key")
+        if user_key:
+            print(f"已刷新测试用户 API Key {account_id}/{user_id}")
+            return user_key
+
+    print(f"刷新测试用户 API Key 失败({key_resp.status_code}): {key_resp.text[:200]}")
+    return _fallback_api_test_key("刷新测试用户 API Key 失败")
+
+
 @pytest.fixture(scope="session")
 def api_client():
-    client = OpenVikingAPIClient(server_url=Config.SERVER_URL, api_key=Config.OPENVIKING_API_KEY)
-
     account_id = Config.OPENVIKING_ACCOUNT
     user_id = Config.OPENVIKING_USER
+    root_key = Config.OPENVIKING_ROOT_API_KEY
+    root_client = OpenVikingAPIClient(
+        server_url=Config.SERVER_URL,
+        api_key=root_key,
+        root_api_key=root_key,
+    )
 
     try:
-        resp = client.admin_list_users(account_id)
-        if resp.status_code == 200:
-            data = resp.json()
-            users = data.get("result", [])
-            user_exists = any(
-                (isinstance(u, dict) and u.get("user_id") == user_id)
-                or (isinstance(u, str) and u == user_id)
-                for u in users
-            )
-            if not user_exists:
-                reg_resp = client.admin_register_user(account_id, user_id, role="admin")
-                if reg_resp.status_code in (200, 201):
-                    print(f"已注册用户 {account_id}/{user_id}")
-                else:
-                    print(f"注册用户失败({reg_resp.status_code}): {reg_resp.text[:200]}")
-            else:
-                print(f"用户 {account_id}/{user_id} 已存在")
-        else:
-            print(f"无法查询用户列表({resp.status_code}), 跳过用户注册(可能为开发模式)")
+        api_key = _ensure_api_test_user_key(root_client, account_id, user_id)
     except Exception as e:
         print(f"用户注册检查异常, 跳过: {e}")
+        api_key = Config.OPENVIKING_API_KEY
 
-    return client
+    return OpenVikingAPIClient(
+        server_url=Config.SERVER_URL,
+        api_key=api_key,
+        root_api_key=root_key,
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)

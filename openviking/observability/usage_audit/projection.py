@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from openviking.observability.events import ObservabilityEvent
+from openviking.observability.http_error_context import (
+    sanitize_public_http_error,
+    serialize_public_error_details,
+)
 
 UNKNOWN_IDENTITY = "__unknown__"
 AUDIT_EXCLUDED_ROUTES = frozenset(
@@ -36,7 +40,6 @@ class UsageAuditProjection:
     token_rows: dict[tuple, int] = field(default_factory=dict)
     retrieval_rows: dict[tuple, tuple[int, int]] = field(default_factory=dict)
     context_rows: dict[tuple, int] = field(default_factory=dict)
-    agent_rows: dict[tuple, tuple[int, str]] = field(default_factory=dict)
     audit_rows: list[tuple] = field(default_factory=list)
     touched_audit_accounts: set[str] = field(default_factory=set)
 
@@ -76,14 +79,12 @@ def project_events(
     token_rows: defaultdict[tuple, int] = defaultdict(int)
     retrieval_rows: defaultdict[tuple, tuple[int, int]] = defaultdict(lambda: (0, 0))
     context_rows: defaultdict[tuple, int] = defaultdict(int)
-    agent_rows: dict[tuple, tuple[int, str]] = {}
     audit_rows: list[tuple] = []
     touched_audit_accounts: set[str] = set()
 
     for event in events:
         account_id = normalize_identity(event.account_id, unknown=True)
         user_id = normalize_identity(event.user_id)
-        agent_id = normalize_identity(event.agent_id)
         utc_dt = _utc_dt(event)
         event_date = utc_dt.date().isoformat()
         event_hour = int(utc_dt.hour)
@@ -95,7 +96,6 @@ def project_events(
                 token_rows,
                 account_id=account_id,
                 user_id=user_id,
-                agent_id=agent_id,
                 event_date=event_date,
                 event_hour=event_hour,
                 source="vlm",
@@ -111,7 +111,6 @@ def project_events(
                 token_rows,
                 account_id=account_id,
                 user_id=user_id,
-                agent_id=agent_id,
                 event_date=event_date,
                 event_hour=event_hour,
                 source="embedding",
@@ -127,7 +126,6 @@ def project_events(
                 token_rows,
                 account_id=account_id,
                 user_id=user_id,
-                agent_id=agent_id,
                 event_date=event_date,
                 event_hour=event_hour,
                 source="rerank",
@@ -148,14 +146,12 @@ def project_events(
                 context_rows=context_rows,
                 audit_rows=audit_rows,
                 touched_audit_accounts=touched_audit_accounts,
-                agent_rows=agent_rows,
             )
 
     return UsageAuditProjection(
         token_rows=dict(token_rows),
         retrieval_rows=dict(retrieval_rows),
         context_rows=dict(context_rows),
-        agent_rows=agent_rows,
         audit_rows=audit_rows,
         touched_audit_accounts=touched_audit_accounts,
     )
@@ -173,7 +169,6 @@ def _add_token_rows(
     *,
     account_id: str,
     user_id: str,
-    agent_id: str,
     event_date: str,
     event_hour: int,
     source: str,
@@ -190,7 +185,6 @@ def _add_token_rows(
         key = (
             account_id,
             user_id,
-            agent_id,
             event_date,
             event_hour,
             source,
@@ -203,7 +197,6 @@ def _add_token_rows(
         key = (
             account_id,
             user_id,
-            agent_id,
             event_date,
             event_hour,
             source,
@@ -224,7 +217,6 @@ def _project_http_request(
     context_rows: defaultdict[tuple, int],
     audit_rows: list[tuple],
     touched_audit_accounts: set[str],
-    agent_rows: dict[tuple, tuple[int, str]],
 ) -> None:
     payload = event.payload
     route = str(payload.get("route") or "")
@@ -240,52 +232,59 @@ def _project_http_request(
         unknown=True,
     )
     audit_user = normalize_identity(payload.get("user_id") or event.user_id) or None
-    audit_agent = normalize_identity(payload.get("agent_id") or event.agent_id) or None
     row_user = audit_user or ""
-    row_agent = audit_agent or ""
     status = "success" if 200 <= status_code < 400 else "error"
+    error_code: str | None = None
+    error_message: str | None = None
+    error_details: str | None = None
+    if status_code >= 400 and any(
+        payload.get(key) is not None for key in ("error_code", "error_message", "error_details")
+    ):
+        captured_error = sanitize_public_http_error(
+            code=payload.get("error_code"),
+            message=payload.get("error_message"),
+            details=payload.get("error_details"),
+        )
+        error_code = captured_error.code or None
+        error_message = captured_error.message or None
+        error_details = serialize_public_error_details(captured_error.details)
 
     retrieval_operation = retrieval_operation_for_http(method, route)
     if retrieval_operation:
-        key = (
+        retrieval_key = (
             audit_account,
             row_user,
-            row_agent,
             event_date,
             hour,
             retrieval_operation,
             status,
         )
-        prev_count, prev_results = retrieval_rows[key]
-        retrieval_rows[key] = (prev_count + 1, prev_results)
+        prev_count, prev_results = retrieval_rows[retrieval_key]
+        result_count = max(safe_int(payload.get("result_count")), 0) if status == "success" else 0
+        retrieval_rows[retrieval_key] = (prev_count + 1, prev_results + result_count)
 
     context_operation = context_write_operation_for_http(method, route, status_code)
     if context_operation:
-        key = (audit_account, row_user, row_agent, event_date, hour, context_operation)
-        context_rows[key] += 1
+        context_key = (audit_account, row_user, event_date, hour, context_operation)
+        context_rows[context_key] += 1
 
     audit_rows.append(
         (
             payload.get("request_id") or event.request_id,
             audit_account,
             audit_user,
-            audit_agent,
             str(payload.get("method") or ""),
             route,
             str(payload.get("api_type") or derive_api_type(route)),
             status_code,
             duration_ms,
+            error_code,
+            error_message,
+            error_details,
             created_at,
         )
     )
     touched_audit_accounts.add(audit_account)
-    if audit_agent:
-        agent_key = (audit_account, audit_agent, event_date)
-        prev_count, prev_seen = agent_rows.get(agent_key, (0, ""))
-        agent_rows[agent_key] = (
-            prev_count + 1,
-            max(prev_seen, created_at) if prev_seen else created_at,
-        )
 
 
 def should_skip_audit_route(route: str) -> bool:

@@ -10,6 +10,7 @@ underlying hourly rows into user-local days / hours.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -71,10 +72,9 @@ class SQLiteUsageAuditStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        # Reset incompatible pre-v3 local tables before creating the new
-        # UTC/hourly layout. The SQLite backend has short retention and may live
-        # inside one workspace, so dropping stale rollups is safer than mixing
-        # old daily/local columns with the new UTC columns.
+        # Preserve the compatible v4 layout through its additive migration.
+        # Unknown newer transitions fail closed; older daily/local layouts
+        # remain incompatible and use the reset path.
         self._migrate_legacy_sync(conn)
         conn.executescript(SQLITE_SCHEMA)
         conn.execute(
@@ -90,10 +90,41 @@ class SQLiteUsageAuditStore:
         except sqlite3.OperationalError:
             row = None
         current = int(row["value"]) if row and row["value"] else 0
-        if current >= SCHEMA_VERSION:
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                "Usage/audit database schema "
+                f"version {current} is newer than supported version {SCHEMA_VERSION}"
+            )
+        if current == SCHEMA_VERSION:
             return
+        if current == 4 and SCHEMA_VERSION == 5:
+            SQLiteUsageAuditStore._migrate_v4_to_v5_sync(conn)
+            return
+        if current >= 4:
+            raise RuntimeError(
+                f"No usage/audit schema migration path from version {current} to {SCHEMA_VERSION}"
+            )
         for table in RESET_ON_SCHEMA_UPGRADE_TABLES:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+    @staticmethod
+    def _migrate_v4_to_v5_sync(conn: sqlite3.Connection) -> None:
+        """Add nullable audit error fields without deleting v4 usage data."""
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'request_audit'"
+        ).fetchone()
+        if table is None:
+            return
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(request_audit)")}
+        conn.execute("BEGIN")
+        try:
+            for name in ("error_code", "error_message", "error_details"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE request_audit ADD COLUMN {name} TEXT")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close_sync)
@@ -102,6 +133,36 @@ class SQLiteUsageAuditStore:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    async def delete_data(self, *, account_id: str, user_id: str | None = None) -> dict[str, int]:
+        """Delete all usage/audit rows for an account, or one user within it."""
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_data_sync, account_id, user_id)
+
+    def _delete_data_sync(self, account_id: str, user_id: str | None = None) -> dict[str, int]:
+        assert self._conn is not None
+        tables = (
+            "usage_token_hourly",
+            "usage_retrieval_hourly",
+            "usage_context_write_bucket",
+            "request_audit",
+        )
+        predicate = "account_id = ?" + (" AND user_id = ?" if user_id is not None else "")
+        params = (account_id, user_id) if user_id is not None else (account_id,)
+        self._conn.execute("BEGIN")
+        try:
+            deleted = {
+                table: self._conn.execute(
+                    f"DELETE FROM {table} WHERE {predicate}",
+                    params,
+                ).rowcount
+                for table in tables
+            }
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return deleted
 
     async def record_batch(self, events: Sequence[ObservabilityEvent]) -> None:
         if not events:
@@ -119,7 +180,6 @@ class SQLiteUsageAuditStore:
             self._write_token_rows(conn, projection.token_rows, updated_at)
             self._write_retrieval_rows(conn, projection.retrieval_rows, updated_at)
             self._write_context_rows(conn, projection.context_rows, updated_at)
-            self._write_agent_rows(conn, projection.agent_rows, updated_at)
             self._write_audit_rows(conn, projection.audit_rows)
             self._trim_usage_rows(conn, self._usage_max_dates(projection))
             self._trim_audit_rows(conn, projection.touched_audit_accounts)
@@ -133,13 +193,13 @@ class SQLiteUsageAuditStore:
         conn.executemany(
             """
             INSERT INTO usage_token_hourly (
-                account_id, user_id, agent_id, date_utc, hour_utc,
+                account_id, user_id, date_utc, hour_utc,
                 source, token_type, provider, model_name,
                 token_count, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (
-                account_id, user_id, agent_id, date_utc, hour_utc,
+                account_id, user_id, date_utc, hour_utc,
                 source, token_type, provider, model_name
             )
             DO UPDATE SET
@@ -154,12 +214,12 @@ class SQLiteUsageAuditStore:
         conn.executemany(
             """
             INSERT INTO usage_retrieval_hourly (
-                account_id, user_id, agent_id, date_utc, hour_utc,
+                account_id, user_id, date_utc, hour_utc,
                 operation, status, request_count, result_count, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (
-                account_id, user_id, agent_id, date_utc, hour_utc, operation, status
+                account_id, user_id, date_utc, hour_utc, operation, status
             )
             DO UPDATE SET
                 request_count = request_count + excluded.request_count,
@@ -177,12 +237,12 @@ class SQLiteUsageAuditStore:
         conn.executemany(
             """
             INSERT INTO usage_context_write_bucket (
-                account_id, user_id, agent_id, date_utc, hour_utc,
+                account_id, user_id, date_utc, hour_utc,
                 operation, count, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (
-                account_id, user_id, agent_id, date_utc, hour_utc, operation
+                account_id, user_id, date_utc, hour_utc, operation
             )
             DO UPDATE SET
                 count = count + excluded.count,
@@ -192,31 +252,15 @@ class SQLiteUsageAuditStore:
         )
 
     @staticmethod
-    def _write_agent_rows(conn, rows: dict[tuple, tuple[int, str]], updated_at: str) -> None:
-        conn.executemany(
-            """
-            INSERT INTO usage_agent_activity_daily (
-                account_id, agent_id, date_utc, request_count, last_seen_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT (account_id, agent_id, date_utc)
-            DO UPDATE SET
-                request_count = request_count + excluded.request_count,
-                last_seen_at = MAX(last_seen_at, excluded.last_seen_at),
-                updated_at = excluded.updated_at
-            """,
-            [(*key, count, last_seen, updated_at) for key, (count, last_seen) in rows.items()],
-        )
-
-    @staticmethod
     def _write_audit_rows(conn, rows: list[tuple]) -> None:
         conn.executemany(
             """
             INSERT INTO request_audit (
-                request_id, account_id, user_id, agent_id, method, route,
-                api_type, status_code, duration_ms, created_at
+                request_id, account_id, user_id, method, route,
+                api_type, status_code, duration_ms,
+                error_code, error_message, error_details, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -262,7 +306,6 @@ class SQLiteUsageAuditStore:
                 "usage_token_hourly",
                 "usage_retrieval_hourly",
                 "usage_context_write_bucket",
-                "usage_agent_activity_daily",
             ):
                 conn.execute(
                     f"DELETE FROM {table} WHERE account_id = ? AND date_utc < ?",
@@ -272,14 +315,12 @@ class SQLiteUsageAuditStore:
     @staticmethod
     def _usage_max_dates(projection: UsageAuditProjection) -> dict[str, str]:
         max_dates: dict[str, str] = {}
-        # token_rows: (account, user, agent, date_utc, hour_utc, source, ...)
-        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.token_rows, date_index=3)
-        # retrieval_rows: (account, user, agent, date_utc, hour_utc, op, status)
-        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.retrieval_rows, date_index=3)
-        # context_rows: (account, user, agent, date_utc, hour_utc, op)
-        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.context_rows, date_index=3)
-        # agent_rows: (account, agent, date_utc)
-        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.agent_rows, date_index=2)
+        # token_rows: (account, user, date_utc, hour_utc, source, ...)
+        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.token_rows, date_index=2)
+        # retrieval_rows: (account, user, date_utc, hour_utc, op, status)
+        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.retrieval_rows, date_index=2)
+        # context_rows: (account, user, date_utc, hour_utc, op)
+        SQLiteUsageAuditStore._merge_max_dates(max_dates, projection.context_rows, date_index=2)
         return max_dates
 
     @staticmethod
@@ -328,16 +369,27 @@ class SQLiteUsageAuditStore:
     # ------------------------------------------------------------------
 
     async def get_today_tokens(
-        self, *, account_id: str, user_date: str, tz: tzinfo
+        self,
+        *,
+        account_id: str,
+        user_date: str,
+        tz: tzinfo,
+        user_id: str | None = None,
     ) -> dict[str, int]:
         async with self._lock:
-            return await asyncio.to_thread(self._get_today_tokens_sync, account_id, user_date, tz)
+            return await asyncio.to_thread(
+                self._get_today_tokens_sync, account_id, user_date, tz, user_id
+            )
 
-    def _get_today_tokens_sync(self, account_id: str, user_date: str, tz: tzinfo) -> dict[str, int]:
+    def _get_today_tokens_sync(
+        self, account_id: str, user_date: str, tz: tzinfo, user_id: str | None
+    ) -> dict[str, int]:
         assert self._conn is not None
         day = date.fromisoformat(user_date)
         utc_start, utc_end = _user_day_window_utc(day, tz)
-        rows = self._fetch_hourly_token_rows(account_id, utc_start, utc_end)
+        rows = self._fetch_hourly_token_rows(
+            account_id, utc_start, utc_end, user_id=user_id
+        )
         result = {"vlm_input": 0, "vlm_output": 0, "embedding_input": 0}
         for source, token_type, _, _, total in rows:
             key = f"{source}_{token_type}"
@@ -347,84 +399,32 @@ class SQLiteUsageAuditStore:
         return result
 
     async def get_today_retrievals(
-        self, *, account_id: str, user_date: str, tz: tzinfo
-    ) -> dict[str, int]:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._get_today_retrievals_sync, account_id, user_date, tz
-            )
-
-    def _get_today_retrievals_sync(
-        self, account_id: str, user_date: str, tz: tzinfo
-    ) -> dict[str, int]:
-        assert self._conn is not None
-        day = date.fromisoformat(user_date)
-        utc_start, utc_end = _user_day_window_utc(day, tz)
-        result = {"find": 0, "search": 0}
-        for operation, total in self._fetch_hourly_retrieval_rows(account_id, utc_start, utc_end):
-            if operation in result:
-                result[operation] += total
-        result["total"] = sum(result.values())
-        return result
-
-    async def get_agent_overview(
         self,
         *,
         account_id: str,
         user_date: str,
         tz: tzinfo,
-        limit: int = 5,
-    ) -> dict[str, Any]:
+        user_id: str | None = None,
+    ) -> dict[str, int]:
         async with self._lock:
             return await asyncio.to_thread(
-                self._get_agent_overview_sync,
-                account_id,
-                user_date,
-                tz,
-                int(limit),
+                self._get_today_retrievals_sync, account_id, user_date, tz, user_id
             )
 
-    def _get_agent_overview_sync(
-        self, account_id: str, user_date: str, tz: tzinfo, limit: int
-    ) -> dict[str, Any]:
+    def _get_today_retrievals_sync(
+        self, account_id: str, user_date: str, tz: tzinfo, user_id: str | None
+    ) -> dict[str, int]:
         assert self._conn is not None
         day = date.fromisoformat(user_date)
         utc_start, utc_end = _user_day_window_utc(day, tz)
-        utc_start_iso = utc_start.isoformat()
-        utc_end_iso = utc_end.isoformat()
-        # last_seen_at is stored as a UTC ISO string by projection.py; compare
-        # lexicographically — ISO-8601 with fixed UTC offset is sort-safe.
-        total_cur = self._conn.execute(
-            """
-            SELECT COUNT(DISTINCT agent_id) AS total
-            FROM usage_agent_activity_daily
-            WHERE account_id = ?
-              AND last_seen_at >= ?
-              AND last_seen_at < ?
-            """,
-            (account_id, utc_start_iso, utc_end_iso),
-        )
-        total = int(total_cur.fetchone()["total"] or 0)
-        cur = self._conn.execute(
-            """
-            SELECT agent_id, MAX(last_seen_at) AS last_seen_at
-            FROM usage_agent_activity_daily
-            WHERE account_id = ?
-              AND last_seen_at >= ?
-              AND last_seen_at < ?
-            GROUP BY agent_id
-            ORDER BY last_seen_at DESC
-            LIMIT ?
-            """,
-            (account_id, utc_start_iso, utc_end_iso, limit),
-        )
-        return {
-            "total": total,
-            "items": [
-                {"agent_id": row["agent_id"], "last_seen_at": row["last_seen_at"]}
-                for row in cur.fetchall()
-            ],
-        }
+        result = {"find": 0, "search": 0}
+        for operation, total in self._fetch_hourly_retrieval_rows(
+            account_id, utc_start, utc_end, user_id=user_id
+        ):
+            if operation in result:
+                result[operation] += total
+        result["total"] = sum(result.values())
+        return result
 
     async def get_token_series(
         self,
@@ -434,6 +434,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self._lock:
             return await asyncio.to_thread(
@@ -443,6 +444,7 @@ class SQLiteUsageAuditStore:
                 end_user_date,
                 bucket,
                 tz,
+                user_id,
             )
 
     def _get_token_series_sync(
@@ -452,6 +454,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None,
     ) -> list[dict[str, Any]]:
         assert self._conn is not None
         start_day = date.fromisoformat(start_user_date)
@@ -463,7 +466,7 @@ class SQLiteUsageAuditStore:
             for d in _date_range(start_user_date, end_user_date)
         }
         for source, token_type, date_utc, hour_utc, total in self._fetch_hourly_token_rows(
-            account_id, utc_start, utc_end
+            account_id, utc_start, utc_end, user_id=user_id
         ):
             local_date = (
                 datetime(
@@ -494,6 +497,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self._lock:
             return await asyncio.to_thread(
@@ -503,6 +507,7 @@ class SQLiteUsageAuditStore:
                 end_user_date,
                 bucket,
                 tz,
+                user_id,
             )
 
     def _get_context_commit_heatmap_sync(
@@ -512,6 +517,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None,
     ) -> list[dict[str, Any]]:
         assert self._conn is not None
         bucket_size = 4 if bucket == "4h" else 1
@@ -523,11 +529,13 @@ class SQLiteUsageAuditStore:
         for event_date in _date_range(start_user_date, end_user_date):
             for hour in range(0, 24, bucket_size):
                 rows[(event_date, hour)] = self._empty_context_row(event_date, hour)
+        user_filter, user_params = self._user_scope_sql(user_id)
         cur = self._conn.execute(
             """
             SELECT date_utc, hour_utc, operation, SUM(count) AS total
             FROM usage_context_write_bucket
             WHERE account_id = ?
+              {user_filter}
               AND (
                 date_utc > ? OR (date_utc = ? AND hour_utc >= ?)
               )
@@ -535,9 +543,10 @@ class SQLiteUsageAuditStore:
                 date_utc < ? OR (date_utc = ? AND hour_utc < ?)
               )
             GROUP BY date_utc, hour_utc, operation
-            """,
+            """.format(user_filter=user_filter),
             (
                 account_id,
+                *user_params,
                 utc_start.date().isoformat(),
                 utc_start.date().isoformat(),
                 utc_start.hour,
@@ -568,23 +577,31 @@ class SQLiteUsageAuditStore:
         return [rows[key] for key in sorted(rows) if key[0] in in_range]
 
     def _fetch_hourly_token_rows(
-        self, account_id: str, utc_start: datetime, utc_end: datetime
+        self,
+        account_id: str,
+        utc_start: datetime,
+        utc_end: datetime,
+        *,
+        user_id: str | None = None,
     ) -> list[tuple[str, str, str, int, int]]:
         """Return rows [(source, token_type, date_utc, hour_utc, total)]."""
         assert self._conn is not None
         utc_start_d = utc_start.date().isoformat()
         utc_end_d = utc_end.date().isoformat()
+        user_filter, user_params = self._user_scope_sql(user_id)
         cur = self._conn.execute(
             """
             SELECT source, token_type, date_utc, hour_utc, SUM(token_count) AS total
             FROM usage_token_hourly
             WHERE account_id = ?
+              {user_filter}
               AND (date_utc > ? OR (date_utc = ? AND hour_utc >= ?))
               AND (date_utc < ? OR (date_utc = ? AND hour_utc < ?))
             GROUP BY source, token_type, date_utc, hour_utc
-            """,
+            """.format(user_filter=user_filter),
             (
                 account_id,
+                *user_params,
                 utc_start_d,
                 utc_start_d,
                 utc_start.hour,
@@ -605,24 +622,32 @@ class SQLiteUsageAuditStore:
         ]
 
     def _fetch_hourly_retrieval_rows(
-        self, account_id: str, utc_start: datetime, utc_end: datetime
+        self,
+        account_id: str,
+        utc_start: datetime,
+        utc_end: datetime,
+        *,
+        user_id: str | None = None,
     ) -> list[tuple[str, int]]:
         """Return [(operation, total_request_count)] for successful retrievals."""
         assert self._conn is not None
         utc_start_d = utc_start.date().isoformat()
         utc_end_d = utc_end.date().isoformat()
+        user_filter, user_params = self._user_scope_sql(user_id)
         cur = self._conn.execute(
             """
             SELECT operation, SUM(request_count) AS total
             FROM usage_retrieval_hourly
             WHERE account_id = ?
+              {user_filter}
               AND status = 'success'
               AND (date_utc > ? OR (date_utc = ? AND hour_utc >= ?))
               AND (date_utc < ? OR (date_utc = ? AND hour_utc < ?))
             GROUP BY operation
-            """,
+            """.format(user_filter=user_filter),
             (
                 account_id,
+                *user_params,
                 utc_start_d,
                 utc_start_d,
                 utc_start.hour,
@@ -632,6 +657,12 @@ class SQLiteUsageAuditStore:
             ),
         )
         return [(str(row["operation"]), int(row["total"] or 0)) for row in cur.fetchall()]
+
+    @staticmethod
+    def _user_scope_sql(user_id: str | None) -> tuple[str, tuple[str, ...]]:
+        if not user_id:
+            return "", ()
+        return "AND user_id = ?", (user_id,)
 
     @staticmethod
     def _empty_context_row(event_date: str, hour: int) -> dict[str, Any]:
@@ -649,6 +680,7 @@ class SQLiteUsageAuditStore:
         self,
         *,
         account_id: str,
+        user_id: str | None = None,
         request_id: str | None = None,
         statuses: list[str] | None = None,
         api_types: list[str] | None = None,
@@ -659,6 +691,7 @@ class SQLiteUsageAuditStore:
             return await asyncio.to_thread(
                 self._query_audit_logs_sync,
                 account_id,
+                user_id,
                 request_id,
                 statuses or [],
                 api_types or [],
@@ -669,6 +702,7 @@ class SQLiteUsageAuditStore:
     def _query_audit_logs_sync(
         self,
         account_id: str,
+        user_id: str | None,
         request_id: str | None,
         statuses: list[str],
         api_types: list[str],
@@ -678,6 +712,9 @@ class SQLiteUsageAuditStore:
         assert self._conn is not None
         where = ["account_id = ?"]
         params: list[Any] = [account_id]
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
         if request_id:
             where.append("request_id = ?")
             params.append(request_id)
@@ -706,8 +743,9 @@ class SQLiteUsageAuditStore:
         offset = max(page - 1, 0) * page_size
         rows = self._conn.execute(
             f"""
-            SELECT request_id, account_id, user_id, agent_id, method, route, api_type,
-                   status_code, duration_ms, created_at
+            SELECT request_id, account_id, user_id, method, route, api_type,
+                   status_code, duration_ms, error_code, error_message,
+                   error_details, created_at
             FROM request_audit
             WHERE {where_sql}
             ORDER BY created_at DESC, id DESC
@@ -720,8 +758,22 @@ class SQLiteUsageAuditStore:
             "success_rate": (success / total) if total else 0.0,
             "page": page,
             "page_size": page_size,
-            "items": [dict(row) for row in rows],
+            "items": [self._audit_item(row) for row in rows],
         }
+
+    @staticmethod
+    def _audit_item(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        raw_details = item.get("error_details")
+        if raw_details:
+            try:
+                decoded = json.loads(raw_details)
+            except (TypeError, ValueError):
+                decoded = None
+            item["error_details"] = decoded if isinstance(decoded, dict) else None
+        else:
+            item["error_details"] = None
+        return item
 
     @staticmethod
     def _status_filter_sql(statuses: list[str]) -> tuple[str, list[Any]]:

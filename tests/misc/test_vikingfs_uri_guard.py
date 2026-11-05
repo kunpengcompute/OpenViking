@@ -8,20 +8,36 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from openviking.pyagfs.exceptions import AGFSInvalidOperationError
+from openviking.server.identity import RequestContext, Role
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import PermissionDeniedError
+from openviking_cli.session.user_id import UserIdentifier
 
 
 def _make_viking_fs() -> VikingFS:
     """Create a VikingFS instance with a mocked AGFS backend."""
     fs = VikingFS.__new__(VikingFS)
-    fs.agfs = MagicMock()
+    fs.agfs = AsyncMock()
+    fs._async_agfs = fs.agfs
     fs.query_embedder = None
     fs.rerank_config = None
+    fs.grep_config = None
     fs.vector_store = None
+    fs.acl_manager = None
     fs._encryptor = None
     fs._bound_ctx = contextvars.ContextVar("vikingfs_bound_ctx_test", default=None)
     return fs
+
+
+def _user_ctx(
+    account_id: str = "acct1",
+    user_id: str = "alice",
+    role: Role = Role.USER,
+) -> RequestContext:
+    return RequestContext(
+        user=UserIdentifier(account_id=account_id, user_id=user_id),
+        role=role,
+    )
 
 
 class TestVikingFSURITraversalGuard:
@@ -50,7 +66,6 @@ class TestVikingFSURITraversalGuard:
         [
             "viking://resources/../_system/users.json",
             "viking://resources/../../_system/accounts.json",
-            "/resources/../_system/users.json",
             "viking://resources/..\\..\\_system\\users.json",
             "viking://resources/C:\\Windows\\System32",
         ],
@@ -59,7 +74,7 @@ class TestVikingFSURITraversalGuard:
         fs = _make_viking_fs()
 
         with pytest.raises(PermissionDeniedError, match="Unsafe URI"):
-            fs._normalized_uri_parts(uri)
+            fs._uri_to_path(uri)
 
     @pytest.mark.asyncio
     async def test_read_file_rejects_traversal_before_agfs_read(self) -> None:
@@ -71,11 +86,13 @@ class TestVikingFSURITraversalGuard:
         fs.agfs.read.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_write_rejects_traversal_before_agfs_write(self) -> None:
+    async def test_write_rejects_unauthorized_paths_before_agfs_write(self) -> None:
         fs = _make_viking_fs()
 
         with pytest.raises(PermissionDeniedError, match="Unsafe URI"):
             await fs.write("viking://resources/../../_system/accounts.json", "pwned")
+        with pytest.raises(PermissionDeniedError, match="requires an administrator"):
+            await fs.write("viking://", "pwned", ctx=_user_ctx())
 
         fs.agfs.write.assert_not_called()
 
@@ -90,6 +107,108 @@ class TestVikingFSURITraversalGuard:
 
         fs._collect_uris.assert_not_called()
         fs._delete_from_vector_store.assert_not_called()
+        fs.agfs.rm.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "viking://",
+            "viking://user",
+            "viking://user/",
+            "viking://agent",
+            "viking://agent/",
+        ],
+    )
+    async def test_rm_rejects_protected_namespace_roots_before_side_effects(self, uri: str) -> None:
+        fs = _make_viking_fs()
+        fs._collect_uris = AsyncMock(return_value=[])
+        fs._delete_from_vector_store = AsyncMock()
+
+        with pytest.raises(PermissionDeniedError, match="Deleting viking://"):
+            await fs.rm(uri, recursive=True)
+
+        fs._collect_uris.assert_not_called()
+        fs._delete_from_vector_store.assert_not_called()
+        fs.agfs.stat.assert_not_called()
+        fs.agfs.rm.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "viking://user/alice",
+            "viking://user/alice/",
+            "viking://resources",
+            "viking://resources/",
+        ],
+    )
+    @pytest.mark.parametrize("role", [Role.USER, Role.ADMIN])
+    @pytest.mark.asyncio
+    async def test_rm_rejects_non_root_namespace_roots_before_side_effects(
+        self, uri: str, role: Role
+    ) -> None:
+        fs = _make_viking_fs()
+        fs._collect_uris = AsyncMock(return_value=[])
+        fs._delete_from_vector_store = AsyncMock()
+
+        with pytest.raises(PermissionDeniedError, match="namespace root"):
+            await fs.rm(uri, recursive=True, ctx=_user_ctx(role=role))
+
+        fs._collect_uris.assert_not_called()
+        fs._delete_from_vector_store.assert_not_called()
+        fs.agfs.stat.assert_not_called()
+        fs.agfs.rm.assert_not_called()
+
+    @pytest.mark.parametrize("uri", ["viking://user/alice", "viking://resources"])
+    @pytest.mark.asyncio
+    async def test_rm_allows_maintenance_scope_roots_for_root(self, uri: str) -> None:
+        fs = _make_viking_fs()
+        fs.agfs.stat = AsyncMock(side_effect=RuntimeError("sentinel"))
+
+        with pytest.raises(RuntimeError, match="sentinel"):
+            await fs.rm(uri, recursive=True)
+
+        fs.agfs.stat.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "viking://user/alice/memories",
+            "viking://resources/project",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_rm_allows_non_root_namespace_descendants(self, uri: str) -> None:
+        fs = _make_viking_fs()
+        fs.agfs.stat = AsyncMock(side_effect=RuntimeError("sentinel"))
+
+        with pytest.raises(RuntimeError, match="sentinel"):
+            await fs.rm(uri, recursive=True, ctx=_user_ctx())
+
+        fs.agfs.stat.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rm_session_root_is_scoped_to_current_user_before_agfs(self) -> None:
+        fs = _make_viking_fs()
+        fs.agfs.stat = AsyncMock(side_effect=RuntimeError("sentinel"))
+
+        with pytest.raises(RuntimeError, match="sentinel"):
+            await fs.rm("viking://user/alice/sessions", recursive=True, ctx=_user_ctx())
+
+        fs.agfs.stat.assert_called_once_with("/local/acct1/user/alice/sessions")
+
+    @pytest.mark.asyncio
+    async def test_rm_rejects_temp_root_for_non_root_before_side_effects(self) -> None:
+        fs = _make_viking_fs()
+        fs._collect_uris = AsyncMock(return_value=[])
+        fs._delete_from_vector_store = AsyncMock()
+
+        with pytest.raises(PermissionDeniedError, match="Temp root is read-only"):
+            await fs.rm("viking://temp", recursive=True, ctx=_user_ctx())
+
+        fs._collect_uris.assert_not_called()
+        fs._delete_from_vector_store.assert_not_called()
+        fs.agfs.stat.assert_not_called()
         fs.agfs.rm.assert_not_called()
 
     @pytest.mark.asyncio
@@ -117,10 +236,68 @@ class TestVikingFSURITraversalGuard:
         fs.agfs.mv.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("source_uri", "match"),
+        [
+            # Account root: rm() rejects it (#2873), and mv() must not let it
+            # through to the recursive source delete.
+            ("viking://", "Deleting viking://"),
+            # viking://user is already blocked by the write guard; assert mv still
+            # refuses it (parity with rm) regardless of which guard fires first.
+            ("viking://user", "viking://user is not supported"),
+            ("viking://user/", "viking://user is not supported"),
+        ],
+    )
+    async def test_mv_rejects_protected_namespace_roots_in_source_before_side_effects(
+        self, source_uri: str, match: str
+    ) -> None:
+        fs = _make_viking_fs()
+        fs._collect_uris = AsyncMock(return_value=[])
+        fs._update_vector_store_uris = AsyncMock()
+        fs._delete_from_vector_store = AsyncMock()
+
+        with pytest.raises(PermissionDeniedError, match=match):
+            await fs.mv(source_uri, "viking://temp/dst")
+
+        fs._collect_uris.assert_not_called()
+        fs._update_vector_store_uris.assert_not_called()
+        fs._delete_from_vector_store.assert_not_called()
+        fs.agfs.stat.assert_not_called()
+        fs.agfs.rm.assert_not_called()
+        fs.agfs.mv.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "source_uri",
+        ["viking://user/alice", "viking://resources"],
+    )
+    async def test_mv_rejects_non_root_namespace_roots_in_source_before_side_effects(
+        self, source_uri: str
+    ) -> None:
+        fs = _make_viking_fs()
+        fs._collect_uris = AsyncMock(return_value=[])
+        fs._update_vector_store_uris = AsyncMock()
+        fs._delete_from_vector_store = AsyncMock()
+
+        with pytest.raises(PermissionDeniedError, match="namespace root"):
+            await fs.mv(
+                source_uri,
+                "viking://resources/dst",
+                ctx=_user_ctx(),
+            )
+
+        fs._collect_uris.assert_not_called()
+        fs._update_vector_store_uris.assert_not_called()
+        fs._delete_from_vector_store.assert_not_called()
+        fs.agfs.stat.assert_not_called()
+        fs.agfs.rm.assert_not_called()
+        fs.agfs.mv.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_read_file_keeps_valid_uri_behavior(self) -> None:
         fs = _make_viking_fs()
-        fs.agfs.stat = MagicMock(return_value=MagicMock())
-        fs.agfs.read = MagicMock(return_value=b"hello")
+        fs.agfs.stat = AsyncMock(return_value=MagicMock())
+        fs.agfs.read = AsyncMock(return_value=b"hello")
 
         content = await fs.read_file("viking://resources/docs/guide.md")
         assert content == "hello"
@@ -131,7 +308,7 @@ class TestVikingFSURITraversalGuard:
     async def test_grep_propagates_agfs_errors_instead_of_falling_back(self) -> None:
         fs = _make_viking_fs()
         fs._encryptor = None
-        fs._ensure_access = MagicMock()
+        fs._ensure_access = AsyncMock()
         fs._grep_with_agfs = AsyncMock(side_effect=AGFSInvalidOperationError("invalid regex"))
         fs._grep_encrypted = AsyncMock(
             return_value={"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
@@ -148,8 +325,8 @@ class TestVikingFSURITraversalGuard:
         """Query-root-relative grep matches should be reconstructed into the final Viking URI."""
         fs = _make_viking_fs()
         fs._encryptor = None
-        fs._ensure_access = MagicMock()
-        fs.agfs.grep = MagicMock(
+        fs._ensure_access = AsyncMock()
+        fs.agfs.grep = AsyncMock(
             return_value={
                 "matches": [
                     {
@@ -174,8 +351,8 @@ class TestVikingFSURITraversalGuard:
         """A '.' grep match should resolve back to the queried Viking URI itself."""
         fs = _make_viking_fs()
         fs._encryptor = None
-        fs._ensure_access = MagicMock()
-        fs.agfs.grep = MagicMock(
+        fs._ensure_access = AsyncMock()
+        fs.agfs.grep = AsyncMock(
             return_value={
                 "matches": [
                     {
@@ -195,7 +372,8 @@ class TestVikingFSURITraversalGuard:
         assert result["matches"][0]["line"] == 1
         assert result["matches"][0]["content"] == "act"
 
-    def test_ls_entries_hides_reserved_tasks_dir_under_account_root(self) -> None:
+    @pytest.mark.asyncio
+    async def test_ls_entries_filters_account_root_to_listable_scopes(self) -> None:
         fs = _make_viking_fs()
         fs.agfs.ls.return_value = [
             {"name": "resources", "isDir": True},
@@ -203,6 +381,24 @@ class TestVikingFSURITraversalGuard:
             {"name": "_system", "isDir": True},
         ]
 
-        entries = fs._ls_entries("/local/default")
+        entries = await fs._ls_entries("/local/default")
 
         assert [entry["name"] for entry in entries] == ["resources"]
+
+    @pytest.mark.asyncio
+    async def test_ls_entries_below_root_keeps_reserved_root_names(self) -> None:
+        """A directory a user created and can stat must also show up in ls."""
+        fs = _make_viking_fs()
+        fs.agfs.ls.return_value = [
+            {"name": "tasks", "isDir": True},
+            {"name": "_system", "isDir": True},
+            {"name": "notes.md", "isDir": False},
+            {"name": ".path.ovlock", "isDir": False},
+            {"name": ".exact.ovlock.notes.md.0123abcd", "isDir": False},
+            {"name": ".redirect.json", "isDir": False},
+            {"name": ".sync_log.json", "isDir": False},
+        ]
+
+        entries = await fs._ls_entries("/local/default/resources/project")
+
+        assert [entry["name"] for entry in entries] == ["tasks", "_system", "notes.md"]

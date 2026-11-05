@@ -5,11 +5,12 @@ Memory type registry - loads YAML configurations.
 """
 
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 import yaml
 
-from openviking.core.namespace import agent_space_fragment, user_space_fragment
+from openviking.core.namespace import user_space_fragment
 from openviking.prompts.manager import PromptManager
 from openviking.session.memory.dataclass import MemoryField, MemoryTypeSchema
 from openviking.session.memory.merge_op import MergeOp
@@ -132,29 +133,6 @@ class MemoryTypeRegistry:
             return list(self._types.keys())
         return [mt.memory_type for mt in self._types.values() if mt.enabled]
 
-    def list_search_uris(self, user_space: str, agent_space: str) -> List[str]:
-        """List all directory URIs for search scope.
-
-        Args:
-            user_space: User space name
-            agent_space: Agent space name
-
-        Returns:
-            List of directory URIs from enabled schemas
-        """
-        uris = []
-        for schema in self.list_all(include_disabled=False):
-            if schema.directory:
-                dir_path = TemplateUtils.render(
-                    schema.directory,
-                    {
-                        "user_space": user_space,
-                        "agent_space": agent_space,
-                    },
-                )
-                uris.append(dir_path)
-        return uris
-
     def load_from_yaml(self, yaml_path: str, replace: bool = False) -> None:
         """
         Load memory type from a YAML file.
@@ -210,6 +188,11 @@ class MemoryTypeRegistry:
         """Parse memory type from YAML data."""
         fields_data = data.get("fields", [])
         fields = []
+        stage = data.get("stage")
+        if stage is None and data.get("agent_only", False):
+            stage = "agent"
+        if stage is None:
+            stage = "user"
 
         for field_data in fields_data:
             field = MemoryField(
@@ -231,11 +214,16 @@ class MemoryTypeRegistry:
             directory=data.get("directory", ""),
             enabled=data.get("enabled", data.get("enable", True)),
             operation_mode=data.get("operation_mode", "upsert"),
-            agent_only=data.get("agent_only", False),
+            stage=stage,
+            peer_enabled=data.get("peer_enabled", True),
             overview_template=data.get("overview_template"),
         )
 
-    async def initialize_memory_files(self, ctx: Any) -> None:
+    async def initialize_memory_files(
+        self,
+        ctx: Any,
+        allowed_memory_types: Optional[set[str]] = None,
+    ) -> None:
         """
         Initialize memory files with init_value for fields that have it.
 
@@ -243,22 +231,26 @@ class MemoryTypeRegistry:
         Skip templates like entities.yaml where filename requires external parameters.
 
         Args:
-            ctx: Request context (must have user with user_space_name and agent_space_name)
+            ctx: Request context.
+            allowed_memory_types: Optional memory type whitelist. When set, only
+                initializes templates whose memory_type is included.
         """
         from openviking.storage.viking_fs import get_viking_fs
 
         logger = get_logger(__name__)
 
         user_space = user_space_fragment(ctx) if ctx and ctx.user else "default"
-        agent_space = agent_space_fragment(ctx) if ctx and ctx.user else "default"
 
         logger.info(
-            f"[MemoryTypeRegistry] Starting memory files initialization for user={user_space}, agent={agent_space}"
+            f"[MemoryTypeRegistry] Starting memory files initialization for user={user_space}"
         )
 
         viking_fs = get_viking_fs()
 
         for schema in self.list_all(include_disabled=False):
+            if allowed_memory_types is not None and schema.memory_type not in allowed_memory_types:
+                continue
+
             # Must be enabled, have filename_template and content_template
             if not schema.enabled or not schema.filename_template or not schema.content_template:
                 continue
@@ -267,9 +259,11 @@ class MemoryTypeRegistry:
             if "{{" in schema.filename_template:
                 continue
 
-            # Check if any field has init_value
+            # Seed template variables with every field so that placeholders for
+            # fields without an explicit init_value render as empty instead of
+            # leaking the literal "{{ field }}" text into the initialized file.
             fields_with_init = {
-                f.name: f.init_value for f in schema.fields if f.init_value is not None
+                f.name: f.init_value if f.init_value is not None else "" for f in schema.fields
             }
             if not fields_with_init:
                 continue
@@ -278,17 +272,11 @@ class MemoryTypeRegistry:
             try:
                 directory = TemplateUtils.render(
                     schema.directory,
-                    {
-                        "user_space": user_space,
-                        "agent_space": agent_space,
-                    },
+                    {"user_space": user_space},
                 )
                 filename = TemplateUtils.render(
                     schema.filename_template,
-                    {
-                        "user_space": user_space,
-                        "agent_space": agent_space,
-                    },
+                    {"user_space": user_space},
                 )
             except Exception:
                 continue
@@ -314,6 +302,9 @@ class MemoryTypeRegistry:
             full_content = MemoryFileUtils.write(
                 mf,
                 content_template=schema.content_template,
+                account_content_template_type=(
+                    schema.memory_type if schema._account_content_template else None
+                ),
             )
 
             # Write the file
@@ -324,11 +315,20 @@ class MemoryTypeRegistry:
                 pass
 
 
-def create_default_registry() -> MemoryTypeRegistry:
-    """
-    Create a registry with memory types loaded at initialization.
+_default_registry: Optional[MemoryTypeRegistry] = None
+_default_registry_lock = Lock()
 
-    Returns:
-        MemoryTypeRegistry with built-in types (loaded in __init__)
+
+def get_default_registry() -> MemoryTypeRegistry:
+    """Return the shared default registry, loaded on first use.
+
+    Template changes take effect after restarting the process. Callers must
+    not modify this registry or its schemas; use a separate registry to load
+    additional templates.
     """
-    return MemoryTypeRegistry(load_schemas=True)
+    global _default_registry
+    if _default_registry is None:
+        with _default_registry_lock:
+            if _default_registry is None:
+                _default_registry = MemoryTypeRegistry()
+    return _default_registry

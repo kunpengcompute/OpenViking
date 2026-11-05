@@ -1,60 +1,54 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class SessionAutoCommitConfig(BaseModel):
+    """Server-wide controls for automatic session commits."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for automatic session commits. When enabled, newly "
+            "created sessions without an explicit auto_commit_policy get a "
+            "default policy, and the idle-timeout background scheduler is "
+            "started. When disabled, neither happens."
+        ),
+    )
+    check_interval_seconds: float = Field(default=600.0, gt=0)
+    scan_rate_limit_files_per_second: float = Field(
+        default=2.0,
+        gt=0,
+        description=(
+            "Maximum number of session .meta.json files read per second during the "
+            "idle auto-commit scan. Used to bound background IO pressure when the "
+            "sessions directory is very large."
+        ),
+    )
 
 
 class MemoryConfig(BaseModel):
     """Memory configuration for OpenViking."""
 
     version: str = Field(
-        default="v2",
-        description="Memory implementation version: 'v1' (legacy) or 'v2' (new templating system)",
+        default="v3",
+        description="Deprecated and ignored. Memory extraction always uses v3.",
     )
-    agent_scope_mode: str = Field(
-        default="user+agent",
-        description=(
-            "Deprecated and ignored. Kept only for backward compatibility with older ov.conf files. "
-            "Agent/user namespace behavior is now controlled by per-account namespace policy."
-        ),
-    )
-
     custom_templates_dir: str = Field(
         default="",
         description="Custom memory templates directory. If set, templates from this directory will be loaded in addition to built-in templates",
-    )
-    v2_lock_retry_interval_seconds: float = Field(
-        default=0.2,
-        ge=0.0,
-        description=(
-            "Retry interval (seconds) when SessionCompressorV2 fails to acquire memory subtree "
-            "locks. Set to 0 for immediate retries."
-        ),
-    )
-    v2_lock_max_retries: int = Field(
-        default=0,
-        ge=0,
-        description=(
-            "Maximum retries for SessionCompressorV2 memory lock acquisition. "
-            "0 means unlimited retries."
-        ),
-    )
-    agent_memory_enabled: bool = Field(
-        default=False,
-        description=(
-            "Enable agent-scope trajectory/experience memory extraction. When true, "
-            "a two-phase pipeline runs after user-memory extraction: Phase 1 extracts "
-            "execution trajectories from the conversation; Phase 2 consolidates them "
-            "into higher-level experience memories."
-        ),
     )
     experimental_memory_switch: bool = Field(
         default=False,
         description=(
             "Experimental memory switch for experimental testing. When enabled, "
-            "experimental memory templates are loaded and agent_memory_enabled defaults "
-            "to true unless explicitly configured."
+            "experimental memory templates are loaded."
         ),
     )
     eager_prefetch: bool = Field(
@@ -74,6 +68,14 @@ class MemoryConfig(BaseModel):
             "When multiple directories are searched, results are merged and top-N are read."
         ),
     )
+    maintenance_review_tokens: int = Field(
+        default=1000,
+        gt=0,
+        description=(
+            "Estimated token count above which a full memory read includes an LLM maintenance "
+            "notice asking it to choose between coherent splitting and single-file compaction."
+        ),
+    )
     extraction_enabled: bool = Field(
         default=True,
         description=(
@@ -83,20 +85,20 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    extraction_output_format: Literal["json", "python"] = Field(
+        default="python",
+        description=(
+            "Final model-output protocol used by every memory extraction loop. "
+            "'python' uses the restricted internal memory SDK DSL (default); "
+            "'json' preserves the legacy structured JSON protocol."
+        ),
+    )
     session_skill_extraction_enabled: bool = Field(
         default=False,
         description=(
             "When enabled, session commit also extracts reusable skills from the archived "
-            "conversation and writes them into the agent skill directory. Disabled by "
+            "conversation and writes them into the current user's skill directory. Disabled by "
             "default."
-        ),
-    )
-    role_id_memory_isolation_enabled: bool = Field(
-        default=False,
-        description=(
-            "When enabled, memory extraction uses role_id from messages to determine "
-            "which user/agent the memory belongs to. When disabled (default), role_id "
-            "is ignored and the login user from the request context is used instead."
         ),
     )
     link_enabled: bool = Field(
@@ -107,23 +109,38 @@ class MemoryConfig(BaseModel):
             "no page_id or link fields are generated, and link resolution is skipped."
         ),
     )
-
-    model_config = {"extra": "forbid"}
+    session_auto_commit: SessionAutoCommitConfig = Field(
+        default_factory=SessionAutoCommitConfig,
+        description="Server-wide controls for automatic session commits.",
+    )
 
     @model_validator(mode="before")
     @classmethod
-    def default_agent_memory_for_experimental_switch(cls, data: Any) -> Any:
-        if isinstance(data, dict) and data.get("experimental_memory_switch") is True:
-            data = data.copy()
-            data.setdefault("agent_memory_enabled", True)
+    def drop_deprecated_memory_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            if "agent_memory_enabled" in data:
+                data.pop("agent_memory_enabled", None)
+                logger.debug(
+                    "memory.agent_memory_enabled is deprecated and ignored; "
+                    "use session memory_policy.memory_types to control trajectory/experience extraction"
+                )
+            if "working_memory_enabled" in data:
+                data.pop("working_memory_enabled", None)
+                logger.debug(
+                    "memory.working_memory_enabled is deprecated and ignored; "
+                    "use session memory_policy.working_memory.enabled to control archive summaries"
+                )
         return data
 
-    @field_validator("agent_scope_mode")
+    @field_validator("version", mode="before")
     @classmethod
-    def validate_agent_scope_mode(cls, value: str) -> str:
-        if value not in {"user+agent", "agent"}:
-            raise ValueError("memory.agent_scope_mode must be 'user+agent' or 'agent'")
-        return value
+    def accept_deprecated_version(cls, value: Any) -> str:
+        if value not in (None, ""):
+            logger.debug(
+                "memory.version is deprecated and ignored; memory extraction always uses v3"
+            )
+        return "v3"
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "MemoryConfig":

@@ -35,7 +35,7 @@ class TestDataProcessor(unittest.TestCase):
         self.assertIn(("geo_lon", "float32"), mapped)
         self.assertIn(("geo_lat", "float32"), mapped)
         self.assertIn(("uri", "path"), mapped)
-        self.assertIn(("tags", "string"), mapped)
+        self.assertIn(("tags", "list<string>"), mapped)
 
     def test_datetime_and_geo_point_conversion(self):
         data = {
@@ -133,6 +133,13 @@ class TestDataProcessor(unittest.TestCase):
         converted = json.loads(self.processor.convert_fields_for_index(fields_json))
 
         self.assertEqual(converted["abstract"], "face \U0001f600")
+
+    def test_convert_fields_for_index_handles_corrupted_json(self):
+        corrupted = '{"abstract": "truncated\x00\xff", "uri": "/tmp/bad"'
+
+        result = self.processor.convert_fields_for_index(corrupted)
+
+        self.assertEqual(result, corrupted)
 
 
 if __name__ == "__main__":

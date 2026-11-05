@@ -4,6 +4,7 @@
 """Tests for search endpoints: find, search, grep, glob."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,17 +12,34 @@ import pytest
 from openviking.models.embedder.base import EmbedResult
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
+from openviking.server.routers import search as search_router
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.retrieve import ContextType, FindResult, MatchedContext
 from openviking_cli.session.user_id import UserIdentifier
 
 
 @pytest.fixture(autouse=True)
 def fake_query_embedder(service):
     class FakeEmbedder:
+        def __init__(self):
+            vector_dim = getattr(
+                getattr(service.viking_fs, "_vector_store", None),
+                "vector_dim",
+                1024,
+            )
+            self._vector = [0.1] * int(vector_dim)
+
+        def prepare_embedding_input(self, text: str) -> str:
+            return text
+
         def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-            return EmbedResult(dense_vector=[0.1, 0.2, 0.3])
+            del text, is_query
+            return EmbedResult(dense_vector=list(self._vector))
+
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            return self.embed(text, is_query=is_query)
 
     service.viking_fs.query_embedder = FakeEmbedder()
 
@@ -40,6 +58,196 @@ async def test_find_basic(client_with_resource):
     assert "telemetry" not in body
 
 
+async def test_search_forwards_keywords_search_type(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_search(**kwargs):
+        captured.update(kwargs)
+        return FindResult(memories=[], resources=[], skills=[])
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    response = await client.post(
+        "/api/v1/search/search",
+        json={"query": "OAuth token", "search_type": "keywords"},
+    )
+
+    assert response.status_code == 200
+    assert captured["search_type"] == "keywords"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"query": "", "search_type": "keywords"},
+        {
+            "query": "OAuth token",
+            "image_url": "https://example.com/image.png",
+            "search_type": "keywords",
+        },
+    ],
+)
+async def test_search_rejects_invalid_keywords_inputs(client: httpx.AsyncClient, payload):
+    response = await client.post("/api/v1/search/search", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])
+async def test_search_endpoints_inline_visible_content_when_requested(
+    client: httpx.AsyncClient, service, monkeypatch, endpoint: str
+):
+    async def fake_read_visible(uri, *, ctx):
+        assert ctx is not None
+        return f"visible content for {uri}"
+
+    async def fake_search(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/visible.md",
+                    context_type=ContextType.RESOURCE,
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.fs, "read_visible", fake_read_visible)
+    monkeypatch.setattr(
+        service.search, "find" if endpoint.endswith("/find") else "search", fake_search
+    )
+
+    response = await client.post(endpoint, json={"query": "visible", "read_content": True})
+
+    assert response.status_code == 200
+    assert response.json()["result"]["resources"][0]["content"] == (
+        "visible content for viking://resources/visible.md"
+    )
+
+
+async def test_find_omits_content_when_read_is_not_requested(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    async def fake_search(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/visible.md",
+                    context_type=ContextType.RESOURCE,
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.search, "find", fake_search)
+    monkeypatch.setattr(
+        service.fs,
+        "read_visible",
+        lambda *args, **kwargs: pytest.fail("read_visible must not be called"),
+    )
+
+    response = await client.post("/api/v1/search/find", json={"query": "visible"})
+
+    assert response.status_code == 200
+    assert "content" not in response.json()["result"]["resources"][0]
+
+
+async def test_find_keeps_hit_without_content_when_read_fails(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    async def fake_read_visible(uri, *, ctx):
+        del uri, ctx
+        raise RuntimeError("unavailable")
+
+    async def fake_find(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/unavailable.md",
+                    context_type=ContextType.RESOURCE,
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.fs, "read_visible", fake_read_visible)
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    response = await client.post(
+        "/api/v1/search/find", json={"query": "unavailable", "read_content": True}
+    )
+
+    assert response.status_code == 200
+    assert "content" not in response.json()["result"]["resources"][0]
+
+
+async def test_search_context_rejects_read_content(client: httpx.AsyncClient):
+    response = await client.post(
+        "/api/v1/search/search",
+        json={"query": "visible", "mode": "context", "read_content": True},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "service_method"),
+    [
+        ("/api/v1/search/find", "find"),
+        ("/api/v1/search/search", "search"),
+    ],
+)
+async def test_search_endpoints_filter_invalid_result_tags(
+    client: httpx.AsyncClient, service, monkeypatch, endpoint: str, service_method: str
+):
+    async def fake_search(**kwargs):
+        del kwargs
+        return FindResult(
+            memories=[],
+            resources=[
+                MatchedContext(
+                    uri="viking://resources/legacy-tags.md",
+                    context_type=ContextType.RESOURCE,
+                    search_tags=["default", "team=infra", "bad=", "project=viking"],
+                )
+            ],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.search, service_method, fake_search)
+
+    response = await client.post(endpoint, json={"query": "legacy tags"})
+
+    assert response.status_code == 200
+    assert response.json()["result"]["resources"][0]["tags"] == [
+        "team=infra",
+        "project=viking",
+    ]
+
+
+@pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])
+async def test_search_endpoints_reject_unknown_request_fields(
+    client: httpx.AsyncClient,
+    endpoint: str,
+):
+    resp = await client.post(
+        endpoint,
+        json={"query": "sample document", "unexpected": "value"},
+    )
+
+    assert resp.status_code == 400
+
+
 async def test_find_with_target_uri(client_with_resource):
     client, uri = client_with_resource
     resp = await client.post(
@@ -48,6 +256,40 @@ async def test_find_with_target_uri(client_with_resource):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+async def test_find_with_target_uri_and_tags_passes_target_and_filter(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_find(*, target_uri=None, filter=None, **kwargs):
+        captured["target_uri"] = target_uri
+        captured["filter"] = filter
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={
+            "query": "sample",
+            "target_uri": "viking://resources/sample",
+            "tags": ["team=search", "env=prod"],
+            "limit": 10,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["target_uri"] == "viking://resources/sample"
+    assert captured["filter"] == {
+        "op": "and",
+        "conds": [
+            {"op": "must", "field": "search_tags", "conds": ["team=search"]},
+            {"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+        ],
+    }
 
 
 async def test_find_with_level_passes_to_service(client: httpx.AsyncClient, service, monkeypatch):
@@ -320,7 +562,7 @@ async def test_find_with_inaccessible_target_uri_returns_permission_denied(
     try:
         resp = await client.post(
             "/api/v1/search/find",
-            json={"query": "sample", "target_uri": "viking://agent/foreign-agent", "limit": 5},
+            json={"query": "sample", "target_uri": "viking://user/foreign/memories", "limit": 5},
         )
     finally:
         app.dependency_overrides.pop(get_request_context, None)
@@ -470,6 +712,140 @@ async def test_find_combines_existing_filter_with_time_range(
     }
 
 
+async def test_find_with_context_type_compiles_filter(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_find(*, filter=None, **kwargs):
+        captured["filter"] = filter
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample", "context_type": "memory"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["filter"] == {"op": "must", "field": "context_type", "conds": ["memory"]}
+
+
+async def test_find_combines_tags_with_existing_filter(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_find(*, filter=None, **kwargs):
+        captured["filter"] = filter
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={
+            "query": "sample",
+            "filter": {"op": "must", "field": "kind", "conds": ["email"]},
+            "tags": ["Env=Prod", " env=prod ", "team=Search"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["filter"] == {
+        "op": "and",
+        "conds": [
+            {"op": "must", "field": "kind", "conds": ["email"]},
+            {"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+            {"op": "must", "field": "search_tags", "conds": ["team=search"]},
+        ],
+    }
+
+
+async def test_search_combines_context_type_list_with_existing_filter(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_search(*, filter=None, **kwargs):
+        captured["filter"] = filter
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={
+            "query": "sample",
+            "context_type": ["memory", "resource"],
+            "filter": {"op": "must", "field": "kind", "conds": ["email"]},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["filter"] == {
+        "op": "and",
+        "conds": [
+            {"op": "must", "field": "kind", "conds": ["email"]},
+            {"op": "must", "field": "context_type", "conds": ["memory", "resource"]},
+        ],
+    }
+
+
+async def test_search_compiles_tags_only_filter(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_search(*, filter=None, **kwargs):
+        captured["filter"] = filter
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample", "tags": ["Team=Search", "env=prod"]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["filter"] == {
+        "op": "and",
+        "conds": [
+            {"op": "must", "field": "search_tags", "conds": ["team=search"]},
+            {"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+        ],
+    }
+
+
+async def test_find_with_invalid_context_type_returns_invalid_argument(client: httpx.AsyncClient):
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample", "context_type": "archive"},
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert "context_type" in body["error"]["message"]
+
+
+async def test_search_rejects_invalid_kv_tags(client: httpx.AsyncClient):
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample", "tags": ["team-search"]},
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+
+
 async def test_find_with_invalid_time_returns_invalid_argument(client: httpx.AsyncClient):
     resp = await client.post(
         "/api/v1/search/find",
@@ -555,6 +931,10 @@ async def test_find_telemetry_metrics(client_with_resource):
     assert "tokens" not in summary
     assert "vector" in summary
     assert summary["vector"]["searches"] >= 0
+    assert "search" in summary
+    assert "vector_retrieval" in summary["search"]
+    assert "result_convert" not in summary["search"]
+    assert "request" not in summary["search"]
     assert "queue" not in summary
     assert "semantic_nodes" not in summary
     assert "memory" not in summary
@@ -573,6 +953,10 @@ async def test_search_telemetry_metrics(client_with_resource):
     body = resp.json()
     summary = body["telemetry"]["summary"]
     assert summary["operation"] == "search.search"
+    assert "search" in summary
+    assert "vector_retrieval" in summary["search"]
+    assert "result_convert" not in summary["search"]
+    assert "request" not in summary["search"]
     if body["result"]["total"] > 0:
         assert summary["vector"]["returned"] == body["result"]["total"]
     else:
@@ -648,10 +1032,97 @@ async def test_grep(client_with_resource):
     parent_uri = "/".join(uri.split("/")[:-1]) + "/"
     resp = await client.post(
         "/api/v1/search/grep",
-        json={"uri": parent_uri, "pattern": "Sample"},
+        json={
+            "uri": parent_uri,
+            "pattern": "Introduction",
+            "before_context": 1,
+            "after_context": 1,
+        },
     )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
+    body = resp.json()
+    assert body["status"] == "ok"
+    match = body["result"]["matches"][0]
+    assert match["before_context"] == [{"line": 2, "content": ""}]
+    assert match["after_context"] == [
+        {"line": 4, "content": "This is a sample markdown document for server testing."}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_forwards_tags_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_grep(uri, pattern, **kwargs):
+        seen.update(uri=uri, pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(grep=fake_grep)),
+    )
+
+    await search_router.grep(
+        search_router.GrepRequest(
+            uri="viking://resources", pattern="OpenViking", tags=["team=search", "env=prod"]
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["tags"] == ["team=search", "env=prod"]
+
+
+@pytest.mark.asyncio
+async def test_grep_forwards_include_tags_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_grep(uri, pattern, **kwargs):
+        seen.update(uri=uri, pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(grep=fake_grep)),
+    )
+
+    await search_router.grep(
+        search_router.GrepRequest(
+            uri="viking://resources", pattern="OpenViking", include_tags=True
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["include_tags"] is True
+
+
+@pytest.mark.asyncio
+async def test_grep_forwards_context_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_grep(uri, pattern, **kwargs):
+        seen.update(uri=uri, pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(grep=fake_grep)),
+    )
+
+    await search_router.grep(
+        search_router.GrepRequest(
+            uri="viking://resources",
+            pattern="OpenViking",
+            before_context=2,
+            after_context=3,
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["before_context"] == 2
+    assert seen["after_context"] == 3
 
 
 async def test_grep_case_insensitive(client_with_resource):
@@ -697,6 +1168,7 @@ async def test_grep_level_limit_filters_by_relative_match_path(
             "temp_file_id": root_file.name,
             "to": "viking://resources/level-limit/root_level.md",
             "reason": "test",
+            "wait": True,
         },
     )
     await client.post(
@@ -705,6 +1177,7 @@ async def test_grep_level_limit_filters_by_relative_match_path(
             "temp_file_id": deep_file.name,
             "to": "viking://resources/level-limit/nested/deeper/deep_level.md",
             "reason": "test",
+            "wait": True,
         },
     )
 
@@ -736,11 +1209,11 @@ async def test_grep_exclude_uri_excludes_specific_uri_range(
 
     await client.post(
         "/api/v1/resources",
-        json={"temp_file_id": include_file.name, "reason": "include"},
+        json={"temp_file_id": include_file.name, "reason": "include", "wait": True},
     )
     await client.post(
         "/api/v1/resources",
-        json={"temp_file_id": exclude_file.name, "reason": "exclude"},
+        json={"temp_file_id": exclude_file.name, "reason": "exclude", "wait": True},
     )
 
     root_uri = "viking://resources"
@@ -777,6 +1250,7 @@ async def test_grep_exclude_uri_does_not_exclude_same_named_sibling_dirs(
             "temp_file_id": group_a_file.name,
             "to": "viking://resources/group_a/cache/a.md",
             "reason": "test",
+            "wait": True,
         },
     )
     await client.post(
@@ -785,6 +1259,7 @@ async def test_grep_exclude_uri_does_not_exclude_same_named_sibling_dirs(
             "temp_file_id": group_b_file.name,
             "to": "viking://resources/group_b/cache/b.md",
             "reason": "test",
+            "wait": True,
         },
     )
 
@@ -808,7 +1283,88 @@ async def test_glob(client_with_resource):
     client, _ = client_with_resource
     resp = await client.post(
         "/api/v1/search/glob",
-        json={"pattern": "*.md"},
+        json={"pattern": "**/*.md"},
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+    assert all(isinstance(match, str) for match in resp.json()["result"]["matches"])
+
+
+async def test_glob_explicit_empty_extra_fields_returns_entry_objects(client_with_resource):
+    client, _ = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/glob",
+        json={"pattern": "**/*.md", "extra_fields": []},
+    )
+
+    assert resp.status_code == 200
+    matches = resp.json()["result"]["matches"]
+    assert matches
+    assert all(isinstance(match, dict) for match in matches)
+    assert all("uri" in match and "isDir" in match for match in matches)
+
+
+@pytest.mark.asyncio
+async def test_glob_forwards_tags_and_tag_projection_to_filesystem_service(monkeypatch):
+    seen = {}
+
+    async def fake_glob(pattern, **kwargs):
+        seen.update(pattern=pattern, **kwargs)
+        return {"matches": [], "count": 0}
+
+    monkeypatch.setattr(
+        search_router,
+        "get_service",
+        lambda: SimpleNamespace(fs=SimpleNamespace(glob=fake_glob)),
+    )
+
+    await search_router.glob(
+        search_router.GlobRequest(
+            pattern="**/*.md", tags=["env=prod"], include_tags=True
+        ),
+        _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
+    )
+
+    assert seen["tags"] == ["env=prod"]
+    assert seen["include_tags"] is True
+
+
+@pytest.mark.parametrize("multimodal", [True, False])
+async def test_find_image_query_uses_account_embedder_capability(
+    client: httpx.AsyncClient, service, monkeypatch, multimodal: bool
+):
+    from openviking.models.embedder.base import DenseEmbedderBase
+    from openviking_cli.utils.config.embedding_config import EmbeddingConfig
+
+    seen = []
+
+    class ImageEmbedder(DenseEmbedderBase):
+        def __init__(self, dimension: int):
+            super().__init__(model_name="test-image-embedder")
+            self._dimension = dimension
+
+        @property
+        def supports_multimodal(self) -> bool:
+            return multimodal
+
+        def embed(self, content, is_query: bool = False) -> EmbedResult:
+            if is_query:
+                seen.append(content)
+            return EmbedResult(dense_vector=[0.1] * self._dimension)
+
+        def get_dimension(self) -> int:
+            return self._dimension
+
+    monkeypatch.setattr(EmbeddingConfig, "get_embedder", lambda self: ImageEmbedder(self.dimension))
+    await service.embedding_provider.invalidate(UserIdentifier.the_default_user().account_id)
+    image_url = "data:image/png;base64,iVBORw0KGgo="
+
+    response = await client.post("/api/v1/search/find", json={"query": "", "image_url": image_url})
+
+    if multimodal:
+        assert response.status_code == 200, response.text
+        assert seen and seen[-1][-1] == {"type": "image_url", "image_url": {"url": image_url}}
+    else:
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+        assert not seen

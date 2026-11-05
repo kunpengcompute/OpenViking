@@ -1,13 +1,21 @@
 import { memo, useCallback, useState } from 'react'
-import { CheckIcon, CopyIcon, UserIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { BotIcon, CheckIcon, CopyIcon, UserIcon } from 'lucide-react'
+import type { TFunction } from 'i18next'
 
-import { resolvePublicAsset } from '#/lib/public-path'
-import type { StreamToolCall } from '#/lib/sessions/types/chat'
-import type { Message } from '#/lib/sessions/types/message'
-import { MarkdownContent, ReasoningBlock, ToolCallBlock } from './message-parts'
-
-const OPENVIKING_ICON_SRC = resolvePublicAsset('favicon-32.png')
+import { groupMessages } from '#/lib/sessions/group-messages'
+import type {
+  Message,
+  MessagePart,
+  ToolPart,
+  ToolResultPart,
+} from '#/lib/sessions/types/message'
+import {
+  IterationDivider,
+  MarkdownContent,
+  ReasoningBlock,
+  ToolCallBlock,
+} from './message-parts'
 
 // ---------------------------------------------------------------------------
 // CopyButton
@@ -41,24 +49,42 @@ function CopyButton({ text }: { text: string }) {
 
 /** Extract all text content from a message's parts. */
 function getTextFromParts(message: Message): string {
-  return message.parts
+  const parts = Array.isArray(message.parts) ? message.parts : []
+  return parts
     .filter((p) => p.type === 'text')
     .map((p) => (p as { text: string }).text)
     .join('\n')
 }
 
+function getToolResultsById(parts: MessagePart[]): Map<string, ToolResultPart> {
+  return new Map(
+    parts
+      .filter((part): part is ToolResultPart => part.type === 'tool_result')
+      .map((part) => [part.tool_id, part]),
+  )
+}
+
+function stripLegacyContextSuffix(text: string): string {
+  return text
+    .replace(/\n\n当前选中的上下文资源：\s*viking:\/\/[\s\S]*$/u, '')
+    .replace(
+      /\n\n当前用户在 Playground 中选中的上下文资源是：\s*viking:\/\/[\s\S]*$/u,
+      '',
+    )
+}
+
 /** Format relative time */
-function formatRelativeTime(iso: string): string {
+function formatRelativeTime(iso: string, t: TFunction<'sessions'>): string {
   const now = Date.now()
   const then = new Date(iso).getTime()
   const diff = Math.max(0, now - then)
   const minutes = Math.floor(diff / 60000)
-  if (minutes < 1) return '刚刚'
-  if (minutes < 60) return `${minutes} 分钟前`
+  if (minutes < 1) return t('chat.relativeTime.justNow')
+  if (minutes < 60) return t('chat.relativeTime.minutesAgo', { count: minutes })
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
+  if (hours < 24) return t('chat.relativeTime.hoursAgo', { count: hours })
   const days = Math.floor(hours / 24)
-  return `${days} 天前`
+  return t('chat.relativeTime.daysAgo', { count: days })
 }
 
 // ---------------------------------------------------------------------------
@@ -76,13 +102,16 @@ function TypingIndicator() {
 }
 
 // ---------------------------------------------------------------------------
-// BotAvatar — product brand avatar
+// AgentAvatar — generic agent avatar
 // ---------------------------------------------------------------------------
 
-function BotAvatar() {
+function AgentAvatar({ compact }: { compact?: boolean }) {
+  const sizeClass = compact ? 'size-6' : 'size-7'
   return (
-    <div className="flex size-7 shrink-0 items-center justify-center rounded-full ring-1 ring-border/20 overflow-hidden">
-      <img src={OPENVIKING_ICON_SRC} alt="OpenViking" className="size-7" />
+    <div
+      className={`flex ${sizeClass} shrink-0 items-center justify-center rounded-full border border-border/70 bg-muted/60 text-muted-foreground`}
+    >
+      <BotIcon className={compact ? 'size-3.5' : 'size-4'} aria-hidden="true" />
     </div>
   )
 }
@@ -92,28 +121,71 @@ function BotAvatar() {
 // ---------------------------------------------------------------------------
 
 interface MessageListProps {
+  layout?: 'default' | 'expanded'
   messages: Message[]
   streaming?: {
-    content: string
-    toolCalls: StreamToolCall[]
-    reasoning: string
+    parts?: MessagePart[]
     iteration: number
   }
+  onResourceClick?: (uri: string) => void
 }
 
-export function MessageList({ messages, streaming }: MessageListProps) {
+export function MessageList({
+  layout = 'default',
+  messages,
+  onResourceClick,
+  streaming,
+}: MessageListProps) {
+  const isExpanded = layout === 'expanded'
+  const safeMessages = groupMessages([
+    ...(Array.isArray(messages) ? messages : []),
+    ...(streaming
+      ? [
+          {
+            id: '__streaming__',
+            role: 'assistant' as const,
+            parts: streaming.parts ?? [],
+            created_at: new Date().toISOString(),
+          },
+        ]
+      : []),
+  ])
+  const streamingGroup =
+    streaming && safeMessages.at(-1)?.role === 'assistant'
+      ? safeMessages.pop()
+      : undefined
   return (
     <>
-      {messages.map((msg, idx) => {
-        const prev = idx > 0 ? messages[idx - 1] : null
-        const sameRole = prev?.role === msg.role
+      {safeMessages.map((msg, idx) => {
+        const prev = idx > 0 ? safeMessages[idx - 1] : null
+        const sameRole =
+          prev?.role === msg.role &&
+          (!prev.turn_id || !msg.turn_id || prev.turn_id === msg.turn_id)
         return msg.role === 'user' ? (
-          <UserMessage key={msg.id} message={msg} compact={sameRole} />
+          <UserMessage
+            key={msg.id}
+            message={msg}
+            compact={sameRole}
+            expanded={isExpanded}
+          />
         ) : (
-          <AssistantMessage key={msg.id} message={msg} compact={sameRole} />
+          <AssistantMessage
+            key={msg.id}
+            message={msg}
+            compact={sameRole}
+            expanded={isExpanded}
+            onResourceClick={onResourceClick}
+          />
         )
       })}
-      {streaming && <StreamingAssistantMessage {...streaming} />}
+      {streaming && (
+        <StreamingAssistantMessage
+          {...streaming}
+          parts={streamingGroup?.parts ?? streaming.parts}
+          expanded={isExpanded}
+          onResourceClick={onResourceClick}
+        />
+      )}
     </>
   )
 }
@@ -123,37 +195,45 @@ export function MessageList({ messages, streaming }: MessageListProps) {
 // ---------------------------------------------------------------------------
 
 const UserMessage = memo(function UserMessage({
+  expanded,
   message,
   compact,
 }: {
+  expanded?: boolean
   message: Message
   compact?: boolean
 }) {
-  const text = getTextFromParts(message)
+  const { t } = useTranslation('sessions')
+  const text = stripLegacyContextSuffix(getTextFromParts(message))
 
   return (
     <div
-      className={`group/msg flex w-full max-w-3xl gap-3 justify-end ${compact ? 'mb-1.5' : 'mb-5'}`}
+      className={`${expanded ? 'w-full' : 'w-full max-w-4xl'} group/msg flex gap-2 justify-end ${compact ? 'mb-1.5' : 'mb-5'}`}
     >
-      <div className="flex items-end gap-1.5 self-end">
+      <div className="flex items-end gap-1.5 self-end opacity-0 transition-opacity group-hover/msg:opacity-100">
         <span className="text-[10px] text-muted-foreground/40 opacity-0 transition-opacity group-hover/msg:opacity-100 select-none">
-          {formatRelativeTime(message.created_at)}
+          {formatRelativeTime(message.created_at, t)}
         </span>
         <CopyButton text={text} />
       </div>
-      <div className="max-w-[75%] space-y-1.5">
+      <div
+        className={
+          expanded ? 'max-w-[88%] space-y-1.5' : 'max-w-[75%] space-y-1.5'
+        }
+      >
+        <Attachments parts={message.parts} />
         {text && (
-          <div className="rounded-2xl rounded-tr-sm bg-primary px-4 py-2.5 text-sm text-primary-foreground whitespace-pre-wrap shadow-sm">
+          <div className="whitespace-pre-wrap rounded-2xl rounded-tr-sm border border-border/70 bg-muted/70 px-4 py-2.5 text-sm leading-6 text-foreground shadow-sm">
             {text}
           </div>
         )}
       </div>
       {!compact && (
-        <div className="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
-          <UserIcon className="size-3.5 text-primary" />
+        <div className="flex size-6 shrink-0 items-center justify-center rounded-full border border-border/70 bg-muted/60">
+          <UserIcon className="size-3.5 text-muted-foreground" />
         </div>
       )}
-      {compact && <div className="w-7 shrink-0" />}
+      {compact && <div className="w-6 shrink-0" />}
     </div>
   )
 })
@@ -163,45 +243,71 @@ const UserMessage = memo(function UserMessage({
 // ---------------------------------------------------------------------------
 
 const AssistantMessage = memo(function AssistantMessage({
+  expanded,
   message,
   compact,
+  onResourceClick,
 }: {
+  expanded?: boolean
   message: Message
   compact?: boolean
+  onResourceClick?: (uri: string) => void
 }) {
+  const { t } = useTranslation('sessions')
   const textContent = getTextFromParts(message)
+  const toolResultsById = getToolResultsById(message.parts)
 
   return (
     <div
-      className={`group/msg flex w-full max-w-3xl gap-3 items-start ${compact ? 'mb-1.5' : 'mb-5'}`}
+      className={`${expanded ? 'w-full' : 'w-full max-w-4xl'} group/msg flex gap-2 items-start ${compact ? 'mb-1.5' : 'mb-5'}`}
     >
-      {!compact ? <BotAvatar /> : <div className="w-7 shrink-0" />}
-      <div className="max-w-full min-w-0 flex-1 rounded-2xl rounded-tl-sm bg-background/95 px-4 py-3 text-sm shadow-sm ring-1 ring-border/30">
-        {message.parts.map((part, i) => {
+      {!compact ? (
+        <AgentAvatar compact={expanded} />
+      ) : (
+        <div className="w-6 shrink-0" />
+      )}
+      <div className="relative max-w-full min-w-0 flex-1 rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3 text-sm">
+        {(Array.isArray(message.parts) ? message.parts : []).map((part, i) => {
           switch (part.type) {
             case 'text':
               return <MarkdownContent key={i} content={part.text} />
-            case 'tool':
+            case 'reasoning':
+              return (
+                <ReasoningBlock
+                  key={i}
+                  reasoning={part.reasoning}
+                  isRunning={false}
+                />
+              )
+            case 'iteration':
+              return <IterationDivider key={i} iteration={part.iteration} />
+            case 'tool': {
+              const toolResult = toolResultsById.get(part.tool_id)
               return (
                 <ToolCallBlock
                   key={i}
                   toolName={part.tool_name}
                   args={part.tool_input}
-                  result={part.tool_output}
-                  isError={part.tool_status === 'error'}
+                  result={toolResult?.tool_output ?? part.tool_output}
+                  isError={toolResult?.is_error ?? part.tool_status === 'error'}
                   isRunning={false}
+                  onResourceClick={onResourceClick}
                 />
               )
-            case 'context':
+            }
+            case 'tool_result':
               return null
+            case 'image_url':
+            case 'context':
+              return <Attachments key={i} parts={[part]} />
           }
         })}
-      </div>
-      <div className="flex items-end gap-1.5 self-end">
-        <CopyButton text={textContent} />
-        <span className="text-[10px] text-muted-foreground/40 opacity-0 transition-opacity group-hover/msg:opacity-100 select-none">
-          {formatRelativeTime(message.created_at)}
-        </span>
+        <div className="absolute right-2 top-2 flex items-center gap-1.5 rounded-lg bg-background/85 px-1.5 py-1 opacity-0 shadow-sm ring-1 ring-border/40 backdrop-blur transition-opacity group-hover/msg:opacity-100">
+          <CopyButton text={textContent} />
+          <span className="text-[10px] text-muted-foreground/60 select-none">
+            {formatRelativeTime(message.created_at, t)}
+          </span>
+        </div>
       </div>
     </div>
   )
@@ -212,57 +318,121 @@ const AssistantMessage = memo(function AssistantMessage({
 // ---------------------------------------------------------------------------
 
 function StreamingAssistantMessage({
-  content,
-  toolCalls,
-  reasoning,
-  iteration,
+  expanded,
+  parts = [],
+  onResourceClick,
 }: {
-  content: string
-  toolCalls: StreamToolCall[]
-  reasoning: string
-  iteration: number
+  expanded?: boolean
+  parts?: MessagePart[]
+  onResourceClick?: (uri: string) => void
 }) {
-  const { t } = useTranslation('sessions')
-  const hasContent = content || toolCalls.length > 0 || reasoning
+  const safeParts = Array.isArray(parts) ? parts : []
+  const hasContent = safeParts.length > 0
+  const toolResultsById = getToolResultsById(safeParts)
 
   return (
-    <div className="mb-5 flex w-full max-w-3xl gap-3 items-start">
-      <BotAvatar />
-      <div className="max-w-full min-w-0 flex-1 rounded-2xl rounded-tl-sm bg-background/95 px-4 py-3 text-sm shadow-sm ring-1 ring-border/30">
-        {iteration > 1 && (
-          <div className="mb-2">
-            <span className="inline-flex items-center rounded-full bg-primary/10 px-2.5 py-0.5 text-[11px] font-medium text-primary">
-              {t('chat.iteration', { count: iteration })}
-            </span>
-          </div>
+    <div
+      className={`${expanded ? 'w-full' : 'w-full max-w-4xl'} mb-5 flex gap-2 items-start`}
+    >
+      <AgentAvatar compact={expanded} />
+      <div className="max-w-full min-w-0 flex-1 rounded-2xl rounded-tl-sm border border-border/60 bg-card px-4 py-3 text-sm">
+        {safeParts.map((part, i) =>
+          renderStreamingPart(part, i, toolResultsById, onResourceClick),
         )}
 
-        <ReasoningBlock reasoning={reasoning} isRunning />
-
-        {toolCalls.map((tc, i) => {
-          let args: Record<string, unknown> = {}
-          try {
-            args = JSON.parse(tc.arguments) as Record<string, unknown>
-          } catch {
-            if (tc.arguments) args = { raw: tc.arguments }
-          }
-          return (
-            <ToolCallBlock
-              key={i}
-              toolName={tc.name}
-              args={args}
-              result={tc.result}
-              isRunning={!tc.result}
-            />
-          )
-        })}
-
-        {content ? (
-          <MarkdownContent content={content} isStreaming />
-        ) : !hasContent ? (
-          <TypingIndicator />
-        ) : null}
+        {!hasContent ? <TypingIndicator /> : null}
       </div>
     </div>
+  )
+}
+
+function renderStreamingPart(
+  part: MessagePart,
+  index: number,
+  toolResultsById: Map<string, ToolResultPart>,
+  onResourceClick?: (uri: string) => void,
+) {
+  switch (part.type) {
+    case 'reasoning':
+      return (
+        <ReasoningBlock
+          key={index}
+          reasoning={part.reasoning}
+          isRunning={part.is_running ?? true}
+        />
+      )
+    case 'iteration':
+      return <IterationDivider key={index} iteration={part.iteration} />
+    case 'tool':
+      return (
+        <StreamingToolPart
+          key={index}
+          part={part}
+          result={toolResultsById.get(part.tool_id)}
+          onResourceClick={onResourceClick}
+        />
+      )
+    case 'tool_result':
+      return null
+    case 'text':
+      return <MarkdownContent key={index} content={part.text} isStreaming />
+    case 'image_url':
+    case 'context':
+      return <Attachments key={index} parts={[part]} />
+  }
+}
+
+function StreamingToolPart({
+  part,
+  result,
+  onResourceClick,
+}: {
+  part: ToolPart
+  result?: ToolResultPart
+  onResourceClick?: (uri: string) => void
+}) {
+  return (
+    <ToolCallBlock
+      toolName={part.tool_name}
+      args={part.tool_input}
+      result={result?.tool_output ?? part.tool_output}
+      isError={result?.is_error ?? part.tool_status === 'error'}
+      isRunning={
+        part.tool_status === 'running' || part.tool_status === 'pending'
+      }
+      onResourceClick={onResourceClick}
+    />
+  )
+}
+
+function Attachments({ parts }: { parts: MessagePart[] }) {
+  return (
+    <>
+      {parts.map((part, index) => {
+        if (part.type === 'context')
+          return (
+            <div
+              key={index}
+              className="my-2 break-all rounded-md border px-3 py-2 text-xs text-muted-foreground"
+              title={part.abstract}
+            >
+              {part.uri}
+            </div>
+          )
+        if (
+          part.type === 'image_url' &&
+          /^(https?:|data:image\/)/i.test(part.image_url.url)
+        )
+          return (
+            <img
+              key={index}
+              src={part.image_url.url}
+              alt=""
+              className="my-2 max-h-80 max-w-full rounded-lg object-contain"
+            />
+          )
+        return null
+      })}
+    </>
   )
 }

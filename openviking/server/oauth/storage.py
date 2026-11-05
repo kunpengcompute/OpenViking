@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0
 """SQLite-backed OAuth state storage.
 
-Holds three tables — DCR clients, short-lived codes (auth codes + OTPs share
-this table, distinguished by ``kind``), and refresh tokens. Uses stdlib
-``sqlite3`` wrapped in ``asyncio.to_thread`` for async ergonomics; Phase 1
-QPS doesn't justify the new ``aiosqlite`` dependency.
+Holds three tables — DCR clients, short-lived codes (the ``oauth_codes``
+table, keyed by ``kind``; only authorization codes are written today), and
+refresh tokens. Uses stdlib ``sqlite3`` wrapped in ``asyncio.to_thread`` for
+async ergonomics; current QPS doesn't justify the new ``aiosqlite`` dependency.
 
 Concurrency: a single ``sqlite3.Connection`` is shared across worker threads
 (``check_same_thread=False``). Every DB access — both reads and writes —
@@ -13,7 +13,7 @@ serializes through ``self._lock``, because the stdlib connection's cursor
 state is not safe for concurrent use across threads. With ``isolation_level=
 None`` each statement is autocommitted, so the lock granularity is per-call.
 
-Atomicity guarantee: one-shot consumption (OTP / auth code / refresh) is done
+Atomicity guarantee: one-shot consumption (auth code / refresh) is done
 via a single ``UPDATE ... WHERE used = 0 RETURNING ...`` so that two concurrent
 consumers cannot both succeed — the loser sees zero rows and is rejected.
 """
@@ -26,7 +26,7 @@ import secrets
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from openviking.server.oauth.otp import hash_secret
 from openviking_cli.utils import get_logger
@@ -43,11 +43,14 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
     grant_types TEXT NOT NULL DEFAULT '["authorization_code","refresh_token"]',
     response_types TEXT NOT NULL DEFAULT '["code"]',
     client_name TEXT,
+    scope TEXT,
     created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS oauth_codes (
     code_hash TEXT PRIMARY KEY,
+    -- ``otp`` is retained for backward compatibility with existing DBs; only
+    -- ``code`` (authorization codes) is written today.
     kind TEXT NOT NULL CHECK (kind IN ('otp', 'code')),
     client_id TEXT,
     redirect_uri TEXT,
@@ -59,7 +62,7 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     user_id TEXT NOT NULL,
     role TEXT NOT NULL,
     -- SHA-256 hex of the API key value that authorized this row. Recorded at
-    -- OTP issuance / oauth-verify time and copied forward into refresh/access
+    -- oauth-verify time and copied forward into refresh/access
     -- so that key rotation or deletion invalidates every derived OAuth token.
     -- Nullable only for backwards compat with rows written before this field
     -- existed; auth path treats NULL as fail-closed.
@@ -166,6 +169,7 @@ class OAuthStore:
         ALTER TABLE ADD COLUMN guarded by a ``PRAGMA table_info`` check.
         """
         column_additions = (
+            ("oauth_clients", "scope", "TEXT"),
             ("oauth_codes", "authorizing_key_fp", "TEXT"),
             ("oauth_pending_authorizations", "verified_key_fp", "TEXT"),
             ("oauth_refresh_tokens", "authorizing_key_fp", "TEXT"),
@@ -197,6 +201,7 @@ class OAuthStore:
         grant_types: Optional[list[str]] = None,
         response_types: Optional[list[str]] = None,
         client_secret: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> dict[str, Any]:
         """Persist a freshly registered client and return the public record.
 
@@ -218,6 +223,7 @@ class OAuthStore:
             "grant_types": grant_types or ["authorization_code", "refresh_token"],
             "response_types": response_types or ["code"],
             "client_name": client_name,
+            "scope": scope,
             "created_at": now,
         }
 
@@ -227,7 +233,7 @@ class OAuthStore:
                 "INSERT INTO oauth_clients "
                 "(client_id, client_secret_hash, redirect_uris, "
                 "token_endpoint_auth_method, grant_types, response_types, "
-                "client_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "client_name, scope, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record["client_id"],
                     record["client_secret_hash"],
@@ -236,6 +242,7 @@ class OAuthStore:
                     json.dumps(record["grant_types"]),
                     json.dumps(record["response_types"]),
                     record["client_name"],
+                    record["scope"],
                     record["created_at"],
                 ),
             )
@@ -261,54 +268,6 @@ class OAuthStore:
 
         async with self._lock:
             return await asyncio.to_thread(_query)
-
-    # ---- OTPs ----
-
-    async def insert_otp(
-        self,
-        *,
-        otp_plain: str,
-        account_id: str,
-        user_id: str,
-        role: str,
-        authorizing_key_fp: str,
-        ttl_seconds: int,
-    ) -> int:
-        """Insert an OTP row and return its expires_at timestamp.
-
-        ``authorizing_key_fp`` is the SHA-256 fingerprint of the API key the
-        caller presented when requesting the OTP. It is propagated forward to
-        any auth code / access / refresh token derived from this OTP so that
-        rotating or removing the key invalidates the entire downstream chain.
-        """
-        now = int(time.time())
-        expires_at = now + ttl_seconds
-
-        def _insert() -> None:
-            assert self._conn is not None
-            self._conn.execute(
-                "INSERT INTO oauth_codes "
-                "(code_hash, kind, account_id, user_id, role, "
-                "authorizing_key_fp, expires_at, created_at) "
-                "VALUES (?, 'otp', ?, ?, ?, ?, ?, ?)",
-                (
-                    hash_secret(otp_plain),
-                    account_id,
-                    user_id,
-                    role,
-                    authorizing_key_fp,
-                    expires_at,
-                    now,
-                ),
-            )
-
-        async with self._lock:
-            await asyncio.to_thread(_insert)
-        return expires_at
-
-    async def consume_otp(self, otp_plain: str) -> Optional[dict[str, Any]]:
-        """Atomically mark an OTP used and return its identity claims, or None."""
-        return await self._atomic_consume_code(otp_plain, expected_kind="otp")
 
     # ---- Auth codes ----
 
@@ -531,21 +490,6 @@ class OAuthStore:
         async with self._lock:
             return await asyncio.to_thread(_q)
 
-    async def revoke_chain(self, *, client_id: str, account_id: str, user_id: str) -> int:
-        """Revoke every refresh token for (client, account, user). Returns count."""
-
-        def _revoke() -> int:
-            assert self._conn is not None
-            cur = self._conn.execute(
-                "UPDATE oauth_refresh_tokens SET consumed = 1 "
-                "WHERE client_id = ? AND account_id = ? AND user_id = ? AND consumed = 0",
-                (client_id, account_id, user_id),
-            )
-            return cur.rowcount
-
-        async with self._lock:
-            return await asyncio.to_thread(_revoke)
-
     # ---- Access tokens ----
 
     async def insert_access(
@@ -624,41 +568,43 @@ class OAuthStore:
         async with self._lock:
             return await asyncio.to_thread(_revoke)
 
-    async def revoke_user_tokens(self, *, account_id: str, user_id: str) -> dict[str, int]:
-        """Revoke all access + refresh tokens for a (account, user) pair.
-
-        Used when an API key for that user is rotated / deleted: every OAuth
-        token derived from that user identity gets invalidated. Auth codes
-        and OTPs for the same user are also wiped to prevent in-flight
-        completion of an exchange started before the revocation.
-        """
+    async def revoke_tokens(self, *, account_id: str, user_id: str | None = None) -> dict[str, int]:
+        """Revoke OAuth grants for one account, or for one user within it."""
 
         def _revoke() -> dict[str, int]:
             assert self._conn is not None
+            predicate = "account_id = ?" + (" AND user_id = ?" if user_id is not None else "")
+            pending_predicate = "verified_account_id = ?" + (
+                " AND verified_user_id = ?" if user_id is not None else ""
+            )
+            params = (account_id, user_id) if user_id is not None else (account_id,)
             access = self._conn.execute(
-                "UPDATE oauth_access_tokens SET revoked = 1 "
-                "WHERE account_id = ? AND user_id = ? AND revoked = 0",
-                (account_id, user_id),
+                f"UPDATE oauth_access_tokens SET revoked = 1 WHERE {predicate} AND revoked = 0",
+                params,
             ).rowcount
             refresh = self._conn.execute(
-                "UPDATE oauth_refresh_tokens SET consumed = 1 "
-                "WHERE account_id = ? AND user_id = ? AND consumed = 0",
-                (account_id, user_id),
+                f"UPDATE oauth_refresh_tokens SET consumed = 1 WHERE {predicate} AND consumed = 0",
+                params,
             ).rowcount
             codes = self._conn.execute(
-                "UPDATE oauth_codes SET used = 1 WHERE account_id = ? AND user_id = ? AND used = 0",
-                (account_id, user_id),
+                f"UPDATE oauth_codes SET used = 1 WHERE {predicate} AND used = 0",
+                params,
+            ).rowcount
+            pending = self._conn.execute(
+                f"DELETE FROM oauth_pending_authorizations WHERE {pending_predicate}",
+                params,
             ).rowcount
             return {
                 "access_tokens_revoked": access,
                 "refresh_tokens_revoked": refresh,
                 "codes_revoked": codes,
+                "pending_authorizations_revoked": pending,
             }
 
         async with self._lock:
             return await asyncio.to_thread(_revoke)
 
-    # ---- Pending authorizations (carry OAuth params across the OTP page) ----
+    # ---- Pending authorizations (carry OAuth params across the consent / authorize page) ----
 
     async def create_pending_authorization(
         self,
@@ -844,12 +790,3 @@ class OAuthStore:
             return await asyncio.to_thread(_gc)
 
     # ---- Test helpers (no-op in production paths) ----
-
-    async def _all_codes_for_test(self) -> Iterable[dict[str, Any]]:
-        def _q() -> list[dict[str, Any]]:
-            assert self._conn is not None
-            cur = self._conn.execute("SELECT * FROM oauth_codes")
-            return [_row_to_dict(cur, r) for r in cur.fetchall()]
-
-        async with self._lock:
-            return await asyncio.to_thread(_q)

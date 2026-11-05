@@ -18,9 +18,8 @@ const DEFAULT_TELEMETRY_PATHS = new Set([
   '/api/v1/search/search',
   '/api/v1/resources',
 ])
+const ADMIN_CONTROL_PLANE_PREFIXES = ['/api/v1/admin'] as const
 const SESSION_COMMIT_PATH = /^\/api\/v1\/sessions\/[^/]+\/commit$/
-const WEB_STUDIO_AGENT_ID = 'web-studio'
-
 function isBrowser(): boolean {
   return typeof window !== 'undefined'
 }
@@ -40,7 +39,7 @@ function normalizeBaseUrl(baseUrl?: string): string {
 }
 
 function readSessionStorage(key: string): string {
-  if (!isBrowser()) {
+  if (!key || !isBrowser()) {
     return ''
   }
 
@@ -52,7 +51,7 @@ function readSessionStorage(key: string): string {
 }
 
 function writeSessionStorage(key: string, value: string): void {
-  if (!isBrowser()) {
+  if (!key || !isBrowser()) {
     return
   }
 
@@ -119,6 +118,13 @@ function shouldInjectTelemetry(
   )
 }
 
+function shouldUseAdminApiKey(config: InternalAxiosRequestConfig): boolean {
+  const pathname = resolvePathname(config.url)
+  return ADMIN_CONTROL_PLANE_PREFIXES.some((prefix) =>
+    pathname.startsWith(prefix),
+  )
+}
+
 function maybeInjectTelemetry(
   config: InternalAxiosRequestConfig,
   defaultTelemetry: boolean,
@@ -147,17 +153,18 @@ function isEnvelopeError(value: unknown): value is OvErrorEnvelope & {
 export function createOvClient(options: OvClientOptions = {}): OvClientAdapter {
   const bindSdkClient = options.bindSdkClient ?? false
   let runtimeOptions = {
-    apiKeyStorageKey: options.apiKeyStorageKey || DEFAULT_API_KEY_STORAGE_KEY,
+    apiKeyStorageKey: options.apiKeyStorageKey ?? DEFAULT_API_KEY_STORAGE_KEY,
     baseUrl: normalizeBaseUrl(options.baseUrl),
     defaultTelemetry: options.defaultTelemetry ?? true,
   }
 
   let connection: OvConnectionState = {
+    adminApiKey: options.connection?.adminApiKey ?? '',
     apiKey:
       options.connection?.apiKey ??
       readSessionStorage(runtimeOptions.apiKeyStorageKey),
     accountId: options.connection?.accountId ?? '',
-    agentId: options.connection?.agentId ?? WEB_STUDIO_AGENT_ID,
+    identityHeaders: options.connection?.identityHeaders ?? false,
     userId: options.connection?.userId ?? '',
   }
 
@@ -177,10 +184,23 @@ export function createOvClient(options: OvClientOptions = {}): OvClientAdapter {
       headers.set(key, value)
     }
 
-    setOptionalHeader(headers, 'X-API-Key', connection.apiKey)
-    setOptionalHeader(headers, 'X-OpenViking-Account', connection.accountId)
-    setOptionalHeader(headers, 'X-OpenViking-User', connection.userId)
-    headers.set('X-OpenViking-Agent', connection.agentId || WEB_STUDIO_AGENT_ID)
+    if (!readHeader(headers, 'X-API-Key')?.trim()) {
+      const apiKey = shouldUseAdminApiKey(config)
+        ? connection.adminApiKey || connection.apiKey
+        : connection.apiKey || connection.adminApiKey
+      setOptionalHeader(headers, 'X-API-Key', apiKey)
+    }
+    if (connection.identityHeaders) {
+      if (!readHeader(headers, 'X-OpenViking-Account')?.trim()) {
+        setOptionalHeader(headers, 'X-OpenViking-Account', connection.accountId)
+      }
+      if (!readHeader(headers, 'X-OpenViking-User')?.trim()) {
+        setOptionalHeader(headers, 'X-OpenViking-User', connection.userId)
+      }
+    } else {
+      headers.delete('X-OpenViking-Account')
+      headers.delete('X-OpenViking-User')
+    }
 
     config.headers = headers
     maybeInjectTelemetry(config, runtimeOptions.defaultTelemetry)
@@ -251,9 +271,10 @@ export function createOvClient(options: OvClientOptions = {}): OvClientAdapter {
 
   function clearConnection(): OvConnectionState {
     connection = {
+      adminApiKey: '',
       apiKey: '',
       accountId: '',
-      agentId: WEB_STUDIO_AGENT_ID,
+      identityHeaders: false,
       userId: '',
     }
     persistApiKey()
@@ -302,6 +323,7 @@ export function createOvClient(options: OvClientOptions = {}): OvClientAdapter {
 }
 
 export const ovClient = createOvClient({
+  apiKeyStorageKey: '',
   baseUrl: ENV_BASE_URL,
   bindSdkClient: true,
 })

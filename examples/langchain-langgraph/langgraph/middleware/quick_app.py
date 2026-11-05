@@ -7,11 +7,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
 
-from openviking.integrations.langchain import (
+from langchain_openviking import (
     InMemoryOpenVikingClient,
     OpenVikingContextMiddleware,
 )
-from openviking.integrations.langchain.client import extract_message_text
+from langchain_openviking.client import extract_message_text
 
 
 class AgentState(TypedDict, total=False):
@@ -21,7 +21,7 @@ class AgentState(TypedDict, total=False):
 def build_app(client: InMemoryOpenVikingClient | None = None):
     client = client or InMemoryOpenVikingClient(
         {
-            "viking://user/memories/profile.md": (
+            "viking://~/memories/profile.md": (
                 "OpenViking middleware examples should answer with azure."
             )
         }
@@ -29,7 +29,7 @@ def build_app(client: InMemoryOpenVikingClient | None = None):
     session_id = "langgraph-middleware-demo"
     middleware = OpenVikingContextMiddleware(
         client=client,
-        target_uri="viking://user/memories",
+        target_uri="viking://~/memories",
         session_id_resolver=lambda _state, _runtime: session_id,
         include_active_messages=True,
     )

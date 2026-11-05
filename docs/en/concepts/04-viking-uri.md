@@ -9,61 +9,87 @@ viking://{scope}/{path}
 ```
 
 - **scheme**: Always `viking`
-- **scope**: Top-level namespace (`resources`, `user`, `agent`, `session`; `temp` and `queue` are internal)
+- **scope**: Top-level namespace (`resources`, `user`, `agent`; `temp`, `queue`, and `upload` are internal)
 - **path**: Resource path within the scope
 
 ## Scopes
 
 | Scope | Description | Lifecycle | Visibility |
 |-------|-------------|-----------|------------|
-| **resources** | Independent resources | Long-term | Global |
-| **user** | User-level data | Long-term | Global |
-| **agent** | Agent-level data | Long-term | Global |
-| **session** | Session-level data | Session lifetime | Current session |
+| **resources** | Independent resources / objective knowledge | Long-term | Account global |
+| **user** | User-level data, including sessions | Long-term / session lifetime | Current user |
+| **agent** | Account-shared skills and Agent configuration; endpoint, tool, and payment directories are planned | Long-term | Account global |
 | **queue** | Processing queue | Temporary | Internal |
 | **temp** | Temporary files | During parsing | Internal |
+| **upload** | Temporary upload files | Temporary | Internal |
 
-Public API and CLI filesystem/content operations accept only the public scopes:
-`resources`, `user`, `agent`, and `session` (plus the root URI `viking://`).
-`temp` and `queue` are internal implementation scopes and cannot be addressed
-directly through public API URI parameters.
+Public API and CLI filesystem/content operations accept the public scopes
+`resources`, `user`, and `agent`, plus the root URI `viking://`. `session` is retained
+as a backward-compatible alias for user session paths; new session data lives
+under `viking://user/{user_id}/sessions`.
+`temp`, `queue`, and `upload` are internal implementation
+scopes and cannot be addressed directly through public API URI parameters.
+
+### Home Alias `~`
+
+`~` is a server-side alias for the caller's own user root. `viking://~` expands to
+`viking://user/{user_id}`, and `viking://~/memories/note.md` to
+`viking://user/{user_id}/memories/note.md`, where `{user_id}` comes from the request's
+authenticated identity — the same string therefore points at a different directory for
+each caller.
+
+- Universal: accepted by every control plane (REST API, `ov` CLI, SDKs, MCP), anywhere a
+  public-scope URI is accepted.
+- First segment only: `viking://resources/~/x` and `viking://user/alice/~/x` keep `~` as
+  a literal path segment.
+- `~` is a user-path alias, not a separate storage scope.
+- Responses always echo the expanded canonical URI, never `viking://~`, and persisted
+  data (vector records, watch keys) stays canonical as well.
+- Requires an authenticated request identity. Expansion uses that identity's effective
+  `user_id` for every request role, including root. Places that demand an already-canonical
+  URI (internal storage paths and background tasks without a request context) reject the
+  alias instead of guessing a user.
+- Replaces the removed uid-less shorthand: `viking://user/<segment>/...` for `memories`,
+  `resources`, `skills`, `peers`, `privacy`, and `sessions` is rejected at USER/ADMIN
+  request boundaries with an error that names the `viking://~/...` replacement.
 
 ## Initial Directory Structure
 
-Moving away from traditional flat database thinking, all context is organized as a filesystem. Agents no longer just find data through vector search, but can locate and browse data through deterministic paths and standard filesystem commands. Each context or directory is assigned a unique URI identifier string in the format viking://{scope}/{path}, allowing the system to precisely locate and access resources stored in different locations.
+Context is organized into directories. With a known URI, an agent can list a directory or read a file directly. Otherwise, it can search first and read the returned paths.
 
 ```
 viking://
-├── session/{session_id}/
-│   ├── .abstract.md          # L0: One-line session summary
-│   ├── .overview.md          # L1: Session overview
-│   ├── .meta.json            # Session metadata
-│   ├── messages.json         # Structured message storage
-│   ├── checkpoints/          # Version snapshots
-│   ├── summaries/            # Compression summary history
-│   └── .relations.json       # Relations table
-│
 ├── user/
-│   ├── .abstract.md          # L0: Content summary
-│   ├── .overview.md          # User profile
-│   └── memories/             # User memory storage
-│       ├── .overview.md      # Memory overview
-│       ├── preferences/      # User preferences
-│       ├── entities/         # Entity memories
-│       └── events/           # Event records
+│   └── {user_id}/
+│       ├── memories/         # User memory storage
+│       │   └── profile.md        # User profile
+│       ├── resources/        # User-owned private resources
+│       ├── skills/           # User skills
+│       ├── peers/
+│       │   └── {peer_id}/
+│       │       ├── memories/  # Memory about a specific interaction peer
+│       │       └── resources/ # Resources scoped to that peer
+│       └── sessions/         # User session storage
+│           └── {session_id}/
+│               ├── .abstract.md
+│               ├── .overview.md
+│               ├── .meta.json
+│               ├── messages.jsonl
+│               ├── tools/
+│               └── history/
 │
-├── agent/
-│   ├── .abstract.md          # L0: Content summary
-│   ├── .overview.md          # Agent overview
-│   ├── memories/             # Agent learning memories
-│   │   ├── .overview.md
-│   │   ├── cases/            # Cases
-│   │   └── patterns/         # Patterns
-│   ├── instructions/         # Agent instructions
-│   └── skills/               # Skills directory
+├── agent/                     # Agent capabilities and configuration (global)
+│   ├── skills/                # Skill definitions
+│   ├── endpoints/             # Communication endpoints (a2a, anp, etc.) (planned)
+│   ├── tools/                 # Tool configuration (mcp, etc.) (planned)
+│   └── payments/              # Payment configuration (ap2, etc.) (planned)
 │
 └── resources/{project}/      # Resource workspace
 ```
+
+## File IDs
+
+In addition to its URI, every file is automatically assigned a stable `id` that serves as the primary key of its vector record in VikingDB. The id is deterministically computed as `md5(f"{account_id}:{uri}")` for level 2 (regular file) records, and is returned by `stat()` and other metadata APIs. This allows callers to cross-reference vector index entries without a separate lookup. The id is scoped to the account and changes if the file is moved to a different URI (vector records are re-keyed during URI migration). Directories do not expose a single `id` because a directory may span multiple semantic levels (L0 abstract, L1 overview), each with its own record.
 
 ## URI Examples
 
@@ -79,39 +105,74 @@ viking://resources/my-project/docs/api.md     # Specific file
 ### User Data
 
 ```
-viking://user/                                # User root
-viking://user/memories/                       # All user memories
-viking://user/memories/preferences/           # User preferences
-viking://user/memories/preferences/coding     # Specific preference
-viking://user/memories/entities/              # Entity memories
-viking://user/memories/events/                # Event memories
+viking://user/                                # Container of all user spaces (a user key lists only its own)
+viking://~/                                   # Your own user root (expands to viking://user/{user_id}/)
+viking://~/memories/                          # All your memories
+viking://~/memories/preferences/              # Your preferences
+viking://~/memories/preferences/coding        # Specific preference
+viking://~/memories/entities/                 # Entity memories
+viking://~/memories/events/                   # Event memories
+viking://~/resources/                         # Your private resources
+viking://~/resources/docs/                    # Your private resource directory
+viking://user/{user_id}/memories/             # Explicit user path (own user_id only, ADMIN included; ROOT can read across user spaces, but ROOT API keys cannot use data APIs in api_key mode)
 ```
 
-### Agent Data
+`viking://resources/...` is the shared scope for the current account and supports per-directory or per-file [ACLs](./15-acl.md). `viking://user/{user}/resources/...` is private; move a resource into the shared scope to share it.
+
+### User Skills and Peer Content
 
 ```
-viking://agent/                               # Agent root
-viking://agent/skills/                        # All skills
-viking://agent/skills/search-web              # Specific skill
-viking://agent/memories/                      # Agent memories
-viking://agent/memories/cases/                # Learned cases
-viking://agent/memories/patterns/             # Learned patterns
-viking://agent/instructions/                  # Agent instructions
+viking://~/skills/                            # Your skills
+viking://~/skills/search-web                  # Specific skill
+viking://~/memories/                          # Your memories
+viking://~/memories/cases/                    # Task cases used for training and evaluation
+viking://~/memories/trajectories/             # Reusable task-execution trajectories
+viking://~/memories/experiences/              # Experience distilled from execution outcomes
+viking://user/{user_id}/peers/{peer_id}/memories/
+viking://user/{user_id}/peers/{peer_id}/resources/
 ```
 
-The short `viking://user/...` and `viking://agent/...` forms above are
-relative to the current request identity. OpenViking expands them internally to
-explicit namespace paths such as `viking://user/{user_id}/...` and
-`viking://agent/{agent_id}/...` before storage and retrieval.
+### Agent Capabilities and Configuration
+
+```
+viking://agent/skills/search-web                    # A specific skill definition
+viking://agent/skills/                              # All skill definitions
+viking://agent/endpoints/                           # Communication endpoints (a2a, anp, etc.) (planned)
+viking://agent/tools/mcp/                           # MCP tool configuration (planned)
+viking://agent/payments/ap2/                        # Payment configuration (planned)
+```
+
+`viking://agent/...` is an account-shared directory for capabilities and configuration,
+including skills, endpoints, tools, payments, and other subdirectories. Directory names
+do not identify agents, and `actor_peer_id` does not filter this scope. Sharing is limited
+to the current account. Peer data belongs under `viking://user/<user_id>/peers/<peer_id>/...`.
+
+The home alias `viking://~/...` is relative to the current request identity. OpenViking
+expands it internally to the explicit namespace path `viking://user/{user_id}/...` before
+storage and retrieval, and responses echo the expanded form.
+
+The older uid-less spelling — `viking://user/memories/...` and the same shape for
+`resources`, `skills`, `peers`, `privacy`, and `sessions` — is no longer accepted at the
+request boundary. Such requests fail with an error that points at the `viking://~/...`
+replacement. `viking://user` itself is the container of user spaces, not a shortcut to
+your own root: listing it with a user key shows only your own space.
+
+Identity path segments such as `{user_id}` and `{peer_id}` must be safe single
+segments, for example `alice` or `web-visitor-alice`.
 
 ### Session Data
 
 ```
-viking://session/{session_id}/                # Session root
-viking://session/{session_id}/messages/       # Session messages
-viking://session/{session_id}/tools/          # Tool executions
-viking://session/{session_id}/history/        # Archived history
+viking://user/{user_id}/sessions/{session_id}/          # Session root
+viking://user/{user_id}/sessions/{session_id}/messages.jsonl  # Session messages
+viking://user/{user_id}/sessions/{session_id}/tools     # Tool executions
+viking://user/{user_id}/sessions/{session_id}/history   # Archived history
+viking://~/sessions/{session_id}/                       # Your own session, via the home alias
 ```
+
+`viking://session/{session_id}` is accepted as a backward-compatible alias for
+the current user's session path. It is not a separate storage root for new
+session data.
 
 ## Path Variables
 
@@ -123,7 +184,7 @@ Viking URI supports path variables for dynamic path generation. This is especial
 {namespace:key}
 ```
 
-- **namespace**: Variable provider namespace (e.g., `calendar`, `env`, `user`)
+- **namespace**: Variable provider namespace (`calendar` is built in)
 - **key**: Variable name within the namespace
 
 ### Calendar Variables
@@ -141,12 +202,12 @@ The `calendar` namespace provides date-related variables:
 | `{calendar:ym}` | Year/month | `2026/05` |
 | `{calendar:quarter}` | Quarter (Q1-Q4) | `Q2` |
 | `{calendar:yq}` | Year/quarter | `2026/Q2` |
-| `{calendar:week}` | ISO week number with leading zero | `18` |
-| `{calendar:yw}` | Year/ISO week | `2026/w18` |
+| `{calendar:week}` | ISO week number with leading zero | `19` |
+| `{calendar:yw}` | Year/ISO week | `2026/w19` |
 
 ### Usage Examples
 
-```python
+```text
 # Organize emails by date
 viking://resources/emails/{calendar:today}/inbox
 # Renders to: viking://resources/emails/2026/05/07/inbox
@@ -176,13 +237,13 @@ Path variables are resolved **server-side** at the time of API execution. The CL
 
 ```bash
 # Add today's emails, --parent-auto-create can be shortened to -p
-ov add-resource --parent-auto-create "viking://resources/emails/{calendar:today}/inbox" ./emails/*.eml
+ov add-resource --parent-auto-create "viking://resources/emails/{calendar:today}/inbox" ./emails/
 
 # Read yesterday's log
 ov read "viking://resources/logs/{calendar:yesterday}/app.log"
 
 # Prep tomorrow's tasks
-ov write --uri "viking://resources/tasks/{calendar:tomorrow}/todo.md" --content "Plan the day"
+ov write "viking://resources/tasks/{calendar:tomorrow}/todo.md" --content "Plan the day"
 
 # Upload monthly report, --parent-auto-create can be shortened to -p
 ov add-resource --parent-auto-create "viking://resources/reports/{calendar:ym}" ./report.pdf
@@ -192,47 +253,44 @@ ov add-resource --parent-auto-create "viking://resources/reports/{calendar:ym}" 
 
 ```
 viking://
-├── resources/       # Independent resources
+├── resources/       # Account-shared reference material
 │   └── {project}/
 │       ├── .abstract.md
 │       ├── .overview.md
 │       └── {files...}
 │
 ├── user/{user_id}/
-│   ├── profile.md                # User basic info
-│   └── memories/
-│       ├── preferences/          # By topic
-│       ├── entities/             # Each independent
-│       └── events/               # Each independent
-│
-├── agent/{agent_id}/             # Agent root when isolate_agent_scope_by_user = false
-│   ├── skills/                   # Skill definitions
 │   ├── memories/
-│   │   ├── cases/
-│   │   └── patterns/
-│   ├── workspaces/
-│   └── instructions/
-│
-├── agent/{agent_id}/user/{user_id}/   # Agent root when isolate_agent_scope_by_user = true
+│   │   ├── profile.md        # User profile
+│   │   ├── preferences/          # By topic
+│   │   ├── entities/             # Each independent
+│   │   └── events/               # Each independent
+│   ├── resources/
+│   │   └── {project}/
 │   ├── skills/
-│   ├── memories/
-│   ├── workspaces/
-│   └── instructions/
+│   └── peers/{peer_id}/
+│       ├── memories/
+│       └── resources/
 │
-└── session/{user_space}/{session_id}/
-    ├── messages/
+├── agent/                        # Agent capabilities and configuration (account global)
+│   ├── skills/                   # Skill definitions
+│   ├── endpoints/                # Communication endpoints (a2a, anp, etc.) (planned)
+│   ├── tools/                    # Tool configuration (mcp, etc.) (planned)
+│   └── payments/                 # Payment configuration (ap2, etc.) (planned)
+│
+└── user/{user_id}/sessions/{session_id}/
+    ├── messages.jsonl
     ├── tools/
     └── history/
 ```
 
-Agent namespace shape is controlled by per-account namespace policy:
-
-- `isolate_agent_scope_by_user = false`: `viking://agent/{agent_id}/...`
-- `isolate_agent_scope_by_user = true`: `viking://agent/{agent_id}/user/{user_id}/...`
-
-`memory.agent_scope_mode` is deprecated and ignored.
+`viking://agent/...` is an account-shared directory without an Agent ID identity layer.
+`actor_peer_id` filters only the current user's `peers` collection. Shared directories
+remain isolated by account.
 
 ## URI Operations
+
+The `VikingURI` helper below comes from the `openviking_cli` package installed with the server, not the standalone Python SDK public interface.
 
 ### Parsing
 
@@ -258,25 +316,39 @@ parent = VikingURI(uri).parent.uri  # viking://resources/docs
 
 ## API Usage
 
+The Python examples below use a configured `SyncHTTPClient` instance named `client`; see [Client Configuration](../configuration/02-client.md).
+
 ### Targeting Specific Scopes
 
 ```python
 # Search only in resources
 results = client.find(
-    "authentication",
-    target_uri="viking://resources/"
+    query="authentication",
+    target_uri="viking://resources/",
 )
 
-# Search only in user memories
+# Search only in your own resources
 results = client.find(
-    "coding preferences",
-    target_uri="viking://user/memories/"
+    query="private project notes",
+    target_uri="viking://~/resources/"
 )
 
-# Search only in skills
+# Search only in your own memories
 results = client.find(
-    "web search",
-    target_uri="viking://agent/skills/"
+    query="coding preferences",
+    target_uri="viking://~/memories/"
+)
+
+# Search only in your own skills
+results = client.find(
+    query="web search",
+    target_uri="viking://~/skills/"
+)
+
+# Search only in global agent skills
+results = client.find(
+    query="web search",
+    target_uri="viking://agent/skills/",
 )
 ```
 
@@ -284,16 +356,16 @@ results = client.find(
 
 ```python
 # List directory
-entries = await client.ls("viking://resources/")
+entries = client.ls(uri="viking://resources/")
 
 # Read file
-content = await client.read("viking://resources/docs/api.md")
+content = client.read(uri="viking://resources/docs/api.md")
 
 # Get abstract
-abstract = await client.abstract("viking://resources/docs/")
+abstract = client.abstract(uri="viking://resources/docs/")
 
 # Get overview
-overview = await client.overview("viking://resources/docs/")
+overview = client.overview(uri="viking://resources/docs/")
 ```
 
 ## Special Files
@@ -302,9 +374,8 @@ Each directory may contain special files:
 
 | File | Purpose |
 |------|---------|
-| `.abstract.md` | L0 abstract (~100 tokens) |
-| `.overview.md` | L1 overview (~2k tokens) |
-| `.relations.json` | Related resources |
+| `.abstract.md` | L0 directory abstract (default body limit: 256 characters) |
+| `.overview.md` | L1 directory overview (default body limit: 4,000 characters) |
 | `.meta.json` | Metadata |
 
 ## Best Practices
@@ -322,12 +393,25 @@ Each directory may contain special files:
 ### Scope-Specific Operations
 
 ```python
-# Add resources only to resources scope
-await client.add_resource(url, to="viking://resources/project/")
+# Add resources to the shared account resource scope
+client.add_resource(url, to="viking://resources/project/")
 
-# Skills go to agent scope
-await client.add_skill(skill)  # Automatically to viking://agent/skills/
+# Add private resources to your own resource root
+client.add_resource(path, parent="viking://~/resources/project/")
+
+# Skills are added to your own skills root by default
+client.add_skill(skill)  # default root: viking://~/skills/
 ```
+
+Install into the account-shared skills directory with the CLI. This requires write access to that path:
+
+```bash
+ov skills add ./skills/search-web -p viking://agent/skills/
+```
+
+### Resources Scope Constraint
+
+Store reference documents, code, and specifications under `resources`. To make content discoverable and loadable as a Skill, install it through the skill API under `viking://~/skills/` or the shared `viking://agent/skills/`. Uploading `SKILL.md` as an ordinary resource does not install a skill.
 
 ## Related Documents
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { extractNewTurnMessages } from "../../text-utils.js";
-import { convertToAgentMessages, mergeConsecutiveAssistants } from "../../context-engine.js";
+import { convertToAgentMessages, mergeConsecutiveAssistants } from "../../services/context-message-adapter.js";
 
 describe("extractNewTurnMessages: toolCallId propagation", () => {
   it("propagates toolCallId from toolResult to extracted tool part", () => {
@@ -56,7 +56,7 @@ describe("extractNewTurnMessages: toolCallId propagation", () => {
     }
   });
 
-  it("maps toolResult to role=user", () => {
+  it("maps toolResult to role=assistant", () => {
     const messages = [
       {
         role: "toolResult",
@@ -67,7 +67,7 @@ describe("extractNewTurnMessages: toolCallId propagation", () => {
     ];
 
     const { messages: extracted } = extractNewTurnMessages(messages, 0);
-    expect(extracted[0]!.role).toBe("user");
+    expect(extracted[0]!.role).toBe("assistant");
   });
 });
 

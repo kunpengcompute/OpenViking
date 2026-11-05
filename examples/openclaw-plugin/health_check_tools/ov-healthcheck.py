@@ -17,7 +17,7 @@ from typing import Any
 
 DEFAULT_GATEWAY_URL = "http://127.0.0.1:19789"
 DEFAULT_OPENVIKING_URL = "http://127.0.0.1:1933"
-DEFAULT_AGENT_ID = "default"
+DEFAULT_ACTOR_PEER = "main"
 DEFAULT_SESSION_SCAN_LIMIT = 0
 META_FILE_SUFFIXES = (".abstract.md", ".overview.md")
 
@@ -197,7 +197,9 @@ def parse_args() -> argparse.Namespace:
         help="OpenViking API key. Auto-discovered from plugin config when possible.",
     )
     parser.add_argument(
-        "--agent-id", default="", help=f"OpenViking agent id (default: {DEFAULT_AGENT_ID})"
+        "--actor-peer",
+        default="",
+        help=f"OpenViking actor peer for direct inspection requests (default: {DEFAULT_ACTOR_PEER})",
     )
     parser.add_argument("--user-id", default="", help="User id for the real conversation session.")
     parser.add_argument(
@@ -624,8 +626,9 @@ def wait_for_commit_visibility(
     session_id: str,
     timeout_seconds: float = 60.0,
     verbose: bool = False,
+    require_overview: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Poll until commit_count > 0, archive overview exists, AND memories are extracted."""
+    """Wait for extraction; an overview is required only when this commit enabled WM."""
     deadline = time.time() + timeout_seconds
     latest_detail: dict[str, Any] | None = None
     latest_context: dict[str, Any] | None = None
@@ -654,7 +657,7 @@ def wait_for_commit_visibility(
             print(f"  waiting: {status} ({remaining:.0f}s remaining)")
             last_status = status
 
-        if commit_ok and overview_ok and memory_ok:
+        if commit_ok and (overview_ok or not require_overview) and memory_ok:
             return detail, context
         time.sleep(5.0)
     return latest_detail, latest_context
@@ -662,19 +665,19 @@ def wait_for_commit_visibility(
 
 class OpenVikingInspector:
     def __init__(
-        self, base_url: str, api_key: str, agent_id: str, *, insecure: bool = False
+        self, base_url: str, api_key: str, actor_peer: str, *, insecure: bool = False
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.agent_id = agent_id or DEFAULT_AGENT_ID
+        self.actor_peer = actor_peer or DEFAULT_ACTOR_PEER
         self.insecure = insecure
 
     def headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
-        if self.agent_id:
-            headers["X-OpenViking-Agent"] = self.agent_id
+        if self.actor_peer:
+            headers["X-OpenViking-Actor-Peer"] = self.actor_peer
         return headers
 
     def health(self) -> bool:
@@ -850,7 +853,7 @@ class OpenVikingInspector:
             self.base_url,
             "/api/v1/search/find",
             method="POST",
-            body={"query": query, "target_uri": "viking://user/memories", "limit": limit},
+            body={"query": query, "target_uri": "viking://~/memories", "limit": limit},
             headers=self.headers(),
             timeout=20.0,
             insecure=self.insecure,
@@ -1136,7 +1139,9 @@ def main() -> int:
         )
         or str(os.environ.get("OPENVIKING_API_KEY", "")).strip()
     )
-    agent_id = args.agent_id or str(plugin_config.get("agent_prefix", "")).strip() or DEFAULT_AGENT_ID
+    actor_peer = (
+        args.actor_peer or str(plugin_config.get("peer_prefix", "")).strip() or DEFAULT_ACTOR_PEER
+    )
     user_id = args.user_id or f"ov-healthcheck-{uuid.uuid4().hex[:8]}"
     probe = f"probe-{uuid.uuid4().hex[:8]}"
     run_facts = build_run_facts(probe)
@@ -1206,7 +1211,7 @@ def main() -> int:
         recorder.add("WARN", "Gateway token not found", "continuing without Authorization header")
 
     inspector = OpenVikingInspector(
-        openviking_url, openviking_api_key, agent_id, insecure=args.insecure
+        openviking_url, openviking_api_key, actor_peer, insecure=args.insecure
     )
     try:
         sessions_before_probe = collect_session_ids(inspector.list_sessions())
@@ -1346,6 +1351,9 @@ def main() -> int:
                 session_id,
                 timeout_seconds=args.commit_wait,
                 verbose=args.verbose,
+                require_overview=bool(
+                    commit_result and commit_result.get("effective_enable_working_memory") is True
+                ),
             )
         except Exception as exc:
             latest_session_detail = None
@@ -1373,8 +1381,14 @@ def main() -> int:
             overview = latest_context.get("latest_archive_overview")
             if isinstance(overview, str) and overview.strip():
                 recorder.add("PASS", "Context endpoint returned latest_archive_overview")
+            elif commit_result and commit_result.get("effective_enable_working_memory") is True:
+                recorder.add(
+                    "FAIL", "Context endpoint has no required archive overview after waiting"
+                )
             else:
-                recorder.add("FAIL", "Context endpoint has no archive overview after waiting")
+                recorder.add(
+                    "INFO", "Working Memory is disabled or not requested; no overview required"
+                )
         else:
             recorder.add("FAIL", "Context endpoint could not be read after commit")
 

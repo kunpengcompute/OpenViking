@@ -13,6 +13,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::error::{Error, Result};
 
+const GATEWAY_MARKER_HEADER: &str = "X-VikingBot-Gateway";
+const GATEWAY_TOKEN_HEADER: &str = "X-Gateway-Token";
+
 fn parse_ignore_dirs(ignore_dirs: Option<&str>) -> Vec<String> {
     ignore_dirs
         .map(|s| {
@@ -52,13 +55,27 @@ fn ignore_dirs_filter<'a>(
     }
 }
 
-pub fn api_error_from_envelope(json: &Value, status: StatusCode) -> String {
+fn normalize_zip_entry_name(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn zip_entry_name(relative_path: &Path) -> Result<String> {
+    let name = relative_path.to_str().ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "Non-UTF-8 path: {}",
+            relative_path.to_string_lossy()
+        ))
+    })?;
+    Ok(normalize_zip_entry_name(name))
+}
+
+pub fn api_error_from_envelope(json: &Value, status: StatusCode) -> Error {
     let error_code = json
         .get("error")
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_str());
-    let error_msg = json
-        .get("error")
+    let error = json.get("error");
+    let error_msg = error
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .map(|s| s.to_string())
@@ -67,11 +84,34 @@ pub fn api_error_from_envelope(json: &Value, status: StatusCode) -> String {
                 .and_then(|d| d.as_str())
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| format!("HTTP error {}", status));
+        .unwrap_or_else(|| {
+            if json.is_null() {
+                format!("HTTP error {}", status)
+            } else {
+                json.to_string()
+            }
+        });
+    let details = error.and_then(|e| e.get("details")).cloned();
 
-    match error_code {
-        Some(code) => format!("[{}] {}", code, error_msg),
-        None => error_msg,
+    Error::api_response(
+        error_code.map(str::to_string),
+        error_msg,
+        details,
+        status.as_u16(),
+    )
+}
+
+pub(crate) fn api_error_from_body(body: &[u8], status: StatusCode) -> Error {
+    match serde_json::from_slice(body) {
+        Ok(json) => api_error_from_envelope(&json, status),
+        Err(_) => Error::api_with_status(
+            format!(
+                "HTTP error {}\n\nRaw response body:\n{}",
+                status,
+                String::from_utf8_lossy(body)
+            ),
+            status.as_u16(),
+        ),
     }
 }
 
@@ -84,19 +124,31 @@ pub fn unwrap_success_envelope(json: Value, preserve_profile: bool) -> Value {
         return result.clone();
     }
 
-    let Some(profile) = json.get("profile") else {
+    let profile = json.get("profile").filter(|profile| !profile.is_null());
+    let has_more = json.get("has_more").filter(|has_more| !has_more.is_null());
+    if profile.is_none() && has_more.is_none() {
         return result.clone();
-    };
+    }
 
     if let Some(result_obj) = result.as_object() {
         let mut merged = result_obj.clone();
-        merged.insert("profile".to_string(), profile.clone());
+        if let Some(profile) = profile {
+            merged.insert("profile".to_string(), profile.clone());
+        }
+        if let Some(has_more) = has_more {
+            merged.insert("has_more".to_string(), has_more.clone());
+        }
         return Value::Object(merged);
     }
 
     let mut wrapped = serde_json::Map::new();
     wrapped.insert("result".to_string(), result.clone());
-    wrapped.insert("profile".to_string(), profile.clone());
+    if let Some(profile) = profile {
+        wrapped.insert("profile".to_string(), profile.clone());
+    }
+    if let Some(has_more) = has_more {
+        wrapped.insert("has_more".to_string(), has_more.clone());
+    }
     Value::Object(wrapped)
 }
 
@@ -145,37 +197,23 @@ pub struct BaseClient {
     pub(crate) api_key: Option<String>,
     pub(crate) account: Option<String>,
     pub(crate) user: Option<String>,
-    pub(crate) agent_id: Option<String>,
+    pub(crate) actor_peer_id: Option<String>,
     pub(crate) profile_enabled: bool,
     pub(crate) extra_headers: Option<std::collections::HashMap<String, String>>,
+    gateway_token: Option<String>,
+    auth_mode: Option<String>,
+    ldap_username: Option<String>,
+    ldap_password: Option<String>,
+    oidc_token: Option<String>,
 }
 
 impl BaseClient {
-    /// Create a new BaseClient with minimal configuration for health probing
-    pub fn new_simple(base_url: impl Into<String>, timeout_secs: f64) -> Self {
-        let http = ReqwestClient::builder()
-            .timeout(std::time::Duration::from_secs_f64(timeout_secs))
-            .build()
-            .expect("Failed to build HTTP client");
-
-        Self {
-            http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_key: None,
-            account: None,
-            user: None,
-            agent_id: None,
-            profile_enabled: false,
-            extra_headers: None,
-        }
-    }
-
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
-        agent_id: Option<String>,
         account: Option<String>,
         user: Option<String>,
+        actor_peer_id: Option<String>,
         timeout_secs: f64,
         profile_enabled: bool,
         extra_headers: Option<std::collections::HashMap<String, String>>,
@@ -191,10 +229,44 @@ impl BaseClient {
             api_key,
             account,
             user,
-            agent_id,
+            actor_peer_id,
             profile_enabled,
             extra_headers,
+            gateway_token: None,
+            auth_mode: None,
+            ldap_username: None,
+            ldap_password: None,
+            oidc_token: None,
         }
+    }
+
+    pub fn with_auth_mode(mut self, auth_mode: Option<String>) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
+
+    pub fn with_ldap_username(mut self, username: Option<String>) -> Self {
+        self.ldap_username = username;
+        self
+    }
+
+    pub fn with_ldap_password(mut self, password: Option<String>) -> Self {
+        self.ldap_password = password;
+        self
+    }
+
+    pub fn with_oidc_token(mut self, token: Option<String>) -> Self {
+        self.oidc_token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        self
+    }
+
+    pub fn with_gateway_token(mut self, gateway_token: Option<String>) -> Self {
+        self.gateway_token = gateway_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        self
     }
 
     fn append_profile_query<'a>(&self, params: &'a [(String, String)]) -> Vec<(String, String)> {
@@ -205,16 +277,12 @@ impl BaseClient {
         merged
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     pub fn user_id(&self) -> Option<&str> {
         self.user.as_deref()
     }
 
-    pub fn agent_id(&self) -> Option<&str> {
-        self.agent_id.as_deref()
+    pub fn actor_peer_id(&self) -> Option<&str> {
+        self.actor_peer_id.as_deref()
     }
 
     pub fn api_key(&self) -> Option<&str> {
@@ -232,11 +300,6 @@ impl BaseClient {
                 headers.insert("X-API-Key", value);
             }
         }
-        if let Some(agent_id) = &self.agent_id {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(agent_id) {
-                headers.insert("X-OpenViking-Agent", value);
-            }
-        }
         if let Some(account) = &self.account {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(account) {
                 headers.insert("X-OpenViking-Account", value);
@@ -247,6 +310,58 @@ impl BaseClient {
                 headers.insert("X-OpenViking-User", value);
             }
         }
+        if let Some(actor_peer_id) = &self.actor_peer_id {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(actor_peer_id) {
+                headers.insert("X-OpenViking-Actor-Peer", value);
+            }
+        }
+
+        // LDAP Basic Auth support
+        if let (Some(auth_mode), Some(username), Some(password)) =
+            (&self.auth_mode, &self.ldap_username, &self.ldap_password)
+        {
+            if auth_mode == "ldap" {
+                let credentials = format!("{}:{}", username, password);
+                use base64::engine::Engine;
+                use base64::engine::general_purpose;
+                let encoded = general_purpose::STANDARD.encode(credentials);
+                if let Ok(value) =
+                    reqwest::header::HeaderValue::from_str(&format!("Basic {}", encoded))
+                {
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+            }
+        }
+
+        // OIDC Bearer Token support
+        if let (Some(auth_mode), Some(token)) = (&self.auth_mode, &self.oidc_token) {
+            if auth_mode == "oidc" {
+                if let Ok(value) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                {
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+            }
+        }
+
+        // Also support OIDC token when api_key looks like a JWT (for backwards compatibility)
+        if self
+            .api_key
+            .as_ref()
+            .map_or(false, |k| k.contains('.') && k.matches('.').count() >= 2)
+        {
+            if let Some(token) = &self.api_key {
+                if let Ok(value) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                {
+                    // Only insert if not already set by explicit OIDC
+                    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+                        headers.insert(reqwest::header::AUTHORIZATION, value);
+                    }
+                }
+            }
+        }
+
         if let Some(extra_headers) = &self.extra_headers {
             for (key, value) in extra_headers {
                 if let Ok(header_name) = reqwest::header::HeaderName::from_str(key) {
@@ -259,13 +374,70 @@ impl BaseClient {
         headers
     }
 
+    fn is_gateway_token_challenge(response: &reqwest::Response) -> bool {
+        response.status() == StatusCode::UNAUTHORIZED
+            && response
+                .headers()
+                .get(GATEWAY_MARKER_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    }
+
+    pub(crate) async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        error_context: &str,
+    ) -> Result<reqwest::Response> {
+        let retry = request.try_clone();
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest(error_context, e))?;
+        if !Self::is_gateway_token_challenge(&response) {
+            return Ok(response);
+        }
+
+        let Some(gateway_token) = self.gateway_token.as_deref() else {
+            return Ok(response);
+        };
+        let Some(retry) = retry else {
+            return Ok(response);
+        };
+        retry
+            .header(GATEWAY_TOKEN_HEADER, gateway_token)
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest(error_context, e))
+    }
+
+    async fn headers_for_uncloneable_request(&self) -> Result<reqwest::header::HeaderMap> {
+        let mut headers = self.build_headers();
+        let Some(gateway_token) = self.gateway_token.as_deref() else {
+            return Ok(headers);
+        };
+        let health_url = format!("{}/health", self.base_url);
+        let response = self
+            .http
+            .get(health_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest("Gateway detection request failed", e))?;
+        if Self::is_gateway_token_challenge(&response) {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(gateway_token) {
+                headers.insert(GATEWAY_TOKEN_HEADER, value);
+            }
+        }
+        Ok(headers)
+    }
+
     pub(crate) async fn handle_response<T: DeserializeOwned + 'static>(
         &self,
         response: reqwest::Response,
     ) -> Result<T> {
         let status = response.status();
 
-        if status == StatusCode::NO_CONTENT || status == StatusCode::ACCEPTED {
+        if status == StatusCode::NO_CONTENT {
             return serde_json::from_value(Value::Null)
                 .map_err(|e| Error::Parse(format!("Failed to parse empty response: {}", e)));
         }
@@ -273,34 +445,26 @@ impl BaseClient {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| Error::Network(format!("Failed to read response body: {}", e)))?;
+            .map_err(|e| Error::from_reqwest("Failed to read response body", e))?;
+
+        if !status.is_success() {
+            return Err(api_error_from_body(&bytes, status));
+        }
 
         let json: Value = match serde_json::from_slice(&bytes) {
             Ok(json) => json,
             Err(e) => {
                 let body_str = String::from_utf8_lossy(&bytes);
-                return Err(Error::Network(format!(
+                return Err(Error::Parse(format!(
                     "Failed to parse JSON response: {}\n\nRaw response body:\n{}",
                     e, body_str
                 )));
             }
         };
 
-        if !status.is_success() {
-            return Err(Error::Api(api_error_from_envelope(&json, status)));
-        }
-
         if let Some(error) = json.get("error") {
             if !error.is_null() {
-                let code = error
-                    .get("code")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("UNKNOWN");
-                let message = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                return Err(Error::Api(format!("[{}] {}", code, message)));
+                return Err(api_error_from_envelope(&json, status));
             }
         }
 
@@ -315,13 +479,6 @@ impl BaseClient {
         })
     }
 
-    pub(crate) fn create_client_with_timeout(&self, timeout: std::time::Duration) -> Result<ReqwestClient> {
-        ReqwestClient::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| Error::Network(format!("Failed to build HTTP client: {}", e)))
-    }
-
     pub(crate) fn create_client_with_connect_timeout(
         &self,
         connect_timeout: std::time::Duration,
@@ -331,7 +488,7 @@ impl BaseClient {
             .connect_timeout(connect_timeout)
             .timeout(timeout)
             .build()
-            .map_err(|e| Error::Network(format!("Failed to build HTTP client: {}", e)))
+            .map_err(|e| Error::from_reqwest("Failed to build HTTP client", e))
     }
 
     pub async fn get<T: DeserializeOwned + 'static>(
@@ -341,14 +498,12 @@ impl BaseClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let params = self.append_profile_query(params);
-        let response = self
+        let request = self
             .http
             .get(&url)
             .headers(self.build_headers())
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .query(&params);
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -369,10 +524,7 @@ impl BaseClient {
         } else {
             request
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -384,21 +536,19 @@ impl BaseClient {
         timeout: std::time::Duration,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        let client = self.create_client_with_timeout(timeout)?;
 
-        let request = client
+        let request = self
+            .http
             .post(&url)
             .headers(self.build_headers())
+            .timeout(timeout)
             .json(body);
         let request = if self.profile_enabled {
             request.query(&[("profile", "1")])
         } else {
             request
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -409,20 +559,13 @@ impl BaseClient {
         body: &B,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        let request = self
-            .http
-            .put(&url)
-            .headers(self.build_headers())
-            .json(body);
+        let request = self.http.put(&url).headers(self.build_headers()).json(body);
         let request = if self.profile_enabled {
             request.query(&[("profile", "1")])
         } else {
             request
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -434,14 +577,12 @@ impl BaseClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let params = self.append_profile_query(params);
-        let response = self
+        let request = self
             .http
             .delete(&url)
             .headers(self.build_headers())
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .query(&params);
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -462,10 +603,7 @@ impl BaseClient {
         } else {
             request
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -478,15 +616,13 @@ impl BaseClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let params = self.append_profile_query(params);
-        let response = self
+        let request = self
             .http
             .patch(&url)
             .headers(self.build_headers())
             .query(&params)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .json(body);
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -499,15 +635,13 @@ impl BaseClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let params = self.append_profile_query(params);
-        let response = self
+        let request = self
             .http
             .post(&url)
             .headers(self.build_headers())
             .query(&params)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("HTTP request failed: {}", e)))?;
+            .json(body);
+        let response = self.send_request(request, "HTTP request failed").await?;
 
         self.handle_response(response).await
     }
@@ -517,6 +651,9 @@ impl BaseClient {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     #[test]
     fn unwrap_success_envelope_preserves_profile_for_value_results() {
@@ -544,6 +681,141 @@ mod tests {
                     "line two"
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn unwrap_success_envelope_preserves_listing_metadata_for_value_results() {
+        let body = json!({
+            "status": "ok",
+            "result": [{"name": "a.md"}],
+            "has_more": true
+        });
+
+        let result = unwrap_success_envelope(body, true);
+
+        assert_eq!(
+            result,
+            json!({
+                "result": [{"name": "a.md"}],
+                "has_more": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_not_reported_as_network_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _connection = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = BaseClient::new(
+            format!("http://{address}"),
+            None,
+            None,
+            None,
+            None,
+            0.02,
+            false,
+            None,
+        );
+        let error = client
+            .get::<Value>("/slow", &[])
+            .await
+            .expect_err("slow response should time out");
+
+        assert!(matches!(error, Error::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn post_with_timeout_overrides_client_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _connection = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = BaseClient::new(
+            format!("http://{address}"),
+            None,
+            None,
+            None,
+            None,
+            5.0,
+            false,
+            None,
+        );
+        let started = std::time::Instant::now();
+        let error = client
+            .post_with_timeout::<_, Value>("/slow", &json!({}), Duration::from_millis(20))
+            .await
+            .expect_err("slow response should time out");
+
+        assert!(matches!(error, Error::Timeout(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "request-level timeout should fire before the 5s client timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_text_http_error_preserves_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            connection
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 20\r\n\r\nupstream unavailable",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = BaseClient::new(
+            format!("http://{address}"),
+            None,
+            None,
+            None,
+            None,
+            1.0,
+            false,
+            None,
+        );
+        let error = client.get::<Value>("/", &[]).await.unwrap_err();
+
+        assert_eq!(error.code(), "UNAVAILABLE");
+        assert!(matches!(
+            error,
+            Error::Api {
+                status: Some(503),
+                message,
+                ..
+            } if message.contains("upstream unavailable")
+        ));
+    }
+
+    #[test]
+    fn unwrap_success_envelope_drops_null_profile_for_value_results() {
+        let body = json!({
+            "status": "ok",
+            "result": [
+                {"id": "1"}
+            ],
+            "profile": null
+        });
+
+        let result = unwrap_success_envelope(body, true);
+
+        assert_eq!(
+            result,
+            json!([
+                {"id": "1"}
+            ])
         );
     }
 
@@ -598,7 +870,8 @@ mod tests {
             None,
         );
 
-        let params = client.append_profile_query(&[("to_uri".to_string(), "viking://x".to_string())]);
+        let params =
+            client.append_profile_query(&[("to_uri".to_string(), "viking://x".to_string())]);
 
         assert_eq!(
             params,
@@ -626,6 +899,22 @@ mod tests {
 
         assert_eq!(params, vec![("profile".to_string(), "1".to_string())]);
     }
+
+    #[test]
+    fn zip_entry_name_normalizes_windows_separators() {
+        let entry = zip_entry_name(Path::new("scripts\\check_bounding_boxes.py"))
+            .expect("path should be utf-8");
+
+        assert_eq!(entry, "scripts/check_bounding_boxes.py");
+    }
+
+    #[test]
+    fn zip_entry_name_preserves_posix_separators() {
+        let entry = zip_entry_name(Path::new("scripts/check_bounding_boxes.py"))
+            .expect("path should be utf-8");
+
+        assert_eq!(entry, "scripts/check_bounding_boxes.py");
+    }
 }
 
 // ============ FileUploader ============
@@ -649,9 +938,13 @@ impl<'a> FileUploader<'a> {
         self
     }
 
-    pub fn zip_directory(&self, dir_path: &Path, ignore_dirs: Option<&str>) -> Result<NamedTempFile> {
+    pub fn zip_directory(
+        &self,
+        dir_path: &Path,
+        ignore_dirs: Option<&str>,
+    ) -> Result<NamedTempFile> {
         if !dir_path.is_dir() {
-            return Err(Error::Network(format!(
+            return Err(Error::InvalidPath(format!(
                 "Path {} is not a directory",
                 dir_path.display()
             )));
@@ -673,9 +966,7 @@ impl<'a> FileUploader<'a> {
             let path = entry.path();
             if path.is_file() {
                 let name = path.strip_prefix(dir_path).unwrap_or(path);
-                let name_str = name.to_str().ok_or_else(|| {
-                    Error::InvalidPath(format!("Non-UTF-8 path: {}", name.to_string_lossy()))
-                })?;
+                let name_str = zip_entry_name(name)?;
                 zip.start_file(name_str, options)?;
                 let mut file = File::open(path)?;
                 std::io::copy(&mut file, &mut zip)?;
@@ -693,7 +984,7 @@ impl<'a> FileUploader<'a> {
         ignore_dirs: Option<&str>,
     ) -> Result<NamedTempFile> {
         if !dir_path.is_dir() {
-            return Err(Error::Network(format!(
+            return Err(Error::InvalidPath(format!(
                 "Path {} is not a directory",
                 dir_path.display()
             )));
@@ -748,9 +1039,7 @@ impl<'a> FileUploader<'a> {
             let path = entry.path();
             if path.is_file() {
                 let name = path.strip_prefix(dir_path).unwrap_or(path);
-                let name_str = name.to_str().ok_or_else(|| {
-                    Error::InvalidPath(format!("Non-UTF-8 path: {}", name.to_string_lossy()))
-                })?;
+                let name_str = zip_entry_name(name)?;
                 if verbose {
                     eprintln!("  Adding: {}", name_str);
                 }
@@ -778,7 +1067,10 @@ impl<'a> FileUploader<'a> {
 
         if let Some(pb) = pb {
             if total_size > 0 {
-                pb.finish_with_message(format!("Compression complete: {:.2} MiB → {:.2} MiB", original_size_mb, zip_size_mb));
+                pb.finish_with_message(format!(
+                    "Compression complete: {:.2} MiB → {:.2} MiB",
+                    original_size_mb, zip_size_mb
+                ));
             } else {
                 pb.finish_with_message(format!("Compression complete: {:.2} MiB", zip_size_mb));
             }
@@ -800,14 +1092,14 @@ impl<'a> FileUploader<'a> {
 
         let part = part
             .mime_str("application/octet-stream")
-            .map_err(|e| Error::Network(format!("Failed to set mime type: {}", e)))?;
+            .map_err(|e| Error::from_reqwest("Failed to set mime type", e))?;
 
         let mut form = reqwest::multipart::Form::new().part("file", part);
         if let Some(upload_mode) = &self.upload_mode {
             form = form.text("upload_mode", upload_mode.clone());
         }
 
-        let mut headers = self.client.build_headers();
+        let mut headers = self.client.headers_for_uncloneable_request().await?;
         headers.remove(reqwest::header::CONTENT_TYPE);
 
         let upload_timeout = TimeoutConfig::for_upload().calculate(file_path)?;
@@ -822,7 +1114,7 @@ impl<'a> FileUploader<'a> {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| Error::Network(format!("File upload failed: {}", e)))?;
+            .map_err(|e| Error::from_reqwest("File upload failed", e))?;
 
         let result: Value = self.client.handle_response(response).await?;
         result
@@ -849,26 +1141,33 @@ impl<'a> FileUploader<'a> {
         let file_size = file_content.len() as u64;
 
         if verbose {
-            eprintln!("Uploading: {} ({:.2} MB)", file_name, file_size as f64 / 1024.0 / 1024.0);
+            eprintln!(
+                "Uploading: {} ({:.2} MB)",
+                file_name,
+                file_size as f64 / 1024.0 / 1024.0
+            );
         }
 
         let pb = ProgressBar::new_spinner();
-        pb.set_message(format!("Uploading {} ({:.2} MB)...", file_name, file_size as f64 / 1024.0 / 1024.0));
+        pb.set_message(format!(
+            "Uploading {} ({:.2} MB)...",
+            file_name,
+            file_size as f64 / 1024.0 / 1024.0
+        ));
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-        let part = reqwest::multipart::Part::bytes(file_content)
-            .file_name(file_name.to_string());
+        let part = reqwest::multipart::Part::bytes(file_content).file_name(file_name.to_string());
 
         let part = part
             .mime_str("application/octet-stream")
-            .map_err(|e| Error::Network(format!("Failed to set mime type: {}", e)))?;
+            .map_err(|e| Error::from_reqwest("Failed to set mime type", e))?;
 
         let mut form = reqwest::multipart::Form::new().part("file", part);
         if let Some(upload_mode) = &self.upload_mode {
             form = form.text("upload_mode", upload_mode.clone());
         }
 
-        let mut headers = self.client.build_headers();
+        let mut headers = self.client.headers_for_uncloneable_request().await?;
         headers.remove(reqwest::header::CONTENT_TYPE);
 
         let upload_timeout = TimeoutConfig::for_upload().calculate(file_path)?;
@@ -883,7 +1182,7 @@ impl<'a> FileUploader<'a> {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| Error::Network(format!("File upload failed: {}", e)))?;
+            .map_err(|e| Error::from_reqwest("File upload failed", e))?;
 
         pb.finish_with_message("Upload complete");
 

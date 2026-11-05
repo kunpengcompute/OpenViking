@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from openviking.storage.transaction import init_lock_manager, reset_lock_manager
 from openviking.storage.viking_fs import init_viking_fs
 from openviking_cli.utils.config import OPENVIKING_CONFIG_ENV
 from openviking_cli.utils.config.agfs_config import AGFSConfig
@@ -54,18 +53,14 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 async def viking_fs_binding_s3_instance():
     """Initialize VikingFS with binding mode for S3 backend."""
-    from openviking.utils.agfs_utils import create_agfs_client
+    from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
 
     # Create AGFS client
-    agfs_client = create_agfs_client(AGFS_CONF)
+    agfs_client = create_agfs_client(RagfsBindingConfig(agfs=AGFS_CONF))
 
-    # Initialize LockManager and VikingFS with client
-    init_lock_manager(agfs=agfs_client)
     vfs = init_viking_fs(agfs=agfs_client)
 
     yield vfs
-
-    reset_lock_manager()
 
 
 @pytest.mark.asyncio

@@ -1,19 +1,16 @@
 import { useEffect, useRef } from 'react'
-import type { ComponentType, CSSProperties, ReactNode } from 'react'
-import { Coins, Database, Search, Users } from 'lucide-react'
+import type { ComponentType, ReactNode } from 'react'
+import { Coins, Database, Search } from 'lucide-react'
 
 import { Skeleton } from '#/components/ui/skeleton'
 
-import { HOME_ACCENT_COLORS } from '../-constants/dashboard'
 import type {
-  AgentOverview,
   ContextCounts,
   HomeT,
   RetrievalCounts,
   TokenCounts,
 } from '../-types/dashboard'
-import { asNumber, formatNumber, formatTimestamp } from '../-lib/format'
-import { normalizeAgents } from '../-lib/normalize'
+import { asNumber, formatNumber } from '../-lib/format'
 import { DetailRow, Panel } from './panel'
 
 function parseDisplayNumber(value: string): number | null {
@@ -38,7 +35,7 @@ function MetricPanel({
 }: {
   children?: ReactNode
   description: string
-  icon: ComponentType<{ className?: string; style?: CSSProperties }>
+  icon: ComponentType<{ className?: string }>
   isError?: boolean
   isLoading?: boolean
   title: string
@@ -97,19 +94,13 @@ function MetricPanel({
       <div>
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold tracking-normal text-[oklch(0.42_0.04_232)] dark:text-[oklch(0.8_0.03_232)]">
+            <h2 className="truncate text-sm font-semibold tracking-normal text-muted-foreground">
               {title}
             </h2>
             <p className="sr-only">{description}</p>
           </div>
-          <span
-            className="flex size-7 shrink-0 items-center justify-center rounded-full"
-            style={{ backgroundColor: HOME_ACCENT_COLORS.iconSoft }}
-          >
-            <Icon
-              className="size-3.5"
-              style={{ color: HOME_ACCENT_COLORS.icon }}
-            />
+          <span className="flex size-7 shrink-0 items-center justify-center text-muted-foreground">
+            <Icon className="size-4" />
           </span>
         </div>
 
@@ -124,8 +115,8 @@ function MetricPanel({
         )}
       </div>
 
-      {children ? (
-        <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(140px,1fr))] gap-2">
+      {children && !isLoading && !isError ? (
+        <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(140px,1fr))] gap-x-5 gap-y-1">
           {children}
         </div>
       ) : null}
@@ -136,12 +127,14 @@ function MetricPanel({
 export function ContextDataPanel({
   data,
   disabled,
+  disabledMessage,
   isError,
   isLoading,
   t,
 }: {
   data: ContextCounts | undefined
   disabled: boolean
+  disabledMessage: string
   isError: boolean
   isLoading: boolean
   t: HomeT
@@ -154,10 +147,12 @@ export function ContextDataPanel({
       isError={isError}
       isLoading={isLoading}
       title={t('contextData.title')}
-      value={isError ? t('requestFailed') : formatNumber(total)}
+      value={
+        isError ? t('requestFailed') : disabled ? '—' : formatNumber(total)
+      }
     >
       {disabled ? (
-        <p className="text-xs text-muted-foreground">{t('usageDisabled')}</p>
+        <p className="text-xs text-muted-foreground">{disabledMessage}</p>
       ) : (
         <>
           <DetailRow
@@ -181,12 +176,14 @@ export function ContextDataPanel({
 export function TodayTokensPanel({
   data,
   disabled,
+  disabledMessage,
   isError,
   isLoading,
   t,
 }: {
   data: TokenCounts | undefined
   disabled: boolean
+  disabledMessage: string
   isError: boolean
   isLoading: boolean
   t: HomeT
@@ -199,10 +196,12 @@ export function TodayTokensPanel({
       isError={isError}
       isLoading={isLoading}
       title={t('todayTokens.title')}
-      value={isError ? t('requestFailed') : formatNumber(total)}
+      value={
+        isError ? t('requestFailed') : disabled ? '—' : formatNumber(total)
+      }
     >
       {disabled ? (
-        <p className="text-xs text-muted-foreground">{t('usageDisabled')}</p>
+        <p className="text-xs text-muted-foreground">{disabledMessage}</p>
       ) : (
         <>
           <DetailRow
@@ -226,12 +225,14 @@ export function TodayTokensPanel({
 export function TodayRetrievalsPanel({
   data,
   disabled,
+  disabledMessage,
   isError,
   isLoading,
   t,
 }: {
   data: RetrievalCounts | undefined
   disabled: boolean
+  disabledMessage: string
   isError: boolean
   isLoading: boolean
   t: HomeT
@@ -244,10 +245,12 @@ export function TodayRetrievalsPanel({
       isError={isError}
       isLoading={isLoading}
       title={t('todayRetrievals.title')}
-      value={isError ? t('requestFailed') : formatNumber(total)}
+      value={
+        isError ? t('requestFailed') : disabled ? '—' : formatNumber(total)
+      }
     >
       {disabled ? (
-        <p className="text-xs text-muted-foreground">{t('usageDisabled')}</p>
+        <p className="text-xs text-muted-foreground">{disabledMessage}</p>
       ) : (
         <>
           <DetailRow
@@ -259,57 +262,6 @@ export function TodayRetrievalsPanel({
             value={formatNumber(data?.search)}
           />
         </>
-      )}
-    </MetricPanel>
-  )
-}
-
-export function AgentAccessPanel({
-  data,
-  disabled,
-  isError,
-  isLoading,
-  t,
-}: {
-  data: AgentOverview | undefined
-  disabled: boolean
-  isError: boolean
-  isLoading: boolean
-  t: HomeT
-}) {
-  const agents = normalizeAgents(data?.items)
-  const total = asNumber(data?.total)
-  return (
-    <MetricPanel
-      description={t('agentAccess.description')}
-      icon={Users}
-      isError={isError}
-      isLoading={isLoading}
-      title={t('agentAccess.title')}
-      value={isError ? t('requestFailed') : formatNumber(total)}
-    >
-      {disabled ? (
-        <p className="text-xs text-muted-foreground">{t('usageDisabled')}</p>
-      ) : agents.length === 0 ? (
-        <p className="text-xs text-muted-foreground">
-          {t('agentAccess.empty')}
-        </p>
-      ) : (
-        <div className="grid gap-2">
-          {agents.slice(0, 3).map((agent) => (
-            <div
-              key={agent.agent_id}
-              className="flex min-h-8 items-center justify-between gap-2 rounded-lg border border-[oklch(0.68_0.12_232/0.1)] bg-background/55 px-2.5 py-1.5 text-xs shadow-xs dark:border-white/10 dark:bg-white/[0.05]"
-            >
-              <span className="min-w-0 truncate font-medium">
-                {agent.agent_id}
-              </span>
-              <span className="shrink-0 tabular-nums text-muted-foreground">
-                {formatTimestamp(agent.last_seen_at || '')}
-              </span>
-            </div>
-          ))}
-        </div>
       )}
     </MetricPanel>
   )

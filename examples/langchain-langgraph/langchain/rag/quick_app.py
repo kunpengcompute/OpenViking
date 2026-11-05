@@ -7,13 +7,13 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
-from openviking.integrations.langchain import InMemoryOpenVikingClient, OpenVikingRetriever
+from langchain_openviking import InMemoryOpenVikingClient, OpenVikingRetriever
 
 
 def build_app(client: InMemoryOpenVikingClient | None = None):
     client = client or InMemoryOpenVikingClient(
         {
-            "viking://user/memories/preferences/deploy_color.md": (
+            "viking://~/memories/preferences/deploy_color.md": (
                 "The user prefers azure as the deployment color for LangChain examples."
             ),
             "viking://resources/runbooks/langchain.md": (
@@ -23,7 +23,7 @@ def build_app(client: InMemoryOpenVikingClient | None = None):
     )
     retriever = OpenVikingRetriever(
         client=client,
-        target_uri=["viking://user/memories", "viking://resources"],
+        target_uri=["viking://~/memories", "viking://resources"],
         limit=4,
         content_mode="auto",
     )

@@ -1,6 +1,12 @@
-# Configuration
+# Configure models and services
+
+Use this guide to choose models, combine configuration examples and understand configuration scope. For field lookups, see [server configuration](../configuration/01-server.md) or [client configuration](../configuration/02-client.md). For a first deployment, start with [deployment paths](00-overview.md).
 
 OpenViking uses a JSON configuration file (`~/.openviking/ov.conf`) for settings.
+
+Use this page when configuring the server. To connect to an existing server, follow [CLI Setup](../getting-started/05-cli-setup.md); clients do not need model or storage settings.
+
+For a first setup, use the wizard below. For an existing installation, find the relevant section and merge its fields into your JSON configuration; do not replace the whole file with a partial example. Editing `ov.conf` requires a restart. The limited runtime update surface is described below.
 
 For a first-time setup, the recommended flow is:
 
@@ -13,7 +19,7 @@ openviking-server doctor
 
 ## Configuration File
 
-Create `~/.openviking/ov.conf` in your project directory:
+Create `~/.openviking/ov.conf` in your home configuration directory:
 
 ```json
 {
@@ -47,6 +53,93 @@ Create `~/.openviking/ov.conf` in your project directory:
 
 For `provider: "openai-codex"`, `vlm.api_key` is optional when Codex OAuth is already available.
 
+## Configuration Scope and Update Lifecycle
+
+OpenViking configuration has two layers:
+
+- **Startup configuration** is read from `ov.conf`. It defines the process baseline and the runtime configuration source. Changing it requires a service restart; the runtime configuration API never rewrites `ov.conf`.
+- **Runtime settings** are stored independently at Cluster and Account scope by the configured runtime configuration source. They can be read and updated through the Admin API.
+
+Only fields explicitly declared as runtime fields are exposed by the runtime configuration API. The current update surface is:
+
+| Scope | Configuration | Lifecycle | Effective behavior |
+| --- | --- | --- | --- |
+| Cluster | `agent_evolution` | Dynamic | ROOT can update it through the Admin API; it is used as the cluster default. |
+| Account | `feishu`, `agent_evolution` | Dynamic | ROOT or the Account ADMIN can update them. Agent Evolution retains deprecated whole-section Cluster fallback for compatibility. Feishu defaulting is implemented by its business resolver: an unset Account section uses Cluster, while a configured section takes only `domain` from Cluster. |
+| Account | `github`, `acl` | Dynamic | ROOT or the Account ADMIN can update it. These sections have no Cluster fallback. |
+| Account | `vlm`, `query_planner` | Dynamic | ROOT-only. Each configured section requires `model` and a non-empty `credentials` array; `timeout` is optional. ADMIN callers cannot read or update these sections. |
+| Account | `embedding` | Mixed | ROOT-only. Credentials, retries, concurrency, failback and circuit-breaker settings are dynamic; model identity, vector-space fields, text source and input token limit are create-only. |
+| Account | `vectordb` | Create-only | ROOT-only. Supply it in Account creation `settings`; later additions, changes and resets are rejected. Only remote backends `http`, `volcengine` and `vikingdb` are supported for Account-owned connections. |
+
+Cluster `embedding`, `vlm`, `query_planner`, `memory`, `feishu`, storage, parser, retrieval, and other ordinary configuration sections remain startup-only. Account `memory` is not on the current Account configuration API surface.
+
+Account and Cluster configurations are independently stored and published.
+Any use of Cluster settings when Account settings are absent is a business
+default, not implicit configuration inheritance. The VLM resolver implements
+that policy: without an Account VLM section it uses Cluster VLM; with an Account
+section, model-service identity comes from Account while selected runtime
+behavior is composed with Cluster. Account `timeout` overrides Cluster `timeout`
+when set; omitting or resetting it uses Cluster `timeout`. Query Planner selection
+is Account `query_planner`, Account `vlm`, Cluster `query_planner`, then Cluster `vlm`.
+
+The vector resolver validates effective Embedding and VectorDB settings together.
+Account `embedding: {}` is valid; without Account model modes, Cluster model
+bindings are used. Account credentials and explicit VectorDB connections supply
+their own connection and authentication fields. Remote collections, indexes and
+authorization must be provisioned externally. Changing embedding credentials does
+not migrate existing vectors; the caller must preserve model compatibility.
+
+Account-owned business code must resolve model configuration through
+`VLMResolver` and pass the resulting `VLMConfig` to lower-level helpers.
+`ClusterVLMResolver` is restricted to startup, diagnostics, and offline
+evaluation composition roots. A CI architecture test rejects new direct reads
+of Cluster VLM or Query Planner configuration from other production modules.
+
+For runtime changes, use the following endpoints:
+
+```http
+GET   /api/v1/admin/configuration
+PATCH /api/v1/admin/configuration
+
+GET   /api/v1/admin/accounts/{account_id}/configuration
+PATCH /api/v1/admin/accounts/{account_id}/configuration
+```
+
+The request body wraps a PATCH document in `settings`:
+
+```json
+{
+  "settings": {
+    "agent_evolution": {
+      "enabled": true
+    }
+  }
+}
+```
+
+PATCH uses three states: an omitted field is unchanged, a concrete value sets or replaces the value, and `null` removes that value from the addressed scope. Objects merge recursively and arrays replace as a whole. The response contains settings from that scope, not a business-effective Account/Cluster composition. Declarative `fallback` is deprecated, supports only complete sections, and remains solely for compatibility; new features must implement Cluster defaults in their business resolver. See [Admin API - Runtime Configuration](../api/08-admin.md#runtime-configuration) for details.
+
+## Account Embedding and VectorDB
+
+ROOT can configure `settings.embedding` and `settings.vectordb` when creating an
+Account. These sections use Account-specific allowlist schemas. Account and
+Cluster settings remain independent; the vector resolver applies Cluster defaults
+for omitted Account values. Provider connections can only be supplied through a
+complete `credentials` binding. Configuration reads return only Account values.
+
+VectorDB is immutable after Account creation. Existing Accounts may rotate complete
+Embedding credential/deployment bindings and update retry, concurrency, failback, and
+circuit-breaker settings. Outer model identity and other vector-space fields remain
+create-only. Compatible endpoint updates do not interrupt in-flight calls or rebuild
+historical vectors.
+
+Account-owned VectorDB configurations use remote backends only. Account
+configuration cannot select local/cuvs backends, local paths, cuVS tuning, or
+custom adapter parameters. Accounts with no VectorDB settings continue sharing
+the Cluster connection with Account data filtering. Remote resources must
+already exist.
+See [Admin configuration API](../api/08-admin.md#runtime-configuration) for permissions and PATCH rules.
+
 ## Configuration Examples
 
 <details>
@@ -61,14 +154,15 @@ For `provider: "openai-codex"`, `vlm.api_key` is optional when Codex OAuth is al
       "provider" : "volcengine",
       "dimension": 1024,
       "model"    : "doubao-embedding-vision-251215",
-      "input": "multimodal"
+      "input": "multimodal",
+      "batch_size": 32
     }
   },
   "vlm": {
     "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
     "api_key"  : "your-volcengine-api-key",
     "provider" : "volcengine",
-    "model"    : "doubao-seed-2-0-pro-260215"
+    "model"    : "doubao-seed-2-0-lite-260428"
   }
 }
 ```
@@ -118,11 +212,14 @@ Use `openviking-server init` to complete the Codex login/import step, then run `
   },
   "vlm": {
     "provider" : "openai-codex",
-    "model"    : "gpt-5.4",
-    "api_base" : "https://chatgpt.com/backend-api/codex"
+    "model"    : "gpt-5.6-terra",
+    "api_base" : "https://chatgpt.com/backend-api/codex",
+    "reasoning_effort": "xhigh"
   }
 }
 ```
+
+OpenAI [retired `gpt-5.4` from Codex with ChatGPT sign-in](https://learn.chatgpt.com/docs/models#deprecated-codex-models) on August 31, 2026. For an existing setup, change `vlm.model` in `ov.conf` to `gpt-5.6-terra` and restart the server; upgrading OpenViking does not rewrite saved model settings. This retirement does not affect `provider: "openai"` with an API key.
 
 </details>
 
@@ -210,9 +307,9 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `max_concurrent` | int | Maximum concurrent embedding requests (`embedding.max_concurrent`, default: `10`) |
+| `max_concurrent` | int | Maximum concurrent embedding requests (`embedding.max_concurrent`, default: `10`; must be `>= 1`) |
 | `max_retries` | int | Maximum retry attempts for transient embedding provider errors (`embedding.max_retries`, default: `3`; `0` disables retry) |
-| `text_source` | str | Text used for vectorizing text files. `content_only` reads raw content, `summary_first` uses summary when available and falls back to content, `summary_only` uses only summary. Default: `content_only` |
+| `text_source` | str | Text used for vectorizing text files. `content_only` reads raw content, `summary_first` uses summary when available and falls back to content, `summary_only` is a deprecated alias for `summary_first`; existing configurations still load, log a warning, and normalize to `summary_first`. Default: `content_only` |
 | `max_input_tokens` | int | Maximum estimated raw text tokens sent to the embedding model when content is used. Default: `4096` |
 | `provider` | str | `"openai"`, `"azure"`, `"volcengine"`, `"vikingdb"`, `"jina"`, `"ollama"`, `"gemini"`, `"voyage"`, `"dashscope"`, `"minimax"`, `"cohere"`, `"litellm"`, or `"local"` |
 | `api_key` | str | API key |
@@ -221,6 +318,7 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 | `input` | str | Input type: `"text"` or `"multimodal"` |
 | `batch_size` | int | Batch size for embedding requests |
 | `encoding_format` | str | (OpenAI / Azure only) Wire format for embedding values: `"float"` or `"base64"`. Leave unset to use the OpenAI Python SDK default. Set to `"float"` when the upstream gateway cannot deserialize base64 embedding payloads correctly. |
+| `extra_body` | object | (OpenAI / Azure only) Extra JSON body fields merged into every embeddings request. Useful for OpenAI-compatible gateways that accept vendor-specific fields, e.g. OpenRouter provider routing `{"provider": {"sort": "latency"}}`. Explicit `query_param`/`document_param` keys take precedence on conflict. |
 
 `embedding.max_retries` only applies to transient errors such as `429`, `5xx`, timeouts, and connection failures. Permanent errors such as `400`, `401`, `403`, and `AccountOverdue` are not retried automatically. The backoff strategy is exponential backoff with jitter, starting at `0.5s` and capped at `8s`.
 
@@ -253,7 +351,7 @@ When the embedding provider experiences consecutive transient failures (e.g. `42
 | `doubao-embedding-vision-251215` | 1024 | multimodal | Recommended |
 | `doubao-embedding-250615` | 1024 | text | Text only |
 
-With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), and mixed content.
+With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), and mixed content. Image-to-image search requires this mode; text-only embedding models continue to index image summaries but cannot accept image queries.
 
 **Supported providers:**
 - `openai`: OpenAI Embedding API
@@ -265,7 +363,7 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
 - `voyage`: Voyage AI Embedding API
 - `minimax`: MiniMax Embedding API
 - `cohere`: Cohere Embedding API
-- `gemini`: Google Gemini Embedding API (text-only; requires `google-genai>=1.0.0`)
+- `gemini`: Google Gemini Embedding API (text-only; requires `google-genai>=1.39.0`)
 - `dashscope`: DashScope (Alibaba Tongyi) Embedding API
 - `litellm`: LiteLLM Embedding API
 - `local`: Local GGUF embedding models
@@ -288,6 +386,29 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
 ```
 
 `encoding_format` is optional and is only forwarded for `provider: "openai"` and `provider: "azure"`. Leave it unset for the OpenAI Python SDK default. Set it to `"float"` when an OpenAI-compatible upstream gateway cannot deserialize base64 embedding payloads correctly.
+
+**OpenRouter example with provider routing:**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "openai",
+      "api_key": "your-openrouter-api-key",
+      "api_base": "https://openrouter.ai/api/v1",
+      "model": "qwen/qwen3-embedding-8b",
+      "dimension": 4096,
+      "extra_body": {
+        "provider": {
+          "sort": "latency"
+        }
+      }
+    }
+  }
+}
+```
+
+`extra_body` is merged into every embeddings request, so OpenAI-compatible gateways that accept vendor-specific fields (such as OpenRouter's provider routing preferences) can be tuned without code changes. It is only forwarded for `provider: "openai"` and `provider: "azure"`.
 
 **Azure OpenAI provider example with JSON float embeddings:**
 
@@ -383,21 +504,9 @@ Get your API key at https://jina.ai
 }
 ```
 
-Supported Voyage text embedding models include:
-- `voyage-4-lite`
-- `voyage-4`
-- `voyage-4-large`
-- `voyage-code-3`
-- `voyage-context-3`
-- `voyage-3`
-- `voyage-3.5`
-- `voyage-3.5-lite`
-- `voyage-finance-2`
-- `voyage-law-2`
+Text models include `voyage-4-lite`, `voyage-4`, and `voyage-4-large`. See [Voyage Text Embeddings](https://docs.voyageai.com/docs/embeddings) for available models and output dimensions.
 
-If `dimension` is omitted, OpenViking uses the model's default output dimension when creating the vector schema.
-
-OpenViking also expects dense float vectors throughout storage and retrieval, so Voyage quantized output dtypes are not exposed in config.
+If `dimension` is omitted, OpenViking uses its built-in model table (`voyage-3`, `voyage-3-large`, `voyage-3.5`, `voyage-3.5-lite`, `voyage-4`, `voyage-4-lite`, `voyage-4-large`, `voyage-code-3`, `voyage-context-3`, `voyage-finance-2`, `voyage-law-2`), falling back to 1024 for an unrecognized model. Set a supported output dimension explicitly for a new model. The current adapter sends plain text `input`; it does not send Voyage's `input_type`, expose quantized output, or implement specialized contextual embedding calls.
 
 **Local deployment (GGUF/MLX):** Jina embedding models are open-weight and available in GGUF and MLX formats on [Hugging Face](https://huggingface.co/jinaai). You can run them locally with any OpenAI-compatible server (e.g. llama.cpp, MLX, vLLM) and point the `api_base` to your local endpoint:
 
@@ -417,7 +526,9 @@ OpenViking also expects dense float vectors throughout storage and retrieval, so
 
 **gemini provider example:**
 
-> **Note:** Requires `pip install "google-genai>=1.0.0"`. For async batching: `pip install "openviking[gemini-async]"`.
+Version 1.39.0 is the minimum SDK version with the client context managers and close methods used to keep asynchronous embedding requests on their owning event loop. Upgrade older SDK pins before enabling this provider.
+
+> **Note:** Requires `google-genai>=1.39.0` in the server environment — uv install: `uv tool install openviking --upgrade --with "google-genai>=1.39.0"`; pip install: `pip install "google-genai>=1.39.0"`. For async batching use the extra instead: `uv tool install "openviking[gemini-async]" --upgrade` or `pip install "openviking[gemini-async]"`.
 
 ```json
 {
@@ -450,7 +561,8 @@ Get your API key at https://aistudio.google.com/apikey
       "provider": "dashscope",
       "api_key": "${DASHSCOPE_API_KEY}",
       "model": "text-embedding-v4",
-      "dimension": 1024
+      "dimension": 1024,
+      "input": "text"
     }
   }
 }
@@ -467,11 +579,11 @@ Get your API key at https://aistudio.google.com/apikey
 | `qwen3-vl-embedding` | 2560 | multimodal | Text + image + video |
 | `qwen2.5-vl-embedding` | 1024 | multimodal | Text + image + video |
 
-**Multimodal parameters** (text+image/video models only):
+**Input and multimodal parameters**:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `input_type` | str | `"multimodal"` or `"text"` | Embedding mode (default: `"multimodal"`) |
+| `input` | str | `"multimodal"` | Embedding mode: `"text"` or `"multimodal"` |
 | `enable_fusion` | bool | `false` | Enable fusion vectors for `tongyi-embedding-vision-*` models |
 | `res_level` | int | `2` | Image resolution level (1=high, 2=medium, 3=low) |
 | `max_video_frames` | int | `16` | Maximum video frames to embed |
@@ -483,7 +595,11 @@ Get your API key at https://aistudio.google.com/apikey
 | China | `https://dashscope.aliyuncs.com` (default) | Recommended for users in mainland China |
 | International | `https://dashscope-intl.aliyuncs.com` | For users outside China |
 
-Custom endpoint URLs are also supported by setting a full URL.
+For a custom gateway, set `api_base` to the gateway's base URL. OpenViking
+appends the mode-specific endpoint path automatically, so do not include
+`/compatible-mode/v1` (text mode) or
+`/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding`
+(multimodal mode) in `api_base`.
 
 Get your API key at https://dashscope.console.aliyun.com/api-key
 
@@ -506,9 +622,21 @@ Get your API key at https://dashscope.console.aliyun.com/api-key
 
 Supported task types: `RETRIEVAL_QUERY`, `RETRIEVAL_DOCUMENT`, `SEMANTIC_SIMILARITY`, `CLASSIFICATION`, `CLUSTERING`, `CODE_RETRIEVAL_QUERY`, `QUESTION_ANSWERING`, `FACT_VERIFICATION`.
 
+#### Local provider (`local`)
+
+When no `dense`, `sparse`, or `hybrid` embedding is configured (including when `embedding` is omitted), OpenViking selects `dense: {"provider": "local", "model": "bge-small-zh-v1.5-f16"}`. This GGUF model produces 512-dimensional vectors and requires no API key.
+
+Install the local inference dependency:
+
+```bash
+pip install "openviking[local-embed]"
+```
+
+On first use, OpenViking downloads the model to `~/.cache/openviking/models` unless the file is already cached. Set `embedding.dense.cache_dir` to change the cache directory, or `embedding.dense.model_path` to use an existing GGUF file without downloading it. A missing explicit `model_path` is an error; it does not trigger a download. This model's dimension is fixed at 512.
+
 #### Sparse Embedding
 
-> **Note:** Volcengine sparse embedding is supported starting from model `doubao-embedding-vision-251215`.
+> This example uses `doubao-embedding-vision-251215`. Check sparse text-output support for your selected model in the Ark [embedding documentation](https://docs.volcengine.com/docs/ark/vectorization?lang=zh&redirect=1).
 
 ```json
 {
@@ -522,6 +650,21 @@ Supported task types: `RETRIEVAL_QUERY`, `RETRIEVAL_DOCUMENT`, `SEMANTIC_SIMILAR
 }
 ```
 
+Sparse output is a provider capability, not an endpoint inferred from
+`storage.vectordb.sparse_weight`. OpenViking currently implements `sparse` and
+`hybrid` embedding providers for `volcengine` and `vikingdb`. The
+OpenAI-compatible, Ollama, and built-in `local` providers are dense-only; a
+self-hosted `/v1/embeddings` endpoint is therefore not treated as a sparse
+endpoint, and OpenViking does not probe a separate
+`/v1/embeddings/sparse` route.
+
+There is no automatic BM25 or other sparse-vector fallback when the configured
+embedder returns only dense vectors. To use hybrid retrieval, configure a
+supported sparse/hybrid provider and set `storage.vectordb.sparse_weight > 0`.
+Model memory requirements are provider/model-specific and are not controlled by
+OpenViking; size self-hosted models against their provider documentation before
+enabling them in production.
+
 #### Hybrid Embedding
 
 Two approaches are supported:
@@ -534,7 +677,7 @@ Two approaches are supported:
     "hybrid": {
       "provider": "volcengine",
       "api_key": "your-api-key",
-      "model": "doubao-embedding-hybrid",
+      "model": "doubao-embedding-vision-251215",
       "dimension": 1024
     }
   }
@@ -568,10 +711,18 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 ```json
 {
   "vlm": {
+    "provider": "volcengine",
     "api_key": "your-api-key",
-    "model": "doubao-seed-2-0-pro-260215",
+    "model": "doubao-seed-2-0-lite-260428",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
-    "max_retries": 3
+    "max_retries": 3,
+    "media": {
+      "enabled": true,
+      "max_concurrent": 2,
+      "file_processing_timeout": 1800,
+      "file_poll_interval": 3,
+      "video_fps": 1.0
+    }
   }
 }
 ```
@@ -585,13 +736,23 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 | `model` | str | Model name |
 | `api_base` | str | API endpoint (optional) |
 | `thinking` | bool | Enable thinking mode for VolcEngine models (default: `false`) |
-| `max_concurrent` | int | Maximum concurrent semantic LLM calls (default: `100`) |
+| `max_concurrent` | int | Maximum concurrent semantic LLM calls (default: `32`) |
 | `max_retries` | int | Maximum retry attempts for transient VLM provider errors (default: `3`; `0` disables retry) |
+| `credentials` | array | Ordered VLM credential/model list, with index 0 having the highest priority. Each item can override `provider`, `model`, `api_key`, `api_base`, `api_version`, `extra_headers`, `extra_request_body`, `reasoning_effort`, and `keepalive_expiry` |
+| `failback_timeout_seconds` | float | Time threshold for attempting a step back toward a higher-priority credential after failover (default: `600`) |
+| `failback_request_count` | int | Successful requests on a lower-priority credential before attempting a step back (default: `50`) |
 | `backup` | object | Optional backup VLM configuration (same shape as `vlm`) for automatic failover when the primary fails with retryable errors such as rate limits, `5xx` responses, or connection/timeout failures. Only one level of failover is supported &mdash; the backup itself cannot define a nested `backup` |
-| `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `60.0`) |
+| `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `600.0`) |
+| `keepalive_expiry` | float | Idle connection lifetime in seconds for OpenAI-compatible VLM clients. Set to `0` to disable idle connection reuse; unset uses the OpenAI SDK default. Must be `>= 0` |
 | `extra_headers` | object | Custom HTTP headers for compatible HTTP providers. `kimi` also accepts header overrides, but already injects the required subscription headers by default |
 | `extra_request_body` | object | Extra JSON body fields for OpenAI-compatible completion requests, useful for provider-specific options such as Ollama `{"think": false}` |
-| `stream` | bool | Enable streaming mode (for OpenAI-compatible providers, default: `false`) |
+| `reasoning_effort` | str | Reasoning effort for `openai`, `azure`, `kimi`, `glm`, and `openai-codex`; explicit values are forwarded, and accepted values depend on the model. When unset, GPT-5/o-series names retain `low`; other models omit the field. For Chat Completions, `extra_request_body.reasoning_effort` takes precedence |
+| `media` | object | Audio/video runtime controls. Media understanding reuses this VLM's provider, model, credentials, client, timeout, retry, headers, output-token limit, failover, and token accounting |
+| `media.enabled` | bool | Enable audio/video understanding (default: `false`) |
+| `media.max_concurrent` | int | Maximum concurrent audio/video calls (default: `2`) |
+| `media.file_processing_timeout` | float | Maximum provider-side preprocessing wait in seconds (default: `1800`) |
+| `media.file_poll_interval` | float | Provider-side preprocessing poll interval in seconds (default: `3`) |
+| `media.video_fps` | float | Video frame sampling rate when supported by the provider, from `0.2` through `5.0` (default: `1.0`) |
 
 `vlm.max_retries` only applies to transient errors such as `429`, `5xx`, timeouts, and connection failures. Permanent authentication, authorization, and billing errors are not retried automatically. The backoff strategy is exponential backoff with jitter, starting at `0.5s` and capped at `8s`.
 
@@ -599,15 +760,15 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 
 | Model | Notes |
 |-------|-------|
-| `doubao-seed-2-0-pro-260215` | Recommended for semantic extraction |
+| `doubao-seed-2-0-lite-260428` | Recommended for semantic extraction |
 | `doubao-pro-32k` | For longer context |
 
 When resources are added, VLM generates:
 
-1. **L0 (Abstract)**: ~100 token summary
-2. **L1 (Overview)**: ~2k token overview with navigation
+1. **L0 (Abstract)**: file or directory summary, with a default limit of 256 characters
+2. **L1 (Overview)**: directory overview with navigation, with a default limit of 4000 characters
 
-If VLM is not configured, L0/L1 will be generated from content directly (less semantic), and multimodal resources may have limited descriptions.
+When the VLM configuration reports `is_available() == false`, generic file summaries are empty and directory overviews fall back to a not-ready placeholder. Paths such as local code-skeleton extraction retain their own behavior. Do not treat this as completed semantic indexing; inspect the model configuration and processing task.
 
 **Supported providers:**
 - `volcengine`: Volcengine VLM API
@@ -638,21 +799,24 @@ For OpenAI-compatible providers (e.g., OpenRouter), you can add custom HTTP head
     "api_base": "https://openrouter.ai/api/v1",
     "extra_headers": {
       "HTTP-Referer": "https://your-site.com",
-      "X-Title": "Your App Name"
+      "X-OpenRouter-Title": "Your App Name"
     }
   }
 }
 ```
 
 Common use cases:
-- **OpenRouter**: Requires `HTTP-Referer` and `X-Title` to identify your application
+- **OpenRouter**: Optional `HTTP-Referer` and `X-OpenRouter-Title` headers provide [app attribution](https://openrouter.ai/docs/app-attribution), not API authentication; `X-Title` remains supported for compatibility
 - **Kimi Coding**: Override or extend the default subscription headers when you need a custom user agent
+- **OpenCode Go** (`https://opencode.ai/zen/go/v1`): Requests without `x-opencode-session` fail with HTTP 400 `MissingSessionID`. Set a fixed id, e.g. `"extra_headers": {"x-opencode-session": "openviking-<your-host>"}`. A fixed id works; OpenCode Go only uses it for routing and prompt-cache hints
 - **Custom proxies**: Add authentication or tracing headers
 - **API gateways**: Add version or routing identifiers
 
 **Custom Request Body**
 
-For OpenAI-compatible providers that accept provider-specific JSON body fields, add them via `extra_request_body`. OpenViking merges these fields into the `extra_body` sent by the OpenAI SDK or LiteLLM:
+Use `extra_request_body` for provider-specific JSON body fields. OpenAI-compatible routes use SDK `extra_body`. LiteLLM Anthropic routes pass native options such as `thinking` and `output_config` directly to LiteLLM, so they reach the top-level request body. LiteLLM still validates model support for these options. On Anthropic routes, LiteLLM control names (including `api_key`, `api_base`, `metadata`, and `mock_response`) and call-owned fields (`model`, `messages`, `tools`, `tool_choice`, `stream`, `timeout`, and headers) are rejected instead of overriding the call. Configure credentials and routing through their dedicated settings.
+
+For example, to disable thinking on Ollama:
 
 ```json
 {
@@ -668,23 +832,88 @@ For OpenAI-compatible providers that accept provider-specific JSON body fields, 
 }
 ```
 
-**Streaming Mode**
+**Audio/video understanding**
 
-For OpenAI-compatible providers that return SSE (Server-Sent Events) format responses, enable `stream` mode:
+Audio and video understanding is an optional capability of the configured VLM. It uses the same provider, model, credentials, client, request timeout, retries, headers, maximum output tokens, failover chain, and token accounting as other VLM calls. Enable it with the nested `vlm.media` controls; there is no separate media model configuration.
 
 ```json
 {
   "vlm": {
-    "provider": "openai",
-    "api_key": "your-api-key",
-    "model": "gpt-4o",
-    "api_base": "https://api.example.com/v1",
-    "stream": true
+    "provider": "volcengine",
+    "api_key": "${VOLCENGINE_API_KEY}",
+    "model": "${VOLCENGINE_MODEL}",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+    "timeout": 1200,
+    "max_retries": 3,
+    "max_tokens": 4096,
+    "media": {
+      "enabled": true,
+      "file_processing_timeout": 1800,
+      "file_poll_interval": 3,
+      "max_concurrent": 2,
+      "video_fps": 1.0
+    }
   }
 }
 ```
 
-> **Note**: The OpenAI SDK requires `stream=true` to properly parse SSE responses. When using providers that force SSE format, you must set this option to `true`.
+`vlm.extra_request_body` also applies to the Ark Responses request for audio/video, for example `{"service_tier": "flex", "thinking": {"type": "disabled"}}`. Use fields supported by the selected model and Responses API. Explicit extra body fields override generated request fields through the SDK, including `store`; response storage defaults to `false` unless you explicitly override it. These fields are not forwarded to file upload, status, or deletion requests.
+
+The VLM `model` value is the corresponding Ark model endpoint ID. `video_fps` applies only to video and controls the frame sampling rate sent to Ark.
+
+The recommended starting models for audio and video understanding are `doubao-seed-2-0-lite-260428` and `doubao-seed-2-0-mini-260428`. These are recommended examples, not an exhaustive compatibility list; Ark continues to update its models and input capabilities. See Ark's official [video input capability list](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1330310?lang=zh#ff5ef604) and [audio input capability list](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1330310?lang=zh#9619c0ba) for other supported models. If `model` is an `ep-*` inference endpoint ID, verify that its underlying foundation model supports the corresponding media input. OpenViking does not validate audio or video model capabilities while loading configuration.
+
+**Ingestible and understandable formats**
+
+| Type | Stored by the existing parser | Understood by Ark in this release |
+|------|-------------------------------|-----------------------------------|
+| Audio | MP3, WAV, OGG, FLAC, AAC, M4A, OPUS, AC3 | MP3, WAV, AAC, M4A |
+| Video | MP4, AVI, MOV, MKV, WEBM, FLV, WMV, TS | MP4, AVI, MOV |
+
+Formats outside the understanding column continue to follow the existing parser and storage behavior; OpenViking does not transcode them or send them to the understanding model. When such a file is recognized as an audio or video leaf, an empty media summary is indexed using its filename.
+
+For a supported file, OpenViking uploads the media to the Ark Files API without explicitly setting `expire_at`, so file retention follows Ark's default policy. After processing completes, OpenViking references the file's `file_id` from the Responses API with response storage disabled by default, then attempts to delete the Ark file under a short cleanup deadline. Remote deletion is best-effort and does not replace an otherwise successful result if cleanup fails; a file whose deletion fails or times out continues to follow Ark's default retention policy. Local temporary files are removed independently even when remote cleanup fails or is cancelled.
+
+- A successful summary for a directory containing exactly one audio or video file becomes that directory's L1 directly, with L0 derived through the existing semantic path. No second generic VLM summarization is performed.
+- Media in a mixed directory contributes its summary to the existing generic VLM aggregation.
+- Disabled media understanding, an unsupported understanding format, or a final model failure yields an empty media summary. Generic directory L0/L1 generation keeps its existing behavior, while a recognized audio or video leaf uses its filename for the DETAIL vector and BM25 content. Provider errors and media-understanding status text are not written to the media summary or leaf index.
+
+Media processing sends file content to the configured external provider. Disabled response storage and best-effort deletion reduce unintended retention but do not replace the provider's own privacy and retention controls; uploaded files do not receive an explicit expiration time, so their retention period is determined by Ark's default policy. Ark Files storage/processing and Responses model tokens can incur provider charges, so review your provider's privacy, retention, and billing terms before enabling this feature. See the official Volcengine Ark documentation for [audio understanding](https://docs.volcengine.com/docs/82379/2377589?lang=zh) and [video understanding](https://docs.volcengine.com/docs/82379/1895586?lang=zh).
+
+### query_planner
+
+Optional lightweight model for retrieval intent analysis and query planning. It uses the same configuration shape as `vlm` for `search()` intent analysis, query expansion, and optional server recall-digest rewriting. If `query_planner` is omitted or empty, OpenViking falls back to `vlm` for backward compatibility.
+
+> In `openviking-server init` you can optionally enable a local lightweight query planner; the wizard pulls the Ollama model and writes the `query_planner` config for you. For recognized query-planner models, `search()` selects the matching bundled prompt at runtime. Models not in the mapping keep using `retrieval.intent_analysis`.
+
+We recommend the local Ollama model [`guoxuter/ov_intent_analysis_sft:v7_q8`](https://ollama.com/guoxuter/ov_intent_analysis_sft:v7_q8). Fine-tuned from Qwen3.5-0.8B, it can be deployed locally and is well suited to letting a small model handle retrieval planning: for small talk, greetings, or turns where the context is already sufficient, it returns no queries to reduce unnecessary memory injection and token consumption; when retrieval is needed, it emits structured queries targeting `skill`, `resource`, and `memory`. The earlier [`v4_q8`](https://ollama.com/guoxuter/ov_intent_analysis_sft:v4_q8) revision is still supported as an alternative.
+
+Pull the model first and make sure the Ollama service is reachable:
+
+```bash
+ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
+```
+
+Then add the following to your OpenViking configuration:
+
+```json
+{
+  "query_planner": {
+    "provider": "litellm",
+    "model": "ollama/guoxuter/ov_intent_analysis_sft:v7_q8",
+    "api_base": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "timeout": 60,
+    "extra_request_body": {
+      "think": false
+    }
+  }
+}
+```
+
+For `ollama/guoxuter/ov_intent_analysis_sft:v7_q8` (and `v4_q8`), OpenViking automatically uses the matching bundled prompt during search (`retrieval.ov_intent_analysis_sft_v7` and `retrieval.ov_intent_analysis_sft_v4` respectively). No prompt file replacement or `prompts.templates_dir` override is required. If you use an unmapped model, OpenViking keeps the default `retrieval.intent_analysis` prompt.
+
+This lets a smaller model handle retrieval planning while a stronger `vlm` handles semantic extraction, memory extraction, and multimodal processing. Measure latency with your model, hardware, and request load.
 
 ### feishu
 
@@ -710,47 +939,94 @@ Configuration for Feishu/Lark cloud document parsing. See [Resources](../api/02-
 | `max_rows_per_sheet` | int | Maximum rows to import per spreadsheet sheet (default: `1000`) |
 | `max_records_per_table` | int | Maximum records to import per bitable table (default: `1000`) |
 
-**Dependency**: `pip install 'openviking[bot-feishu]'`
+**Dependency**: Included by default in `openviking[bot]` installation
 
 **Lark international**: For Lark URLs (`*.larksuite.com`), set `domain` to `https://open.larksuite.com`.
 
 ### code
 
-Controls how code files are summarized via `code_summary_mode`. Both config formats are equivalent:
+Code skeleton extraction is built into the code summary pipeline and has no parser-level configuration. OpenViking first uses maintained `tags.scm` queries when one exists for the language; if no corresponding `tags.scm` exists, it uses `tree-sitter-language-pack.process()`; when the current extraction route produces no useful skeleton, it invokes `semantic.code_summary` as fallback.
+
+The remaining `code` configuration fields are for remote code resource network guards and code-hosting allowlists. See [Code Skeleton Extraction](../concepts/06-extraction.md#code-skeleton-extraction) for the extraction route.
+
+#### Remote resource network guard
+
+For URL ingestion, the default network check rejects destinations resolving to non-public addresses. Ordinary public URLs do not need to be on the code-hosting allowlist; trusted code hosts on that list bypass the address-range check. Add self-hosted GitHub Enterprise, GitLab, or Azure DevOps hosts to the corresponding platform list under `code`:
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `github_domains` | list[str] | Allowed GitHub hosts (add your GitHub Enterprise host here) | `["github.com", "www.github.com"]` |
+| `gitlab_domains` | list[str] | Allowed GitLab hosts (add your self-hosted GitLab host here) | `["gitlab.com", "www.gitlab.com"]` |
+| `azure_devops_domains` | list[str] | Allowed Azure DevOps hosts | `["dev.azure.com", "ssh.dev.azure.com", "vs-ssh.visualstudio.com"]` |
+| `code_hosting_domains` | list[str] | Allowed generic code-hosting hosts | `["github.com", "gitlab.com", "gitcode.com", "gitee.com", "bitbucket.org", "codeberg.org", "gitea.com", "atomgit.com", "git.sr.ht"]` |
+
+To allow other private-network targets, such as internal mirrors, set the top-level `allow_private_networks` to `true`. It is disabled by default; local hostnames such as `localhost` and its subdomains remain rejected. This example enables private-network access and registers a code host:
 
 ```json
 {
+  "allow_private_networks": true,
   "code": {
-    "code_summary_mode": "ast"
+    "github_domains": ["github.com", "github.example.com"]
   }
 }
 ```
 
+Use `github_domains`, `gitlab_domains`, or `azure_devops_domains` when the host
+needs those platform-specific URL semantics. Add other Git hosts to
+`code_hosting_domains`.
+
+### pdf
+
+PDF parsing configuration. Three strategies are supported: `local` (local pdfplumber), `mineru` (remote MinerU API), and `auto` (try local first, fall back to MinerU).
+
 ```json
 {
-  "parsers": {
-    "code": {
-      "code_summary_mode": "ast"
+  "pdf": {
+    "strategy": "auto",
+    "mineru_endpoint": "http://127.0.0.1:8000",
+    "mineru_timeout": 300.0,
+    "mineru_bodys": {
+      "backend": "hybrid-auto-engine",
+      "lang_list": ["ch"],
+      "parse_method": "auto"
     }
   }
 }
 ```
 
-Set `code_summary_mode` to one of:
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `strategy` | str | Parsing strategy: `local` / `mineru` / `auto` (default `auto`) |
+| `mineru_endpoint` | str | MinerU API **base URL** (e.g. `http://127.0.0.1:8000`) |
+| `mineru_timeout` | float | Request timeout in seconds (default `300.0`) |
+| `mineru_bodys` | dict | MinerU API multipart form fields |
 
-| Value | Description | Default |
-|-------|-------------|---------|
-| `"ast"` | Extract AST skeleton (class names, method signatures, first-line docstrings, imports) for files ≥100 lines, skip LLM calls. **Recommended for large-scale code indexing** | ✓ |
-| `"llm"` | Always use LLM for summarization (higher cost) | |
-| `"ast_llm"` | Extract AST skeleton (with full docstrings) first, then pass it as context to LLM (highest quality, moderate cost) | |
+**MinerU protocol**: a synchronous `POST {mineru_endpoint}/file_parse` request with the PDF as the multipart `files` field; form parameters are passed through from `mineru_bodys`.
 
-AST extraction supports: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++. Other languages, extraction failures, or empty skeletons automatically fall back to LLM.
+### External parser API (`parser_api`) {#parser-api}
 
-See [Code Skeleton Extraction](../concepts/06-extraction.md#code-skeleton-extraction-ast-mode) for details.
+The top-level `parser_api` section routes selected formats to the external Understanding files/responses API. It replaces the Parser stage; TreeBuilder, persistence, and semantic processing remain in OpenViking. See [Resource processing](../api/02-resources.md#resource-processing-pipeline) for routing and asynchronous behavior.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enable` | `false` | Enable external parsing. |
+| `extensions` | `[]` | File extensions to route externally; normalized to lowercase without the leading dot. |
+| `host` | `""` | API host including scheme, such as `https://parser.example.com`; required when enabled. |
+| `api_key` | `""` | External API credential; required when enabled. |
+| `enable_feishu_url` | `false` | Allow direct Feishu URL parsing when credentials are available. Feishu documents already normalized to Markdown by the accessor bypass external parsing; file attachments still use extension routing. |
+| `enable_resumable_upload` | `false` | Enable resumable uploads. |
+| `upload_simple_max_bytes` | `536870912` (512 MiB) | Simple-upload size threshold. |
+| `upload_part_size_bytes` | `8388608` (8 MiB) | Resumable-upload part size. |
+| `http_timeout_seconds` | `10.0` | Timeout for an individual HTTP request. |
+| `response_timeout_seconds` | `1800` | Timeout while waiting for the parsing response. |
+| `poll_interval_ms` | `3000` | Response polling interval. |
+
+All size, timeout, and polling values must be greater than zero.
 
 ### rerank
 
-Reranking model for search result refinement. Supports VikingDB (Volcengine), Cohere, and OpenAI-compatible APIs.
+Reranking model for search result refinement. Supports VikingDB (Volcengine), Cohere,
+OpenAI-compatible APIs, LiteLLM, and Jev.
 
 **Volcengine (VikingDB):**
 
@@ -774,23 +1050,87 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
     "provider": "openai",
     "api_key": "your-api-key",
     "api_base": "https://dashscope.aliyuncs.com/compatible-api/v1/reranks",
-    "model": "qwen3-vl-rerank",
+    "model": "qwen3-rerank",
+    "timeout": 120,
+    "max_input_tokens": 2048,
     "threshold": 0.1
   }
 }
 ```
 
+**Jev (TypeSafe System One) provider:**
+
+```json
+{
+  "rerank": {
+    "provider": "jev",
+    "api_key": "your-typesafe-api-key",
+    "model": "jev-latest",
+    "timeout": 120,
+    "log_payloads": false,
+    "threshold": 0.1
+  }
+}
+```
+
+To use Jev through Vercel AI Gateway, point `api_base` at Vercel's
+[TypeSafe-compatible endpoint](https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe)
+and use Vercel's model ID. The request and response formats are identical to
+TypeSafe direct access; the adapter does not special-case Vercel:
+
+```json
+{
+  "rerank": {
+    "provider": "jev",
+    "api_key": "your-vercel-ai-gateway-api-key",
+    "api_base": "https://ai-gateway.vercel.sh/typesafe",
+    "model": "typesafe-ai/jev",
+    "threshold": 0.1
+  }
+}
+```
+
+Notes for Vercel:
+
+- Use a long-lived AI Gateway API key created with
+  `vercel ai-gateway api-keys create`, not the OIDC token from `vercel env pull`,
+  which expires after 12 hours.
+- The Vercel team must have a credit card on file for AI Gateway; otherwise
+  requests fail with 403 `customer_verification_required`.
+- `api_base` must include the `/typesafe` suffix. `https://ai-gateway.vercel.sh/v1`
+  is Vercel's own evaluate protocol and is not supported by the adapter.
+
+The Jev adapter sends the query and candidate documents as shared System One `state`
+and supports two modes:
+
+- `noul` (default): one independent relevance question per document, using its returned yes
+  probability as the score. All questions are sent in one HTTP request, and document
+  scores do not have to sum to 1.
+- `choice`: one question compares all candidate documents, with `candidate_{index}`
+  mapped to input indices. Scores come from `probabilities` in document order.
+
+Select the mode with `rerank.mode`; omitting it or setting it to `null` keeps the
+default `noul` behavior. Choice scores are relative probabilities summing to 1 within
+the candidate pool, not absolute relevance probabilities, so they are unsuitable for
+absolute score filtering. When enabling Choice, set `"threshold": 0`. The MCP `find`
+and `search` `min_score` argument overrides that setting, so pass `min_score=0` when
+using Choice through MCP.
+
 **Parameters**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `provider` | str | `"vikingdb"`, `"cohere"`, or `"openai"`. Auto-detected if omitted. |
+| `provider` | str | `"vikingdb"`, `"cohere"`, `"openai"`, `"litellm"`, or `"jev"`. Auto-detected if omitted. |
 | `ak` | str | VikingDB Access Key (vikingdb provider only) |
 | `sk` | str | VikingDB Secret Key (vikingdb provider only) |
 | `model_name` | str | Model name (vikingdb provider only, default: `doubao-seed-rerank`) |
-| `api_key` | str | API key (for `openai` or `cohere` providers) |
-| `api_base` | str | Endpoint URL (for `openai` provider) |
-| `model` | str | Model name (for `openai` providers) |
+| `api_key` | str | API key (for `openai`, `cohere`, or `jev` providers) |
+| `api_base` | str | Endpoint URL (for `openai` or `jev`; Jev defaults to `https://api.typesafe.ai`, Vercel uses `https://ai-gateway.vercel.sh/typesafe`) |
+| `model` | str | Model name for OpenAI-compatible, LiteLLM, or Jev providers |
+| `mode` | `"noul"`, `"choice"`, or `null` | Jev rerank mode. `null` and omission use `"noul"` |
+| `timeout` | float | HTTP request timeout in seconds for HTTP rerank providers, including Jev. Default: `30.0` |
+| `max_input_tokens` | int | Maximum estimated raw-text tokens in each query-document pair sent to the reranker. Oversized inputs retain their beginning and end. `0` disables. Default: `0` |
+| `log_payloads` | bool | Log complete rerank request and response payloads. May expose query and document content. Default: `false` |
 | `threshold` | float | Score threshold between `0.0` and `1.0`; results below this are filtered out. Default: `0.1` |
 | `extra_headers` | object | Custom HTTP headers (for OpenAI-compatible providers, optional) |
 
@@ -798,28 +1138,75 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
 - `vikingdb`: Volcengine VikingDB Rerank API (uses AK/SK)
 - `cohere`: Cohere Rerank API
 - `openai`: OpenAI-compatible Rerank API
+- `litellm`: LiteLLM Rerank API
+- `jev`: Jev (TypeSafe System One) structured-decision API with Choice comparison and independent Noul scoring
 
 If rerank is not configured, search uses vector similarity only.
 
 ### retrieval
 
-Retrieval ranking configuration for final search scores.
+Configuration for session intent analysis and context assembly timeouts.
 
 ```json
 {
   "retrieval": {
-    "hotness_alpha": 0.0,
-    "score_propagation_alpha": 1.0
+    "enable_intent": true,
+    "recall_intent_timeout_s": 5.0,
+    "recall_rewrite_timeout_s": 30.0
   }
 }
 ```
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
-| `hotness_alpha` | float | Weight for blending hotness into final retrieval scores. `0.0` disables the hotness boost and keeps scores equal to semantic similarity; `1.0` uses only hotness. Valid range: `0.0` to `1.0`. | `0.0` |
-| `score_propagation_alpha` | float | Weight for each child result's own score when blending with its parent score during hierarchical retrieval. `1.0` ignores the parent score (semantic similarity only); `0.5` is an equal blend with the parent score; `0.0` uses only the parent score. Valid range: `0.0` to `1.0`. | `1.0` |
+| `enable_intent` | bool | Run intent analysis and query planning when `search()` receives a `session_id`. | `true` |
 
-Keep `hotness_alpha` at `0.0` when you need scores to reflect pure vector similarity. Set it above `0.0` only when frequently accessed or recently updated contexts should receive a ranking boost.
+The `mode="context"` assembly face on `/search` uses two timeout fuses:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `recall_intent_timeout_s` | float | Timeout for session-aware query expansion; on timeout the original user query is used | `5.0` |
+| `recall_rewrite_timeout_s` | float | Timeout for the digest rewrite; on timeout `digest` is empty and `rendered` is returned as usual | `30.0` |
+
+Query expansion requires a `session_id` with content and intent analysis enabled; rewriting requires `rewrite`. Each model call has its own timeout. On failure, retrieval falls back to the original query or the unrevised result.
+
+### grep
+
+Grep engine configuration for content pattern search. These settings are server-side only and cannot be overridden per-request.
+
+```json
+{
+  "grep": {
+    "engine": "auto",
+    "switch_to_remote_threshold": 10000
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `engine` | str | Search engine mode: `"auto"` uses VikingDB BM25 recall when available and falls back to local filesystem search; `"fs"` forces local filesystem search only. | `"auto"` |
+| `switch_to_remote_threshold` | int | L2 record count threshold to switch to VikingDB BM25 recall. When the number of L2 files under the search scope reaches this threshold, VikingDB BM25 is used for phase-1 recall; otherwise local filesystem search is used. Set to `0` to always use VikingDB BM25. Must be ≥ 0. | `10000` |
+
+For VikingDB / Volcengine FullText grep, OpenViking writes a `content` text field for BM25 recall. The source context keeps the full content, while the vector-store write payload truncates this field to **1 MB** at the final adapter boundary to stay within backend payload limits. Only VikingDB-backed backends use `content`; on all other backends (`local`, `cuvs`, `http`) the field is not written.
+
+### glob
+
+Glob engine configuration for path pattern matching. These settings are server-side only and cannot be overridden per request.
+
+```json
+{
+  "glob": {
+    "engine": "fs",
+    "switch_to_remote_threshold": 100
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `engine` | str | Path matching engine mode: `"auto"` uses remote `path_glob` processing when a VikingDB / Volcengine vector store is available and the search-scope record count reaches the threshold; otherwise it falls back to local filesystem search. `"fs"` forces local filesystem search only. | `"fs"` |
+| `switch_to_remote_threshold` | int | Record-count threshold at which `auto` mode switches to remote `path_glob`. Set to `0` to always use remote path matching. Must be ≥ 0. | `100` |
 
 ### storage
 
@@ -830,6 +1217,7 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
 | `workspace` | str | Local data storage path (main configuration) | "./data" |
+| `skip_process_lock` | bool | Skip the exclusive `.openviking.lock` file lock on `storage.workspace` for embedded vector backends (`local`, `cuvs`). Other backends do not acquire this lock. Skipping it does not make embedded vector storage safe for multiple processes. | `false` |
 | `agfs` | object | RAGFS (Rust-based AGFS) configuration | {} |
 | `vectordb` | object | Vector database storage configuration | {} |
 
@@ -855,6 +1243,8 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 |-----------|------|-------------|---------|
 | `backend` | str | `"local"`, `"s3"`, or `"memory"` | `"local"` |
 | `timeout` | float | Request timeout in seconds | `10.0` |
+| `backups` | object | Multi-write storage configuration. When set, the top-level `backend` acts as the primary backend and `backups.items[]` defines backup backends | `null` |
+| `redirects` | array | File redirect policies for multi-write storage. Matching files are written to the specified backup instead of the primary backend | `[]` |
 | `queuefs` | object | QueueFS configuration. Controls the namespace mode, backend, and runtime options for `/queue` | `{ "mode": "shared", "backend": "sqlite", "recover_stale_sec": 0, "busy_timeout_ms": 5000 }` |
 | `queue_db_path` | str (optional) | Legacy compatibility field for QueueFS sqlite DB path. Superseded by `storage.agfs.queuefs.db_path`. Defaults to `{storage.workspace}/_system/queue/queue.db` when not set. Useful when the workspace volume does not support sqlite (e.g. some network filesystems) | `null` |
 | `s3` | object | S3 backend configuration (when backend is 's3') | - |
@@ -863,21 +1253,178 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 
 RAGFS uses Rust binding mode by default, directly accessing the file system through the Rust implementation.
 
+> [!WARNING]
+> `storage.agfs` no longer supports the AGFS HTTP client mode, and the old HTTP client entry should not be configured anymore. AGFS / RAGFS filesystem access now happens only through the in-process Rust binding (`RAGFSBindingClient`). This does not affect the OpenViking server HTTP API, the `ov` CLI, or `AsyncHTTPClient` / `SyncHTTPClient` when they connect to an OpenViking server.
+
+##### Multi-Write Storage Configuration
+
+`storage.agfs.backups` enables multi-write storage. If it is not configured, OpenViking stays in single-backend mode.
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "redirects": [
+        {
+          "type": "FileExtensionPolicy",
+          "extensions": ["(pdf|ppt|zip)"],
+          "target": ["s3-backup"]
+        }
+      ],
+      "backups": {
+        "sync_type": "async",
+        "items": [
+          {
+            "name": "s3-backup",
+            "backend": "s3",
+            "s3": {
+              "bucket": "openviking-backup",
+              "region": "cn-beijing",
+              "endpoint": "https://tos-s3-cn-beijing.volces.com",
+              "access_key": "your-ak",
+              "secret_key": "your-sk",
+              "prefix": "multi-write"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Common `backups` fields:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `sync_type` | str | Multi-write sync mode. Supports `"async"` or `"sync"` | `"async"` |
+| `write_ack_count` | int | Number of backup acknowledgements required before a `sync` write returns | all backups |
+| `write_ack_timeout_ms` | int | Timeout in milliseconds while waiting for backup acknowledgements in `sync` mode | `null` |
+| `write_concurrency` | int | Maximum async backup write concurrency | `null` |
+| `items` | array | Backup backend list. Each item reuses normal backend configuration and adds fields such as `name`, `operations`, `excludes`, and `encryption` | `[]` |
+
+Common `redirects` fields:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `type` | str | Policy type. Supports `"FileExtensionPolicy"` or `"FileOverSizePolicy"` | required |
+| `extensions` | array | Extension regex list used by `FileExtensionPolicy`, for example `["(pdf\\|ppt)"]` | `[]` |
+| `max_size_mb` | int | File size threshold in MB used by `FileOverSizePolicy` | `null` |
+| `target` | array | Backup `name` list that receives matched files | required |
+
+File-size redirect example:
+
+```json
+{
+  "type": "FileOverSizePolicy",
+  "max_size_mb": 100,
+  "target": ["s3-backup"]
+}
+```
+
+Notes:
+
+- `redirects` is configured at top-level `storage.agfs` and defines redirect policies for the primary backend.
+- `target` must reference an existing backup `name` from `backups.items[]`.
+- Files matched by redirect still appear as normal readable and listable files through the filesystem APIs.
+
+See the [Multi-Write Storage Guide](./13-multi-write-storage.md) for more examples.
+
+##### Global Cache Provider, CacheFS, and PathLock Configuration
+
+The top-level `cache` section is a sibling of `storage`. Its public shape is Provider-neutral:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `provider` | str | Global Cache Provider. This release supports `redis` | required |
+| `params` | object | Provider-owned parameters; parsed as Redis connection settings when `provider=redis` | `{}` |
+
+`storage.agfs.cachefs` only controls CacheFS behavior:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `backend` | str | `local` keeps the original filesystem path; `cache` enables the CacheFS wrapper | `local` |
+| `namespace` | str | CacheFS key namespace | `openviking` |
+| `max_file_size_bytes` | int | Maximum full-file object size admitted to cache | `1048576` |
+| `traversal_mode` | str | `backend` or `cached_traversal` | `backend` |
+| `bypass_prefixes` | array[str] | Path prefixes that bypass cache | `[]` |
+
+`storage.agfs.pathlock` selects the PathLock storage provider:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `provider` | str | `filesystem`, `memory`, or `cache`; `cache` uses the shared Redis CacheRuntime | `filesystem` |
+| `namespace` | str (optional) | OpenViking instance name used in Redis PathLock keys; required when `provider=cache` | `null` |
+| `lock_expire_secs` | float | Seconds before an unrefreshed lock becomes stale; must be at least `1.0` | `30.0` |
+| `lock_timeout_secs` | float | Deprecated and ignored; runtime wait timeout remains `0.0` | `0.0` |
+
+```json
+{
+  "cache": {
+    "provider": "redis",
+    "params": {
+      "mode": "sentinel",
+      "endpoints": [
+        "redis://sentinel-1:26379",
+        "redis://sentinel-2:26379"
+      ],
+      "master_name": "mymaster",
+      "password_env": "OPENVIKING_REDIS_PASSWORD",
+      "connect_timeout_ms": 1000,
+      "command_timeout_ms": 1000
+    }
+  },
+  "storage": {
+    "agfs": {
+      "cachefs": {
+        "backend": "cache",
+        "namespace": "production"
+      },
+      "queuefs": {
+        "backend": "cache",
+        "cache_key_prefix": "production"
+      },
+      "pathlock": {
+        "provider": "cache",
+        "namespace": "production",
+        "lock_expire_secs": 30.0
+      }
+    }
+  }
+}
+```
+
+The canonical configuration has no global `cache.enabled`. CacheRuntime is initialized when CacheFS or QueueFS selects `backend=cache`, or when PathLock selects `provider=cache`. Cache-backed PathLock currently requires `cache.provider=redis`; DynamicProvider is not supported for PathLock. When all modules use local providers, `cache.params` is not parsed and no Provider connection is opened.
+
+This is a breaking configuration change. `storage.agfs.cache`, `storage.agfs.queuefs.backend="redis"`, and `storage.agfs.queuefs.redis` are rejected. Move Provider settings to top-level `cache.provider/cache.params`, select `cachefs.backend="cache"` or `queuefs.backend="cache"`, use Redis `mode="standalone"` instead of `singleton`, and use `rediss://` instead of `tls_enabled`.
+
 ##### QueueFS Configuration
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
 | `mode` | str | QueueFS namespace mode: `"shared"` uses `/queue`; `"worker"` isolates each worker under `/queue/worker-<index\|pid>` | `"shared"` |
-| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, or `"sqlite3"` | `"sqlite"` |
+| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, `"sqlite3"`, or `"cache"` | `"sqlite"` |
 | `db_path` | str (optional) | SQLite database path for QueueFS when backend is `"sqlite"` or `"sqlite3"` | `null` |
 | `recover_stale_sec` | int | Recover `processing` queue messages older than this many seconds on startup. `0` means recover all stale processing messages | `0` |
 | `busy_timeout_ms` | int | SQLite busy timeout for QueueFS in milliseconds | `5000` |
+| `cache_key_prefix` | str | QueueFS key namespace when backend is `"cache"` | `"default"` |
 
 Notes:
 
 - QueueFS defaults to `sqlite` even if the main AGFS storage backend is `local`, `s3`, or `memory`.
 - `mode=shared` keeps the historical global queue namespace at `/queue`; `mode=worker` isolates each worker under `/queue/worker-<index|pid>`.
 - `db_path` is only used when QueueFS backend is `sqlite` or `sqlite3`.
+- `backend=cache` automatically binds the global `cache.provider + cache.params` configuration.
+- `recover_stale_sec` and `busy_timeout_ms` apply only to SQLite backends.
+- Redis Cluster endpoints are seed nodes, and `db` must be `0`. Slot routing, `MOVED`/`ASK`, topology refresh, and reconnects are handled by Fred RedisProvider.
+- Redis Sentinel endpoints are Sentinel nodes and require a non-empty `master_name`; the provider handles master discovery and reconnects.
+- `username` and `password` authenticate data nodes; `sentinel_username` and `sentinel_password` authenticate Sentinel nodes.
+- All Redis reads go to the primary. Replica reads are not configurable.
+- `tls_insecure_skip_verify=true` requires `rediss://` endpoints.
+- QueueFS cache keys use `{cache_key_prefix}:ov:*`; use different prefixes for deployments or tenants sharing one Redis cluster.
+- Redis backend runs three bounded `recover_stale` sweeps in a dedicated startup recovery thread at startup, 30 seconds, and 60 seconds to cover the heartbeat-expiry window after a container restart; it does not run long-lived periodic recovery.
 - If both `storage.agfs.queuefs.db_path` and legacy `storage.agfs.queue_db_path` are set, `storage.agfs.queuefs.db_path` wins.
 - If QueueFS backend is `memory`, any `db_path` or legacy `queue_db_path` is ignored.
 
@@ -928,7 +1475,6 @@ Legacy compatibility example:
 }
 ```
 
-
 ##### S3 Backend Configuration
 
 | Parameter | Type | Description | Default |
@@ -941,6 +1487,7 @@ Legacy compatibility example:
 | `prefix` | str | Optional key prefix for namespace isolation | "" |
 | `use_ssl` | bool | Enable/disable SSL (HTTPS) for S3 connections. Also controls the scheme auto-prefixed onto bare-hostname `endpoint` values | true |
 | `use_path_style` | bool | true for PathStyle used by MinIO and some S3-compatible services; false for VirtualHostStyle used by TOS and some S3-compatible services | true |
+| `auto_detect_content_type` | bool | Automatically infer MIME type from the object key / filename extension and set the S3 object `Content-Type` header during upload | false |
 | `directory_marker_mode` | str | How to persist directory markers: `none`, `empty`, or `nonempty` | `"empty"` |
 | `normalize_encoding_chars` | str | Characters to escape in S3 object keys as `!HH` hexadecimal bytes; empty string disables normalization | `"?#%+@"` |
 
@@ -962,6 +1509,32 @@ Typical choices:
 - Escaped bytes are encoded as `!HH`, where `HH` is the uppercase hexadecimal value of the byte.
 - Characters not listed in `normalize_encoding_chars`, including Chinese and other Unicode characters, remain unchanged.
 - Set `normalize_encoding_chars` to `""` to keep original path segments in object keys.
+
+`auto_detect_content_type` is disabled by default for backward compatibility. When enabled, RAGFS infers the MIME type from the object key / filename extension and writes it to the S3 object `Content-Type`:
+
+- Detection is based on the object key / filename extension, not file content sniffing.
+- Directory markers whose keys end with `/` do not get a `Content-Type`.
+- Unknown extensions fall back to `application/octet-stream`.
+
+Example:
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "backend": "s3",
+      "s3": {
+        "bucket": "my-bucket",
+        "endpoint": "s3.amazonaws.com",
+        "region": "us-east-1",
+        "access_key": "your-ak",
+        "secret_key": "your-sk",
+        "auto_detect_content_type": true
+      }
+    }
+  }
+}
+```
 
 <details>
 <summary><b>PathStyle S3</b></summary>
@@ -1019,15 +1592,16 @@ Vector database storage configuration
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
-| `backend` | str | VectorDB backend type: 'local' (file-based), 'http' (remote service), 'volcengine' (cloud VikingDB), or 'vikingdb' (private deployment) | "local" |
+| `backend` | str | VectorDB backend type: 'local' (file-based), 'http' (remote service), 'volcengine' (cloud VikingDB), 'vikingdb' (private deployment), or 'cuvs' (local storage + GPU dense search) | "local" |
 | `name` | str | VectorDB collection name | "context" |
-| `url` | str | Remote service URL for 'http' type (e.g., 'http://localhost:5000') | null |
+| `url` | str | Remote service URL for 'http' type (e.g., `http://localhost:5000`) | null |
 | `project_name` | str | Project name (alias project) | "default" |
 | `distance_metric` | str | Distance metric for vector similarity search (e.g., 'cosine', 'l2', 'ip') | "cosine" |
 | `dimension` | int | Vector embedding dimension | 0 |
 | `sparse_weight` | float | Sparse weight for hybrid vector search, only effective when using hybrid index | 0.0 |
 | `volcengine` | object | 'volcengine' type VikingDB configuration | - |
 | `vikingdb` | object | 'vikingdb' type private deployment configuration | - |
+| `cuvs` | object | NVIDIA cuVS configuration for the 'cuvs' backend and the opt-in memory-aware auto mode on 'local'; see the [cuVS guide](./16-cuvs.md) | - |
 
 Default local mode
 ```
@@ -1056,10 +1630,26 @@ Supports cloud-deployed VikingDB on Volcengine
         "ak": "your-access-key",
         "sk": "your-secret-key"
       }
+    }
   }
 }
 ```
 </details>
+
+##### ACL schema
+
+ACL data exists only in the context collection. In addition to `acl_mode: string` (`none`, `inherit`, or `restricted`), add these scalar-indexed `list<string>` fields:
+
+```text
+acl_direct_grants
+acl_inherited_grants
+```
+
+Each element uses `{mask}:{principal}`: `1` means `read`, `3` means `write`, and `7` means `manage`.
+
+Local backends add the fields to an existing collection and rebuild the scalar index during startup. Existing records are not rewritten; missing ACL fields read as `acl_mode=none` and empty lists.
+
+For existing remote collections, including Volcengine VikingDB, provision these fields and scalar indexes before startup; OpenViking validates but does not alter the remote schema. Volcengine API-key data-plane mode also requires the context collection and configured index to exist. See [Resource Access Control (ACL)](../concepts/15-acl.md) for permission semantics.
 
 
 ## Config Files
@@ -1068,10 +1658,30 @@ OpenViking uses two config files:
 
 | File | Purpose | Default Path |
 |------|---------|-------------|
-| `ov.conf` | SDK embedded mode + server config | `~/.openviking/ov.conf` |
+| `ov.conf` | OpenViking Server configuration | `~/.openviking/ov.conf` |
 | `ovcli.conf` | HTTP client and CLI connection to remote server | `~/.openviking/ovcli.conf` |
 
 When config files are at the default path, OpenViking loads them automatically — no additional setup needed.
+
+> **Root-key two-file rule:** `server.root_api_key` in `ov.conf` is the
+> credential accepted by the server. `root_api_key` in `ovcli.conf` is the
+> client-side copy used by `ov --sudo`. If that CLI manages this server, keep
+> the two values identical and rotate both files together. The normal
+> tenant-scoped `api_key` remains a separate user/admin credential.
+
+### Reload boundary
+
+The server reads `ov.conf` during process startup and does not watch the file
+for changes. Editing `embedding`, `vlm`, `rerank`, `retrieval`, `storage`, or
+`server` settings requires restarting the OpenViking server. Queue work that is
+already running is not migrated to the new configuration, so use the normal
+service-manager restart procedure and verify with `openviking-server doctor`
+after the process comes back.
+
+`ovcli.conf` is client-side configuration. A new `ov` command or newly created
+HTTP client reads the current file; an already-running client or plugin may keep
+the values it loaded at construction time and should be restarted when its
+connection or credential settings change.
 
 If config files are at a different location, there are two ways to specify:
 
@@ -1086,27 +1696,86 @@ openviking-server --config /path/to/ov.conf
 
 ### ov.conf
 
-The config sections documented above (embedding, vlm, rerank, storage) all belong to `ov.conf`. SDK embedded mode and server share this file.
+The config sections documented above (embedding, vlm, rerank, retrieval, grep, storage) all belong to the server's `ov.conf`.
 
 For memory-related settings, add a `memory` section in `ov.conf`:
 
 ```json
 {
   "memory": {
-    "agent_scope_mode": "user+agent"
+    "custom_templates_dir": "/path/to/custom-memory"
   }
 }
 ```
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `agent_scope_mode` | Deprecated and ignored. Kept only for backward compatibility with older `ov.conf` files. Agent/user namespace behavior is now controlled by per-account namespace policy. | `"user+agent"` |
+| `version` | Deprecated and ignored. OpenViking always uses the v3 memory extraction pipeline; existing configs that set this field still load without error. | `"v3"` |
+| `custom_templates_dir` | Custom memory schema directory. Later definitions replace the same `memory_type`; new types are added. See the [Prompt Guide](10-prompt-guide.md). | `""` |
+| `extraction_enabled` | Whether session commit runs long-term memory extraction. | `true` |
+| `session_skill_extraction_enabled` | Whether session commit also extracts reusable skills into the current user's skill directory. | `false` |
+| `link_enabled` | Whether memory extraction writes and resolves memory links. | `false` |
+| `session_auto_commit` | Server-wide automatic session commit controls. This belongs under `memory`, not under `server`; see [Session Auto Commit Configuration](#session-auto-commit-configuration). | See section below |
 
-`agent_scope_mode` no longer changes namespace behavior. The server now uses account-level namespace policy to choose between `viking://agent/{agent_id}/...` and `viking://agent/{agent_id}/user/{user_id}/...`.
+#### Memory links (`memory.link_enabled`)
+
+`memory.link_enabled` defaults to `false`. When enabled, extraction resolves temporary page IDs into URIs and stores links in memory metadata. Each link contains `from_uri`, `to_uri`, `link_type` (default `related_to`), `weight` (default `0.5`, extraction clamps it to 0–1), `match_text` (a word from the conversation, or `null`), `description`, and `created_at`.
+
+`link_type` is a relation label rather than a closed enum. Extraction normalizes it to lowercase snake_case with one to three alphabetic words; invalid labels fall back to `related_to`. These links describe relationships between memories; the current retrieval pipeline does not traverse them or use their weights for ranking.
+
+#### Session Auto Commit Configuration
+
+`memory.session_auto_commit` controls server-wide automatic session commit behavior.
+
+```json
+{
+  "memory": {
+    "session_auto_commit": {
+      "enabled": false,
+      "check_interval_seconds": 600.0,
+      "scan_rate_limit_files_per_second": 2.0
+    }
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `enabled` | bool | Master switch for automatic session commits. When enabled, newly created sessions without an explicit `auto_commit_policy` get a default policy, and the idle-timeout background scheduler is started. When disabled, neither happens | `false` |
+| `check_interval_seconds` | float | Minimum interval between two idle scan rounds in seconds. Must be greater than `0` | `600.0` |
+| `scan_rate_limit_files_per_second` | float | Maximum number of session `.meta.json` files read per second during an idle scan. Must be greater than `0`. Bounds background storage IO when the sessions tree is very large | `2.0` |
+
+Notes:
+
+- `memory.session_auto_commit` is a server-wide control surface, not a per-session business policy.
+- Per-session auto-commit behavior is configured through the session-level `auto_commit_policy` (see the table below). Set it when creating a session with `POST /api/v1/sessions`, or partially update it through `PATCH /api/v1/sessions/{session_id}/config`. Omitting `auto_commit_policy` from a PATCH preserves it; sending `null` disables automatic commits. Use `GET /api/v1/sessions/{session_id}` to inspect the effective policy.
+- When `enabled=false`, sessions created without an explicit or `server.user_config_defaults.auto_commit_policy` policy keep auto commit disabled and return `auto_commit_policy: null`; `SessionAutoCommitScheduler` is not started.
+- When `enabled=true`:
+  - Sessions without an explicit or deployment-default policy get the built-in policy below.
+  - `SessionAutoCommitScheduler` starts a scan round immediately, then waits at least `check_interval_seconds` before the next round. If a round already took longer than that interval, the next round starts immediately.
+  - Within a round, session `.meta.json` files are read serially at no more than `scan_rate_limit_files_per_second` to avoid IO spikes.
+  - It does not perform a dedicated startup recovery sweep; idle detection happens only on periodic scans.
+- Token- and message-count auto commit run inline after message writes, do not depend on the scheduler, but still require the session to carry an `auto_commit_policy`.
+
+##### Per-session Auto Commit Policy
+
+When a session carries an `auto_commit_policy`, any field you omit falls back to the built-in default below. Sessions without a stored policy keep auto commit disabled. Values are clamped into `[0, max]`, and unknown keys are rejected with `InvalidArgumentError`. See [Sessions API](../api/05-sessions.md#create-session) for how to set and view it.
+
+| Field | Type | Default | Max | Description |
+|-------|------|---------|-----|-------------|
+| `pending_token_threshold` | int | 150000 | 1000000 | When uncommitted pending tokens exceed this value (strictly greater-than), an auto commit is triggered after a message write. |
+| `message_count_threshold` | int | 100 | 1000 | When the uncommitted live message count exceeds this value (strictly greater-than), an auto commit is triggered after a message write. |
+| `idle_timeout_seconds` | int | 86400 | 604800 | After this many idle seconds, a session with uncommitted content becomes eligible for the server-side idle scheduler. Idle-timeout commits archive the full backlog and ignore `keep_recent_count`. |
+| `keep_recent_count` | int | 0 | 500 | Number of recent live messages to keep (not archived) on a threshold-triggered auto commit. Idle-timeout commits ignore this and commit everything. |
+| `min_commit_interval_seconds` | int | 0 | 604800 | Minimum seconds between two automatic commits (throttle). |
+
+Code entry: `openviking/session/auto_commit_policy.py:AutoCommitPolicy`.
 
 ### ovcli.conf
 
-You can edit this file by hand, or generate it interactively with `ov config setup-cli`. If you maintain configurations for multiple servers, switch between them with `ov config switch`.
+You can edit this file by hand, or generate it interactively with `ov config`. If you maintain configurations for multiple servers, switch between them with `ov config switch`.
+
+For the guided CLI setup flow, see [OpenViking CLI Setup](../getting-started/05-cli-setup.md).
 
 Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI to connect to a remote server:
 
@@ -1114,9 +1783,6 @@ Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI t
 {
   "url": "http://localhost:1933",
   "api_key": "your-secret-key",
-  "account": "acme",
-  "user": "alice",
-  "agent_id": "my-agent",
   "profile": false,
   "upload": {
     "mode": "local",
@@ -1130,29 +1796,29 @@ Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI t
 | Field | Description | Default |
 |-------|-------------|---------|
 | `url` | Server address | (required) |
-| `api_key` | API key for authentication (root key or user key) | `null` (no auth) |
-| `account` | Default account sent as `X-OpenViking-Account` | `null` |
-| `user` | Default user sent as `X-OpenViking-User` | `null` |
-| `agent_id` | Agent identifier for agent space isolation | `null` |
+| `api_key` | Normally a user/admin key for data access. A root key here only works for admin APIs in API Key mode | `null` (no auth) |
+| `root_api_key` | Root key used by the `ov` CLI with `--sudo`, or as a fallback when `api_key` is unset. The Python HTTP SDK does not use this fallback | `null` |
+| `account` | Optional trusted-mode account identity header value | `null` |
+| `user` | Optional trusted-mode user identity header value | `null` |
 | `profile` | Whether to append `profile=1` to HTTP requests by default. Applies to both the Python HTTP client and the `ov` CLI; `ov --profile` can enable it per invocation. Actual effect still depends on the server enabling `server.profile_enabled`. | `false` |
 | `upload.ignore_dirs` | Default directory ignore list for `add-resource` (CSV) | `null` |
 | `upload.include` | Default include patterns for `add-resource` (CSV) | `null` |
 | `upload.exclude` | Default exclude patterns for `add-resource` (CSV) | `null` |
-| `upload.mode` | Temporary upload backend: `"local"` (per-instance disk) or `"shared"` (distributed shared store, required when consumer requests can land on a different server instance than the upload). Per-call override via `OPENVIKING_UPLOAD_MODE`. | `null` (server's `temp_upload.default_mode`, which itself defaults to `"local"`) |
+| `upload.mode` | Python HTTP-client temporary upload backend: `"local"` (per-instance disk) or `"shared"` (distributed shared store). The Rust `ov` CLI does not read this field; set `OPENVIKING_UPLOAD_MODE=shared` for shared uploads. | `null` (server's `temp_upload.default_mode`, which itself defaults to `"local"`) |
 
 Local directory uploads respect `.gitignore` files (root and nested). `ignore_dirs/include/exclude` apply on top of that.
 
-CLI flags can override these identity fields per command:
+For trusted gateway deployments, CLI flags can override these identity fields per command:
 
 ```bash
-openviking --account acme --user alice --agent-id assistant-2 ls viking://
+ov --account acme --user alice ls viking://
 ```
 
 For `add-resource`, upload filter flags are merged additively with `ovcli.conf` defaults:
 
 ```bash
 # ovcli.conf: upload.exclude="*.log"
-openviking add-resource ./docs --exclude "*.tmp"
+ov add-resource ./docs --exclude "*.tmp"
 # effective exclude sent to server: "*.log,*.tmp"
 ```
 
@@ -1176,7 +1842,19 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
     "temp_upload": {
       "default_mode": "local",
       "shared_max_size_bytes": 536870912,
-      "shared_prefix": "viking://upload"
+      "ttl_seconds": 43200
+    },
+    "user_config_defaults": {
+      "add_targets": {
+        "resource_uri": "viking://~/resources",
+        "skill_uri": "viking://~/skills"
+      },
+      "memory_policy": {
+        "memory_types": ["profile", "preferences", "events", "entities", "experiences"]
+      }
+    },
+    "agent_evolution": {
+      "enabled": false
     }
   }
 }
@@ -1186,32 +1864,147 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 |-------|------|-------------|---------|
 | `host` | str | Bind address | `127.0.0.1` |
 | `port` | int | Bind port | `1933` |
-| `auth_mode` | str | Authentication mode: `"api_key"` or `"trusted"`. Default is `"api_key"` | `"api_key"` |
+| `auth_mode` | str / null | Built-in modes: `"dev"`, `"api_key"`, `"trusted"`, `"oidc"`, `"ldap"`. When omitted/null, infer `api_key` from a non-empty `root_api_key`; otherwise infer `dev`. | `null` |
 | `root_api_key` | str | Root API key for multi-tenant auth in `api_key` mode. In `trusted` mode it is optional on localhost, but required for any non-localhost deployment; it does not become the source of user identity | `null` |
 | `profile_enabled` | bool | Whether to allow request-scoped cProfile via `profile=1` on HTTP requests. When disabled, the server ignores that query parameter. When enabled, the CLI can display the returned `profile`, while the Python HTTP client currently triggers profiling but does not automatically attach the top-level `profile` field to most SDK return values. | `false` |
 | `cors_origins` | list | Allowed CORS origins | `["*"]` |
 | `public_base_url` | str | Public-facing base URL emitted in MCP-issued upload instructions. Resolution order: env var `OPENVIKING_PUBLIC_BASE_URL` → this field → `X-Forwarded-Host`/`X-Forwarded-Proto` request headers → `Host` request header → listen-address fallback. Set this (or the env var) when the server runs behind a reverse proxy that does not forward `X-Forwarded-*` headers. | `null` |
-| `upload_signed_ttl_seconds` | int | TTL in seconds for one-shot tokens minted by the MCP `add_resource` tool for local-file uploads via the signed `POST /api/v1/resources/temp_upload_signed` endpoint. | `600` (10 minutes) |
-| `temp_upload.default_mode` | str | Server-side default for `POST /api/v1/resources/temp_upload` when the client does not send `upload_mode`: `"local"` (per-instance disk, current single-node behavior) or `"shared"` (distributed shared store usable across replicas). | `"local"` |
+| `upload_signed_ttl_seconds` | int | TTL in seconds for the one-shot tokens minted by the MCP `add_resource` and `add_skill` tools for local-file uploads via `POST /api/v1/resources/temp_upload?token=...`. | `600` (10 minutes) |
+| `temp_upload.default_mode` | str | Server-side default for `POST /api/v1/resources/temp_upload` when the client does not send `upload_mode`: `"local"` (per-instance disk, current single-node behavior) or `"shared"` (distributed shared store usable across replicas). New shared uploads are stored in internal `viking://upload/<created_at_ms>-<uuid>/content` and `meta` objects, and can be consumed repeatedly for `ttl_seconds`. | `"local"` |
 | `temp_upload.shared_max_size_bytes` | int | Maximum size accepted in `shared` mode, in bytes. Requests above this size are rejected before object-store write. | `536870912` (512 MiB) |
-| `temp_upload.shared_prefix` | str | URI prefix used when allocating shared `temp_file_id` objects. | `"viking://upload"` |
+| `temp_upload.ttl_seconds` | int | Retention time shared by local and shared temporary uploads, in seconds. Each upload cleans files older than this for its mode; shared cleanup uses one upload-root listing, parses creation time from each first-level directory name, and recursively removes expired directories without filesystem modification times. Set to `0` to disable automatic cleanup. | `43200` (12 hours) |
+| `user_config_defaults.add_targets.resource_uri` | str | Deployment default resource add directory used when `add_resource` omits both `to` and `parent`. `viking://~/...` resolves per request user. | `null` |
+| `user_config_defaults.add_targets.skill_uri` | str | Deployment default skill add root used when `add_skill` omits `target_uri`. Only `viking://~/skills` and `viking://agent/skills` are accepted. | `null` |
+| `user_config_defaults.memory_policy` | object | Deployment default memory extraction policy used when neither the Session nor the User has an explicit policy. | `null` |
+| `user_config_defaults.auto_commit_policy` | object | Deployment default auto-commit policy for newly created sessions without an explicit policy. | `null` |
+| `agent_evolution.enabled` | bool | Startup cluster default for Agent Evolution. Account and Cluster Admin settings may override it at runtime. When enabled, session commits may generate or update cases, trajectories, and experiences according to the session `memory_policy`. Existing memories remain readable and searchable when disabled. | `false` |
 
-`api_key` mode uses API keys and is the default. `trusted` mode trusts `X-OpenViking-Account` / `X-OpenViking-User` headers from a trusted gateway or internal caller.
+Omitting `auth_mode` (or setting it to `null`) selects `api_key` when a non-empty `root_api_key` is configured, and `dev` otherwise. `dev` is allowed only on localhost and accepts requests without authentication. An empty-string `root_api_key` is invalid.
 
-When `root_api_key` is configured in `api_key` mode, the server enables multi-tenant authentication. Use the Admin API to create accounts and user keys. In `trusted` mode, ordinary requests do not require user registration first; each request is resolved as `USER` from the injected identity headers. However, skipping `root_api_key` in `trusted` mode is allowed only on localhost. Development mode only applies when `auth_mode = "api_key"` and `root_api_key` is not set.
+Explicit `auth_mode: "api_key"` requires a non-empty `root_api_key`, including on localhost; without it, startup fails instead of falling back to development mode. Use the root key with the Admin API to create accounts and user/admin keys; use those tenant-bound keys for data access. `trusted` mode accepts account/user identity headers from a trusted gateway and does not require user-key provisioning first. Its root key is optional only on localhost and required for non-localhost binds. For role resolution, OIDC/LDAP setup, and gateway requirements, see [Authentication](04-authentication.md).
+
+`user_config_defaults` provides deployment defaults for add targets and memory extraction. For add operations, explicit request targets still win: `add_resource.to` / `add_resource.parent` take precedence over user defaults, and `add_skill.target_uri` takes precedence over user defaults. Memory policy precedence is Session policy > User `settings/user_config.json` policy > `server.user_config_defaults.memory_policy` > kernel default. `server.agent_evolution.enabled` supplies the startup default. Runtime resolution is Account override > Cluster runtime override > that startup value. Use the Admin settings APIs for changes without restarting; editing `ov.conf` directly takes effect after restart.
+
+Supported add target URIs:
+
+- `resource_uri` is used as the default `add_resource` parent directory, equivalent to `parent=<uri>, create_parent=true`. It must be a writable resource directory URI for the request user. Supported forms are `viking://resources` or `viking://resources/...`, `viking://~/resources` or `viking://~/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, and `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`. The `viking://~/...` home alias resolves per request user.
+- `skill_uri` is used as the default `add_skill` target root. In v1, only `viking://~/skills` and `viking://agent/skills` are accepted; explicit `viking://user/{user_id}/skills` is not accepted.
+- Legacy spellings: `viking://user/resources` and `viking://user/skills` written in earlier configs are auto-normalized to `viking://~/resources` and `viking://~/skills` when the config is loaded, and the server logs an info message. Prefer the `viking://~/...` form in new configs — outside `add_targets`, the uid-less spelling is rejected at the request boundary.
+
+### Runtime configuration source {#runtime-configuration-source}
+
+The top-level `runtime_config` section selects the source of runtime settings at startup; it is not nested under `server`.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `source` | `"file"` | `file` stores settings through AGFS; `memory` keeps them only in this process; a registered source name selects a custom implementation. |
+| `module` | `null` | Optional Python module imported to register a custom source. Sources can also register through the `openviking.config_source` entry-point group. |
+| `params` | `{}` | Parameters passed to the custom source factory as `ConfigSourceContext.params`. |
+
+A custom source implements `ConfigSource.load(scope)`, `update(scope, mutate)`, and `delete(scope)`. It must guard read-modify-write against concurrent updates, including calls from different threads or event loops. The mutation callback can be retried and must have no side effects.
+
+The file source stores Account settings at `/local/{account_id}/_system/setting.json` and Cluster settings at `/local/_system/runtime_config/cluster.json` in AGFS. It retains the previous bytes as `setting.backup.json` and `cluster.backup.json` beside those files and can read the backup if the primary file is missing or invalid. Existing Account settings keep their original path.
+
+The manager polls the Cluster and cached Accounts every 30 seconds. Accounts unused for 24 hours are evicted from the cache and stop being polled; their persisted settings remain. A refresh failure keeps the last valid configuration. Admin settings GET returns the stored override, not a merged effective configuration or proof that every derived client has switched. Use the [Admin API](../api/08-admin.md) to update settings; see [Reload boundary](#reload-boundary) for consumer behavior.
+
+### Tool output externalization {#tool-output-externalization}
+
+`server.tool_output_externalization` moves oversized session tool outputs to the session's `tool-results/` store and leaves a preview stub plus `tool_output_ref`. Retrieve the full output through the session tool-result read, search, and list APIs in [Session management](../api/05-sessions.md).
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Enable externalization. |
+| `threshold_chars` | `20000` | Externalize an individual output above this character count. |
+| `preview_chars` | `2000` | Preview character target for one output. |
+| `assistant_turn_inline_budget_chars` | `100000` | Inline budget across tool outputs in one assistant turn. |
+| `assistant_turn_preview_budget_chars` | `10000` | Budget used to allocate previews across the turn. |
+| `min_preview_chars` | `1000` | Lower bound when allocating per-output previews. |
+| `aggregate_selection_strategy` | `"largest_first"` | Only supported strategy: select larger outputs first when reducing the turn's inline size. |
+| `failure_mode` | `"preserve_raw"` | On storage failure: `preserve_raw` keeps the original output, `reject` raises an error, and `preview_only` keeps only a preview without a recoverable reference. |
+
+The budgets guide output selection and preview allocation; preview metadata and the minimum preview size can prevent a strict cap. With `preserve_raw`, failed writes can also leave the turn above its budget.
+
+### Usage Reporter
+
+The optional Usage Reporter extracts memory usage events from committed session tool parts. The built-in file log sink writes each event as one flat JSON object to a dedicated hourly rotating file:
+
+```json
+{
+  "server": {
+    "usage_reporter": {
+      "enabled": true,
+      "extractors": ["memory_usage"],
+      "sinks": [
+        {
+          "type": "file_log",
+          "config": {
+            "path": "/var/log/openviking_usage/usage.log",
+            "resource_id_env": "OV_RESOURCE_ID",
+            "rotation_interval_hours": 1,
+            "backup_count": 168
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+The built-in `file_log` sink replaces the earlier `http` sink. Deployments
+using `"type": "http"` must migrate to `file_log` and collect the dedicated
+log files, or configure a `custom` sink that implements their delivery
+contract.
+
+Set the environment variable named by `resource_id_env` before starting the server. Its value identifies the deployed OpenViking resource and isolates otherwise identical account, user, and URI combinations. The sink creates the parent directory, appends events immediately, rotates the active file every UTC hour, and retains `backup_count` rotated files. It does not write to the default OpenViking stdout log.
+
+Each line has the following form:
+
+```json
+{"event_time":"2026-08-05 11:30:00","tenant_id":"resource_id:ov-example;account_id:default;user_id:default;resource_uri:viking://user/default/memories/experiences/example.md","event_name":"experience.recall.count","object_id":"ue_<sha256>","count":1,"tags":{"resource_type":"experience"}}
+```
+
+`event_time` is UTC. `tenant_id` combines the deployment resource ID, event account, user, and Experience URI. `memory.recalled` maps to `experience.recall.count`, while `memory.injected` maps to `experience.inject.count`. `object_id` is the stable Usage Event ID. Downstream consumers must deduplicate by the composite `(tenant_id, object_id)` key rather than by `object_id` globally. Aggregate usage with `sum(count)` after filtering by `tenant_id`, `event_name`, and the desired `event_time` range. File collection and downstream delivery remain best-effort.
+
+#### Custom sink
+
+Add a sink entry under `server.usage_reporter.sinks`:
+
+```json
+{"type": "custom", "class_path": "my_app.usage.MySink", "config": {}}
+```
+
+The class must be importable by the server. `config` is passed as keyword arguments to its constructor. Implement `async def write(self, *, events: list[UsageEvent]) -> None`; `UsageEvent` is defined in `openviking.usage_reporter.models` and exposes `event_id` and `to_dict()`. The input is a list of events, not the flat `file_log` JSON rows.
+
+Delivery is best-effort: sink errors and timeouts are logged, and phase-2 replay can send an event again. A custom sink must define its own retry and deduplication policy. If it emits the file-log schema, use `object_id = event.event_id` and deduplicate by `(tenant_id, object_id)` within the deployment/account/user/resource scope described above. This is not an exactly-once delivery contract.
 
 For startup and deployment details see [Deployment](./03-deployment.md), for authentication see [Authentication](./04-authentication.md).
 
 ## storage.transaction Section
 
-Path locks are enabled by default and usually require no configuration. **The default behavior is no-wait**: if the target path is already locked by another operation, the operation fails immediately with `LockAcquisitionError`. Set `lock_timeout` to a positive value to allow polling/retry.
+`storage.transaction` is deprecated and kept only for legacy compatibility. Use `storage.agfs.pathlock` for the active PathLock provider, namespace, and expiry configuration. When legacy fields are still present, OpenViking logs a warning at runtime; `lock_timeout` is deprecated and ignored, `lock_expire` is automatically mapped when the new field is unset, and `redo_recovery_enabled` is ignored.
+
+Recommended configuration:
+
+```json
+{
+  "storage": {
+    "agfs": {
+      "pathlock": {
+        "provider": "filesystem",
+        "lock_expire_secs": 30.0
+      }
+    }
+  }
+}
+```
+
+Legacy compatibility form (not recommended for new deployments):
 
 ```json
 {
   "storage": {
     "transaction": {
-      "lock_timeout": 5.0,
-      "lock_expire": 300.0
+      "lock_expire": 30.0
     }
   }
 }
@@ -1219,34 +2012,29 @@ Path locks are enabled by default and usually require no configuration. **The de
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
-| `lock_timeout` | float | Path lock acquisition timeout (seconds). `0` = fail immediately if locked (default). `> 0` = wait/retry up to this many seconds, then raise `LockAcquisitionError`. | `0.0` |
-| `lock_expire` | float | Lock inactivity threshold (seconds). Locks not refreshed within this window are treated as stale and reclaimed. | `300.0` |
+| `lock_timeout` | float | Deprecated and ignored. Runtime wait timeout is fixed at `0.0`. | `0.0` |
+| `lock_expire` | float | Deprecated. Use `storage.agfs.pathlock.lock_expire_secs`. Automatically mapped when the new field is unset. | `30.0` |
+| `redo_recovery_enabled` | bool | Deprecated and ignored. Session commit phase-2 recovery now resumes from the persistent `session_commit` queue. | `true` |
 
 For details on the lock mechanism, see [Path Locks and Crash Recovery](../concepts/09-transaction.md).
 
-## storage.task_tracker Section
+## Task Tracker Persistence
 
-The task tracker records async task state for endpoints that return a `task_id` (task types include `session_commit`, `add_resource`, `add_skill`, and `admin_reindex`). The `persistent` backend stores task state on the workspace volume so that **a `task_id` returned by one instance can be looked up from another instance**, and task history survives a restart. The default `memory` backend keeps task state per process — sufficient for single-instance deployments.
+The task tracker records async task state for endpoints that return a `task_id` (task types include `session_commit`, `add_resource`, `add_skill`, and `admin_reindex`). Task records are written to AGFS. Instances sharing the same persistent storage can query the same `task_id`, and task history survives a restart subject to retention cleanup. Records on the `memory` filesystem backend do not survive a process restart.
 
-```json
-{
-  "storage": {
-    "task_tracker": {
-      "backend": "memory"
-    }
-  }
-}
+No `storage.task_tracker` configuration is required. If an older configuration still includes `storage.task_tracker`, OpenViking logs a warning and ignores it.
+
+Task record files are stored under the owning account's system directory:
+
+```text
+/local/{account_id}/_system/tasks/{user_id}/{task_id}.json
 ```
 
-| Parameter | Type | Description | Default |
-|-----------|------|-------------|---------|
-| `backend` | str | Task tracker backend. `"memory"` keeps task state in process memory (single-instance). `"persistent"` enables cross-instance task lookup and survives restarts. | `"memory"` |
-
-Set `backend` to `"persistent"` for multi-instance deployments where callers may poll `GET /api/v1/tasks/{task_id}` from any instance, or when task history needs to outlive the process.
+<a id="encryption"></a>
 
 ## encryption Section
 
-Enable at-rest data encryption to ensure data security and isolation in multi-tenant environments. Encryption is completely transparent to users with no API changes.
+At-rest encryption protects newly written files with account-specific keys through the existing APIs. Existing plaintext files are not encrypted automatically; migrate or rewrite them separately.
 
 ```json
 {
@@ -1337,7 +2125,9 @@ Suitable for Volcengine cloud deployments:
 
 For detailed encryption explanations, see [Data Encryption](../concepts/10-encryption.md). For complete usage instructions, see [Encryption Guide](./08-encryption.md).
 
-## Full Schema
+## Configuration Structure
+
+This illustrates the main sections, not a complete runnable configuration or JSON Schema. Replace `string` and `|`-separated options with actual values; see the module sections for fields omitted here.
 
 ```json
 {
@@ -1361,23 +2151,22 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "model": "string",
     "api_base": "string",
     "thinking": false,
-    "max_concurrent": 100,
+    "max_concurrent": 32,
     "max_retries": 3,
     "extra_headers": {},
-    "extra_request_body": {},
-    "stream": false
+    "extra_request_body": {}
   },
   "rerank": {
-    "provider": "volcengine|openai",
+    "provider": "vikingdb|cohere|openai|litellm|jev",
     "api_key": "string",
     "model": "string",
     "api_base": "string",
+    "max_input_tokens": 0,
     "threshold": 0.1,
     "extra_headers": {}
   },
   "retrieval": {
-    "hotness_alpha": 0.0,
-    "score_propagation_alpha": 1.0
+    "enable_intent": true
   },
   "encryption": {
     "enabled": false,
@@ -1402,20 +2191,17 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "workspace": "string",
     "agfs": {
       "backend": "local|s3|memory",
-      "timeout": 10
-    },
-    "transaction": {
-      "lock_timeout": 0.0,
-      "lock_expire": 300.0
+      "timeout": 10,
+      "pathlock": {
+        "provider": "filesystem",
+        "lock_expire_secs": 30.0
+      }
     },
     "vectordb": {
-      "backend": "local|remote",
+      "backend": "local|cuvs|http|volcengine|vikingdb",
       "url": "string",
       "project": "string"
     }
-  },
-  "code": {
-    "code_summary_mode": "ast"
   },
   "server": {
     "host": "127.0.0.1",
@@ -1465,7 +2251,7 @@ Error: VLM request timeout
 Error: Rate limit exceeded
 ```
 
-Volcengine has rate limits. Consider batch processing with delays or upgrading your plan.
+Check the provider error to determine whether the limit applies to request count, token usage, or account quota, then adjust request pacing or request the corresponding quota.
 - Lower `embedding.max_concurrent` / `vlm.max_concurrent` first
 - Keep a small `max_retries` value for occasional `429`s; set it to `0` if you prefer fail-fast behavior
 

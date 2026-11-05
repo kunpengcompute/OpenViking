@@ -37,7 +37,6 @@ logger = get_logger(__name__)
 # Exported for testing
 __all__ = [
     "extract_json_content",
-    "remove_json_trailing_content",
     "parse_json_with_stability",
     "value_fault_tolerance",
     "parse_value_with_tolerance",
@@ -136,21 +135,6 @@ def extract_json_content(s: str) -> str:
         return s
 
     return result
-
-
-def remove_json_trailing_content(s: str) -> str:
-    """
-    Layer 1: Remove extra content after JSON closing brace.
-
-    DEPRECATED: Use extract_json_content() instead which handles both leading and trailing content.
-
-    Args:
-        s: Raw LLM response string
-
-    Returns:
-        String with only the JSON part
-    """
-    return extract_json_content(s)
 
 
 def _get_origin_type(annotation) -> Type:
@@ -395,7 +379,8 @@ def parse_json_with_stability(
     Args:
         content: Raw LLM response string
         model_class: Optional Pydantic model class to validate against
-        expected_fields: Optional list of field names to keep (filter out extra fields)
+        expected_fields: Optional field names to keep. Non-empty objects containing
+            none of these fields are rejected instead of becoming an empty result.
 
     Returns:
         Tuple of (parsed_data, error_message). error_message is None on success.
@@ -429,16 +414,27 @@ def parse_json_with_stability(
     if isinstance(parsed_data, list) and len(parsed_data) > 0:
         parsed_data = parsed_data[0]
         tracer.info("Extracted first item from list response")
+    elif (
+        isinstance(parsed_data, list)
+        and len(parsed_data) == 0
+        and getattr(model_class, "_allow_empty_list_response", False)
+    ):
+        # The operations model opts in (via _allow_empty_list_response) to treating a
+        # bare `[]` as a valid "no operations" outcome: every field is default_factory=list,
+        # so map [] to {} and let it validate to an empty-ops object instead of raising
+        # downstream. Every other model keeps the fail-loud "Expected dict" path below.
+        parsed_data = {}
+        tracer.info("Empty list response treated as empty object (no operations)")
 
     if not isinstance(parsed_data, dict):
-        return None, f"Expected dict after parsing, got {type(parsed_data)}"
+        return None, f"Expected dict after parsing, got {parsed_data}"
 
     # Filter to only expected fields if provided
     if expected_fields:
-        filtered_data = {}
-        for k, v in parsed_data.items():
-            if k in expected_fields:
-                filtered_data[k] = v
+        filtered_data = {k: v for k, v in parsed_data.items() if k in expected_fields}
+        if parsed_data and not filtered_data:
+            fields = ", ".join(sorted(parsed_data))
+            return None, f"No expected fields found; got fields: {fields}"
         parsed_data = filtered_data
 
     # If no model class, return the raw dict

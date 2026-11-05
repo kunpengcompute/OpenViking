@@ -1,17 +1,28 @@
 import { useCallback, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { ArrowUpIcon, SquareIcon } from 'lucide-react'
 
 import { cn } from '#/lib/utils'
 
 interface ComposerProps {
-  onSend: (message: string) => void
+  onSend: (message: string) => void | boolean | Promise<void | boolean>
   onCancel: () => void
   isStreaming: boolean
+  variant?: 'default' | 'compact'
 }
 
-export function Composer({ onSend, onCancel, isStreaming }: ComposerProps) {
+export function Composer({
+  onSend,
+  onCancel,
+  isStreaming,
+  variant = 'default',
+}: ComposerProps) {
+  const { t } = useTranslation('sessions')
   const [value, setValue] = useState('')
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const submittingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const isCompact = variant === 'compact'
 
   const resize = useCallback(() => {
     const el = textareaRef.current
@@ -20,16 +31,23 @@ export function Composer({ onSend, onCancel, isStreaming }: ComposerProps) {
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`
   }, [])
 
-  const handleSend = useCallback(() => {
+  const handleSend = useCallback(async () => {
     const trimmed = value.trim()
-    if (!trimmed) return
-    onSend(trimmed)
-    setValue('')
-    requestAnimationFrame(() => {
-      const el = textareaRef.current
-      if (el) el.style.height = 'auto'
-    })
-  }, [value, onSend])
+    if (!trimmed || submittingRef.current || isStreaming) return
+    submittingRef.current = true
+    setIsSubmitting(true)
+    try {
+      const accepted = await onSend(trimmed)
+      if (accepted === false) return
+      // Do not erase text edited while the submission was pending.
+      setValue((current) => (current === value ? '' : current))
+    } catch {
+      // The caller owns error reporting; keep the input available for retry.
+    } finally {
+      submittingRef.current = false
+      setIsSubmitting(false)
+    }
+  }, [value, onSend, isStreaming])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -45,10 +63,12 @@ export function Composer({ onSend, onCancel, isStreaming }: ComposerProps) {
   )
 
   return (
-    <div className="px-4 pb-4 pt-2">
+    <div className={cn(isCompact ? 'px-3 pb-3 pt-2' : 'px-4 pb-4 pt-2')}>
       <div
         className={cn(
-          'mx-auto w-full max-w-3xl rounded-2xl border border-border/50 bg-background/95',
+          'mx-auto w-full border border-border/50 bg-background/95',
+          isCompact ? 'max-w-none' : 'max-w-4xl',
+          isCompact ? 'rounded-xl' : 'rounded-2xl',
           'shadow-lg shadow-black/8 dark:shadow-black/25',
         )}
       >
@@ -56,7 +76,8 @@ export function Composer({ onSend, onCancel, isStreaming }: ComposerProps) {
         <textarea
           ref={textareaRef}
           autoFocus
-          placeholder="回复..."
+          aria-label={t('chat.placeholder')}
+          placeholder={t('chat.placeholder')}
           rows={1}
           value={value}
           onChange={(e) => {
@@ -65,15 +86,24 @@ export function Composer({ onSend, onCancel, isStreaming }: ComposerProps) {
           }}
           onKeyDown={handleKeyDown}
           className={cn(
-            'min-h-[44px] w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm',
+            'w-full resize-none bg-transparent text-sm',
+            isCompact
+              ? 'min-h-[38px] px-3 pb-0.5 pt-2.5'
+              : 'min-h-[44px] px-4 pb-1 pt-3',
             'placeholder:text-muted-foreground/60',
             'focus-visible:outline-none',
           )}
         />
-        <div className="flex items-center justify-end px-3 pb-2.5">
+        <div
+          className={cn(
+            'flex items-center justify-end',
+            isCompact ? 'px-2.5 pb-2' : 'px-3 pb-2.5',
+          )}
+        >
           {isStreaming ? (
             <button
               type="button"
+              aria-label={t('chat.cancel')}
               onClick={onCancel}
               className={cn(
                 'inline-flex size-8 items-center justify-center rounded-lg',
@@ -86,8 +116,9 @@ export function Composer({ onSend, onCancel, isStreaming }: ComposerProps) {
           ) : (
             <button
               type="button"
+              aria-label={t('chat.send')}
               onClick={handleSend}
-              disabled={!value.trim()}
+              disabled={!value.trim() || isSubmitting}
               className={cn(
                 'inline-flex size-8 items-center justify-center rounded-lg',
                 'bg-primary text-primary-foreground',

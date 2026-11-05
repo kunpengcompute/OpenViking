@@ -40,7 +40,7 @@ class SemanticQueue(NamedQueue):
 
     @staticmethod
     def _memory_parent_semantic_key(msg: SemanticMsg) -> str:
-        return f"{msg.account_id}|{msg.user_id}|{msg.agent_id}|{msg.uri}"
+        return f"{msg.account_id}|{msg.user_id}|{msg.peer_id}|{msg.uri}"
 
     async def enqueue(self, msg: SemanticMsg) -> str:
         """Serialize SemanticMsg object and store in queue."""
@@ -69,6 +69,8 @@ class SemanticQueue(NamedQueue):
                 version = _SEMANTIC_COALESCE_VERSION.get(msg.coalesce_key, 0) + 1
                 _SEMANTIC_COALESCE_VERSION[msg.coalesce_key] = version
                 msg.coalesce_version = version
+
+        msg.queue_enqueued_at = time.time()
 
         return await super().enqueue(msg.to_dict())
 

@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
-from openviking.message.part import ContextPart, Part, TextPart, ToolPart
+from openviking.core.peer_id import normalize_peer_id
+from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart, part_from_dict
+from openviking.utils.token_estimation import estimate_text_tokens
 
 
 @dataclass
@@ -20,8 +22,13 @@ class Message:
     id: str
     role: Literal["user", "assistant"]
     parts: List[Part]
-    role_id: Optional[str] = None
+    peer_id: Optional[str] = None
     created_at: str = None
+    turn_id: Optional[str] = None
+    message_kind: Optional[
+        Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
+    ] = None
+    source_message_ids: Optional[List[str]] = None
 
     @property
     def content(self) -> str:
@@ -33,11 +40,13 @@ class Message:
 
     @property
     def estimated_tokens(self) -> int:
-        """Estimate token count from all parts (ceil(len/4) heuristic).
+        """Estimate token count from all parts using a CJK-aware fallback.
 
         Counts fields that actually appear in the assembled prompt:
         - TextPart.text: always emitted
         - ContextPart.abstract: injected as text (uri is not sent to the model)
+        - ImagePart: not counted here; image captioning/model usage is tracked
+          by the VLM call that converts images into text for extraction
         - ToolPart: tool_id (appears in toolUse.id / toolResult.toolCallId),
           tool_name, tool_input (JSON), tool_output
 
@@ -48,19 +57,19 @@ class Message:
         (8k/16k) or tool-dense sessions, consider adding a conservative per-tool
         buffer instead of mirroring the full convertToAgentMessages logic.
         """
-        total_chars = 0
+        token_text = []
         for p in self.parts:
             if isinstance(p, TextPart):
-                total_chars += len(p.text)
+                token_text.append(p.text)
             elif isinstance(p, ContextPart):
-                total_chars += len(p.abstract)
+                token_text.append(p.abstract)
             elif isinstance(p, ToolPart):
-                total_chars += len(p.tool_id) + len(p.tool_name)
+                token_text.extend([p.tool_id, p.tool_name])
                 if p.tool_input:
-                    total_chars += len(json.dumps(p.tool_input, ensure_ascii=False))
+                    token_text.append(json.dumps(p.tool_input, ensure_ascii=False))
                 if p.tool_output:
-                    total_chars += len(p.tool_output)
-        return -(-total_chars // 4)  # ceil division
+                    token_text.append(p.tool_output)
+        return estimate_text_tokens("".join(token_text))
 
     def to_dict(self) -> dict:
         """Serialize to JSONL."""
@@ -71,13 +80,21 @@ class Message:
                 .isoformat(timespec="milliseconds")
                 .replace("+00:00", "Z")
             )
-        return {
+        data = {
             "id": self.id,
             "role": self.role,
-            "role_id": self.role_id,
             "parts": [self._part_to_dict(p) for p in self.parts],
             "created_at": created_at_val,
         }
+        if self.peer_id is not None:
+            data["peer_id"] = self.peer_id
+        if self.turn_id is not None:
+            data["turn_id"] = self.turn_id
+        if self.message_kind is not None:
+            data["message_kind"] = self.message_kind
+        if self.source_message_ids is not None:
+            data["source_message_ids"] = list(self.source_message_ids)
+        return data
 
     def _part_to_dict(self, part: Part) -> dict:
         if isinstance(part, TextPart):
@@ -88,6 +105,14 @@ class Message:
                 "uri": part.uri,
                 "context_type": part.context_type,
                 "abstract": part.abstract,
+            }
+        elif isinstance(part, ImagePart):
+            image_url = {"url": part.url}
+            if part.detail is not None:
+                image_url["detail"] = part.detail
+            return {
+                "type": part.type,
+                "image_url": image_url,
             }
         elif isinstance(part, ToolPart):
             d = {
@@ -154,135 +179,26 @@ class Message:
                 raw_parts = []
 
         for p in raw_parts:
-            if p["type"] == "text":
-                parts.append(TextPart(text=p.get("text", "")))
-            elif p["type"] == "context":
-                parts.append(
-                    ContextPart(
-                        uri=p["uri"],
-                        context_type=p.get("context_type", "memory"),
-                        abstract=p.get("abstract", ""),
-                    )
-                )
-            elif p["type"] == "tool":
-                parts.append(
-                    ToolPart(
-                        tool_id=p["tool_id"],
-                        tool_name=p["tool_name"],
-                        tool_uri=p["tool_uri"],
-                        skill_uri=p.get("skill_uri", ""),
-                        tool_input=p.get("tool_input"),
-                        tool_output=p.get("tool_output", ""),
-                        tool_status=p.get("tool_status", "pending"),
-                        duration_ms=p.get("duration_ms"),
-                        prompt_tokens=p.get("prompt_tokens"),
-                        completion_tokens=p.get("completion_tokens"),
-                        tool_output_ref=p.get("tool_output_ref", ""),
-                        tool_output_truncated=bool(p.get("tool_output_truncated", False)),
-                        tool_output_original_chars=p.get("tool_output_original_chars"),
-                        tool_output_preview_chars=p.get("tool_output_preview_chars"),
-                        tool_output_sha256=p.get("tool_output_sha256", ""),
-                        tool_output_storage_uri=p.get("tool_output_storage_uri", ""),
-                        tool_output_mime_type=p.get("tool_output_mime_type", "text/plain"),
-                        tool_output_source_ref=p.get("tool_output_source_ref", ""),
-                        tool_output_source_offset=p.get("tool_output_source_offset"),
-                        tool_output_source_limit=p.get("tool_output_source_limit"),
-                        tool_output_externalization_error=p.get(
-                            "tool_output_externalization_error", ""
-                        ),
-                        tool_output_group_id=p.get("tool_output_group_id", ""),
-                        tool_output_externalized_reason=p.get(
-                            "tool_output_externalized_reason", ""
-                        ),
-                        tool_output_group_original_chars=p.get("tool_output_group_original_chars"),
-                        tool_output_group_budget_chars=p.get("tool_output_group_budget_chars"),
-                    )
-                )
+            parts.append(part_from_dict(p))
+        try:
+            peer_id = normalize_peer_id(data.get("peer_id"))
+        except ValueError:
+            peer_id = data.get("peer_id")
+
         return cls(
             id=data["id"],
             role=data["role"],
             parts=parts,
-            role_id=data.get("role_id"),
+            peer_id=peer_id,
             created_at=data.get("created_at"),
+            turn_id=data.get("turn_id"),
+            message_kind=data.get("message_kind"),
+            source_message_ids=(
+                list(data.get("source_message_ids"))
+                if isinstance(data.get("source_message_ids"), list)
+                else None
+            ),
         )
-
-    @classmethod
-    def create_user(
-        cls,
-        content: str,
-        msg_id: str = None,
-        role_id: Optional[str] = None,
-    ) -> "Message":
-        """Create user message."""
-        from uuid import uuid4
-
-        return cls(
-            id=msg_id or f"msg_{uuid4().hex}",
-            role="user",
-            parts=[TextPart(text=content)],
-            role_id=role_id,
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-    @classmethod
-    def create_assistant(
-        cls,
-        content: str = "",
-        context_refs: List[dict] = None,
-        tool_calls: List[dict] = None,
-        msg_id: str = None,
-        role_id: Optional[str] = None,
-    ) -> "Message":
-        """Create assistant message."""
-        from uuid import uuid4
-
-        parts: List[Part] = []
-        if content:
-            parts.append(TextPart(text=content))
-
-        for ref in context_refs or []:
-            parts.append(
-                ContextPart(
-                    uri=ref.get("uri", ""),
-                    context_type=ref.get("context_type", "memory"),
-                    abstract=ref.get("abstract", ""),
-                )
-            )
-
-        for tc in tool_calls or []:
-            parts.append(
-                ToolPart(
-                    tool_id=tc.get("id", ""),
-                    tool_name=tc.get("name", ""),
-                    tool_uri=tc.get("uri", ""),
-                    skill_uri=tc.get("skill_uri", ""),
-                    tool_input=tc.get("input"),
-                    tool_status=tc.get("status", "pending"),
-                )
-            )
-
-        return cls(
-            id=msg_id or f"msg_{uuid4().hex}",
-            role="assistant",
-            parts=parts,
-            role_id=role_id,
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-    def get_context_parts(self) -> List[ContextPart]:
-        """Get all ContextParts."""
-        return [p for p in self.parts if isinstance(p, ContextPart)]
-
-    def get_tool_parts(self) -> List[ToolPart]:
-        """Get all ToolParts."""
-        return [p for p in self.parts if isinstance(p, ToolPart)]
-
-    def find_tool_part(self, tool_id: str) -> Optional[ToolPart]:
-        """Find ToolPart by tool_id."""
-        for p in self.parts:
-            if isinstance(p, ToolPart) and p.tool_id == tool_id:
-                return p
-        return None
 
     def to_jsonl(self) -> str:
         """Serialize to JSONL string."""

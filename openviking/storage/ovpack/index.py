@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from openviking.core.namespace import context_type_for_uri
+from openviking.core.namespace import context_type_for_uri, is_session_uri, owner_fields_for_uri
 from openviking.server.identity import RequestContext
 from openviking.storage.expr import Eq
 from openviking.storage.ovpack.format import (
@@ -28,6 +28,7 @@ PORTABLE_VECTOR_SCALAR_FIELDS = [
     "description",
     "tags",
     "abstract",
+    "md5",
 ]
 EXPORT_VECTOR_FIELDS = [*PORTABLE_VECTOR_SCALAR_FIELDS, "vector"]
 
@@ -155,6 +156,7 @@ def append_index_records(
     rel_path: str,
     kind: str,
     records: list[dict[str, Any]],
+    user_id: str | None = None,
 ) -> None:
     for record in records:
         item = {
@@ -163,6 +165,8 @@ def append_index_records(
             "kind": kind,
             "level": int(record.get("level", 2)),
         }
+        if user_id:
+            item["user_id"] = user_id
         text = record.get("text")
         if isinstance(text, str) and text:
             item["text"] = text
@@ -193,11 +197,15 @@ async def build_manifest(
     scopes: list[str] | None = None,
     include_vectors: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[float]]:
-    manifest_entries = [{"path": "", "kind": "directory"}]
+    root_user_id = owner_fields_for_uri(root_uri).get("owner_user_id")
+    root_entry: dict[str, Any] = {"path": "", "kind": "directory"}
+    if root_user_id:
+        root_entry["user_id"] = root_user_id
+    manifest_entries = [root_entry]
     index_records: list[dict[str, Any]] = []
     dense_values: list[float] = []
 
-    if root_uri != "viking://":
+    if root_uri != "viking://" and not is_session_uri(root_uri):
         root_records = await index_records_for_uri(
             viking_fs,
             vector_store,
@@ -206,22 +214,34 @@ async def build_manifest(
             ctx=ctx,
             include_vectors=include_vectors,
         )
-        append_index_records(index_records, dense_values, "", "directory", root_records)
+        append_index_records(
+            index_records,
+            dense_values,
+            "",
+            "directory",
+            root_records,
+            user_id=root_user_id,
+        )
 
     for entry in entries:
         rel_path = entry["rel_path"]
         is_dir = bool(entry.get("isDir"))
-        manifest_entries.append(
-            {
-                "path": rel_path,
-                "kind": "directory" if is_dir else "file",
-                "size": entry.get("size", 0) if not is_dir else 0,
-            }
-        )
+        entry_uri = join_uri(root_uri, rel_path)
+        entry_user_id = owner_fields_for_uri(entry_uri).get("owner_user_id")
+        manifest_entry = {
+            "path": rel_path,
+            "kind": "directory" if is_dir else "file",
+            "size": entry.get("size", 0) if not is_dir else 0,
+        }
+        if entry_user_id:
+            manifest_entry["user_id"] = entry_user_id
+        manifest_entries.append(manifest_entry)
+        if is_session_uri(entry_uri):
+            continue
         records = await index_records_for_uri(
             viking_fs,
             vector_store,
-            join_uri(root_uri, rel_path),
+            entry_uri,
             is_dir=is_dir,
             ctx=ctx,
             include_vectors=include_vectors,
@@ -232,6 +252,7 @@ async def build_manifest(
             rel_path,
             "directory" if is_dir else "file",
             records,
+            user_id=entry_user_id,
         )
 
     root = {
@@ -247,6 +268,8 @@ async def build_manifest(
     }
     if package_type:
         root["package_type"] = package_type
+    if root_user_id:
+        root["user_id"] = root_user_id
     if scopes is not None:
         manifest["scopes"] = scopes
     return manifest, index_records, dense_values

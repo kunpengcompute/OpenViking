@@ -3,10 +3,12 @@
 
 """Shared fixtures for OpenViking server tests."""
 
+import asyncio
 import shutil
 import socket
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,13 +17,13 @@ import pytest
 import pytest_asyncio
 import uvicorn
 
-from openviking import AsyncOpenViking
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
 from openviking.server.app import create_app
 from openviking.server.config import ServerConfig
 from openviking.server.identity import RequestContext, Role
 from openviking.service.core import OpenVikingService
-from openviking.storage.transaction import reset_lock_manager
+from openviking.service.task_tracker import get_task_tracker
+from openviking.storage.queuefs import QueueManager, SessionCommitMsg, get_queue_manager
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.embedding_config import EmbeddingConfig
 from openviking_cli.utils.config.vlm_config import VLMConfig
@@ -52,22 +54,19 @@ This is a sample markdown document for server testing.
 
 def _install_fake_embedder(monkeypatch):
     """Use an in-process fake embedder so server tests never hit external APIs."""
-    dimension = 1024
 
     class FakeEmbedder(DenseEmbedderBase):
-        def __init__(self):
+        def __init__(self, dimension: int = 2048):
             super().__init__(model_name="test-fake-embedder")
+            self._dimension = dimension
 
         def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-            return EmbedResult(dense_vector=[0.1] * dimension)
-
-        def embed_batch(self, texts: list[str], is_query: bool = False) -> list[EmbedResult]:
-            return [self.embed(text, is_query=is_query) for text in texts]
+            return EmbedResult(dense_vector=[0.1] * self._dimension)
 
         def get_dimension(self) -> int:
-            return dimension
+            return self._dimension
 
-    monkeypatch.setattr(EmbeddingConfig, "get_embedder", lambda self: FakeEmbedder())
+    monkeypatch.setattr(EmbeddingConfig, "get_embedder", lambda self: FakeEmbedder(self.dimension))
     return FakeEmbedder
 
 
@@ -85,6 +84,58 @@ def _install_fake_vlm(monkeypatch):
     monkeypatch.setattr(VLMConfig, "is_available", lambda self: True)
     monkeypatch.setattr(VLMConfig, "get_completion_async", _fake_get_completion)
     monkeypatch.setattr(VLMConfig, "get_vision_completion_async", _fake_get_vision_completion)
+
+
+def _install_session_commit_queue_fallback(service: OpenVikingService, monkeypatch) -> None:
+    """Execute SessionCommit jobs when MockLocalAGFS cannot dequeue QueueFS entries."""
+    queue_manager = get_queue_manager()
+    original_enqueue = queue_manager.enqueue
+    queued_commit_tasks: set[str] = set()
+    tracker = get_task_tracker()
+    original_has_work = tracker.has_work
+    monkeypatch.setattr(
+        tracker,
+        "has_work",
+        lambda task_id: task_id in queued_commit_tasks or original_has_work(task_id),
+    )
+
+    async def enqueue_with_session_commit_fallback(queue_name, data):
+        if queue_name != QueueManager.SESSION_COMMIT:
+            return await original_enqueue(queue_name, data)
+
+        queued_commit_tasks.add(data["task_id"])
+
+        async def process_commit() -> None:
+            await asyncio.sleep(0)
+            msg = SessionCommitMsg(**data)
+            ctx = RequestContext(
+                user=UserIdentifier.from_dict(msg.user),
+                role=Role.USER,
+            )
+            queued_session = service.sessions.session(
+                ctx,
+                msg.session_id,
+                session_uri=msg.session_uri,
+            )
+            while True:
+                phase1 = await queued_session._read_phase1_meta(msg.archive_uri)
+                if phase1.get("status") == "ready" or await queued_session._archive_file_exists(
+                    msg.archive_uri,
+                    ".failed.json",
+                ):
+                    break
+                await asyncio.sleep(0)
+            await queued_session.load()
+            try:
+                while not await queued_session.resume_queued_commit(msg):
+                    await asyncio.sleep(0)
+            finally:
+                queued_commit_tasks.discard(msg.task_id)
+
+        asyncio.create_task(process_commit())
+        return data["task_id"]
+
+    monkeypatch.setattr(queue_manager, "enqueue", enqueue_with_session_commit_fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +187,7 @@ def upload_temp_dir(temp_dir: Path, monkeypatch) -> Path:
 
 @pytest_asyncio.fixture(scope="function")
 async def service(temp_dir: Path, monkeypatch):
-    """Create and initialize an OpenVikingService in embedded mode."""
-    reset_lock_manager()
+    """Create and initialize an OpenVikingService for in-process API tests."""
     fake_embedder_cls = _install_fake_embedder(monkeypatch)
     _install_fake_vlm(monkeypatch)
     svc = OpenVikingService(
@@ -145,20 +195,29 @@ async def service(temp_dir: Path, monkeypatch):
     )
     await svc.initialize()
     svc.viking_fs.query_embedder = fake_embedder_cls()
+    _install_session_commit_queue_fallback(svc, monkeypatch)
     yield svc
     await svc.close()
-    reset_lock_manager()
 
 
 @pytest_asyncio.fixture(scope="function")
 async def app(service: OpenVikingService):
     """Create FastAPI app with pre-initialized service (no auth)."""
+    from openviking.server.auth.plugins import DevAuthPlugin
+    from openviking.server.auth.registry import get_registry
     from openviking.server.dependencies import set_service
 
     config = ServerConfig()
     fastapi_app = create_app(config=config, service=service)
     # ASGITransport doesn't trigger lifespan, so wire up the service manually
     set_service(service)
+    # Manually initialize auth plugin (lifespan not triggered in ASGI tests)
+    registry = get_registry()
+    if registry.get("dev") is None:
+        registry.register(DevAuthPlugin)
+    plugin_cls = registry.get("dev")
+    if plugin_cls is not None:
+        fastapi_app.state.auth_plugin = plugin_cls()
     return fastapi_app
 
 
@@ -191,16 +250,21 @@ async def client_with_resource(client, service, sample_markdown_file):
 @pytest_asyncio.fixture(scope="function")
 async def running_server(temp_dir: Path, monkeypatch):
     """Start a real uvicorn server in a background thread."""
-    await AsyncOpenViking.reset()
-    reset_lock_manager()
     fake_embedder_cls = _install_fake_embedder(monkeypatch)
     _install_fake_vlm(monkeypatch)
+
+    @asynccontextmanager
+    async def _noop_mcp_lifespan():
+        yield
+
+    monkeypatch.setattr("openviking.server.mcp_endpoint.mcp_lifespan", _noop_mcp_lifespan)
 
     svc = OpenVikingService(
         path=str(temp_dir / "sdk_data"), user=UserIdentifier.the_default_user("sdk_test_user")
     )
     await svc.initialize()
     svc.viking_fs.query_embedder = fake_embedder_cls()
+    _install_session_commit_queue_fallback(svc, monkeypatch)
 
     config = ServerConfig(root_api_key=SDK_ROOT_API_KEY)
     fastapi_app = create_app(config=config, service=svc)
@@ -231,9 +295,18 @@ async def running_server(temp_dir: Path, monkeypatch):
     else:
         raise RuntimeError("APIKeyManager did not initialize for SDK server test")
 
-    yield port, svc
+    manager = fastapi_app.state.api_key_manager
+    sdk_account_id = "sdk_test_account"
+    sdk_user_key = await manager.create_account(sdk_account_id, "sdk_test_user")
+    sdk_ctx = RequestContext(
+        user=UserIdentifier(sdk_account_id, "sdk_test_user"),
+        role=Role.ADMIN,
+    )
+    await svc.initialize_account_directories(sdk_ctx)
+    await svc.initialize_user_directories(sdk_ctx)
+
+    yield port, svc, sdk_user_key
 
     server.should_exit = True
     thread.join(timeout=5)
     await svc.close()
-    await AsyncOpenViking.reset()

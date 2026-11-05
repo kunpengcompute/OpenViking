@@ -11,17 +11,24 @@
 
 import { isPluginEnabled, loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
-import { commitSession, deriveOvSessionId, isBypassed, makeFetchJSON } from "./lib/ov-session.mjs";
+import {
+  commitSession,
+  deriveOvSessionId,
+  enqueuePendingDirectly,
+  isRetryableFailure,
+  makeFetchJSON,
+} from "./lib/ov-session.mjs";
 import { maybeDetach, readHookStdin } from "./lib/async-writer.mjs";
+import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
   process.exit(0);
 }
 
-const cfg = loadConfig();
+const baseCfg = loadConfig();
 const { log, logError } = createLogger("session-end");
-const fetchJSON = makeFetchJSON(cfg);
+const fetchJSON = makeFetchJSON(baseCfg);
 
 function approve() {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -29,45 +36,50 @@ function approve() {
 
 async function main() {
   // Write-path hook: gated by autoCapture so that disabling capture also
-  // disables the final-commit triggered here.
-  if (!cfg.autoCapture) {
-    log("skip", { reason: "autoCapture disabled" });
+  // disables the final-commit triggered here. This runs against the hook's own
+  // directory, before the payload names the session's.
+  if (!baseCfg.autoCapture) {
+    log("skip", { reason: "disabled" });
     approve();
     return;
   }
 
-  if (await maybeDetach(cfg, { approve })) return;
+  if (await maybeDetach(baseCfg, { approve })) return;
 
-  let input = {};
-  try {
-    input = JSON.parse((await readHookStdin()) || "{}");
-  } catch { /* best effort */ }
+  await runHookStage({
+    loadConfig,
+    input: { read: readHookStdin, tolerant: true },
+    gates: { enabled: (cfg) => cfg.autoCapture },
+    envelope: approve,
+    onSkip: (reason) => log("skip", { reason }),
+  }, async ({ sessionId }) => {
+    if (!sessionId) {
+      log("skip", { reason: "no session_id" });
+      return;
+    }
 
-  const sessionId = input.session_id;
-  const cwd = input.cwd;
-  if (!sessionId) {
-    log("skip", { reason: "no session_id" });
-    approve();
-    return;
-  }
+    const ovSessionId = deriveOvSessionId(sessionId);
+    const health = await fetchJSON("/health");
+    if (!health.ok && isRetryableFailure(health)) {
+      const queued = await enqueuePendingDirectly("commitSession", ovSessionId, {});
+      log("commit", { ovSessionId, ok: false, queued: queued.ok, reason: "health_retryable" });
+      return;
+    }
+    if (!health.ok) {
+      logError("health_check", `non-retryable status ${health.status || "unknown"}`);
+      return;
+    }
 
-  if (isBypassed(cfg, { sessionId, cwd })) {
-    log("skip", { reason: "bypass_session_pattern" });
-    approve();
-    return;
-  }
-
-  const ovSessionId = deriveOvSessionId(sessionId);
-  const health = await fetchJSON("/health");
-  if (!health.ok) {
-    logError("health_check", "server unreachable");
-    approve();
-    return;
-  }
-
-  const res = await commitSession(fetchJSON, ovSessionId);
-  log("commit", { ovSessionId, ok: res.ok, error: res.ok ? undefined : res.error?.message });
-  approve();
+    const res = await commitSession(fetchJSON, ovSessionId);
+    log("commit", {
+      ovSessionId,
+      ok: res.ok,
+      trace_id: res.traceId || res.result?.trace_id,
+      queued: Boolean(res.pendingQueued),
+      enqueueFailed: Boolean(res.pendingEnqueueFailed),
+      error: res.ok ? undefined : res.error?.message,
+    });
+  });
 }
 
 main().catch((err) => { logError("uncaught", err); approve(); });

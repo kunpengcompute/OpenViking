@@ -22,14 +22,15 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { isPluginEnabled, loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
-import { deriveOvSessionId, isBypassed } from "./lib/ov-session.mjs";
+import { deriveOvSessionId } from "./lib/ov-session.mjs";
+import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
+import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
   process.exit(0);
 }
 
-const cfg = loadConfig();
 const { log, logError } = createLogger("subagent-start");
 
 const STATE_DIR = join(tmpdir(), "openviking-cc-subagent-state");
@@ -38,59 +39,45 @@ function approve() {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
 }
 
-function stateFile(agentId) {
-  const safe = String(agentId).replace(/[^a-zA-Z0-9_-]/g, "_");
+function stateFile(subagentId) {
+  const safe = String(subagentId).replace(/[^a-zA-Z0-9_-]/g, "_");
   return join(STATE_DIR, `${safe}.json`);
 }
 
-async function main() {
+runHookStage({
+  loadConfig,
+  input: { tolerant: true },
   // Paired with subagent-stop.mjs (a write path): when capture is off the
   // stop hook will skip, so there's no point stashing start state either.
-  if (!cfg.autoCapture) {
-    log("skip", { reason: "autoCapture disabled" });
-    approve();
-    return;
-  }
-
-  let input = {};
-  try {
-    const chunks = [];
-    for await (const chunk of process.stdin) chunks.push(chunk);
-    input = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-  } catch { /* best effort */ }
-
-  const sessionId = input.session_id;
-  const agentId = input.agent_id;
+  gates: { enabled: (cfg) => cfg.autoCapture },
+  envelope: approve,
+  onSkip: (reason) => log("skip", { reason }),
+}, async ({ cfg, input, cwd, sessionId }) => {
+  const subagentId = input.agent_id;
   const agentType = input.agent_type || "subagent";
-  const cwd = input.cwd;
 
-  if (!sessionId || !agentId) {
+  if (!sessionId || !subagentId) {
     log("skip", { reason: "missing session_id or agent_id" });
-    approve();
     return;
   }
 
-  if (isBypassed(cfg, { sessionId, cwd })) {
-    log("skip", { reason: "bypass_session_pattern" });
-    approve();
-    return;
-  }
+  const effectivePeer = getEffectivePeerId(cfg, { sessionId, cwd });
 
-  // Isolated ovSessionId: append agent_id so the subagent has its own OV
-  // session distinct from the parent (cc-<ccid>__agent-<agentid>).
-  const ovSessionId = deriveOvSessionId(sessionId, `agent:${agentId}`);
-  const ovAgentId = `${cfg.agentId || "claude-code"}_${agentType}`;
+  // Isolated ovSessionId: append Claude's subagent id so the subagent has its
+  // own OV session distinct from the parent.
+  const ovSessionId = deriveOvSessionId(sessionId, `subagent:${subagentId}`);
 
   try {
     await mkdir(STATE_DIR, { recursive: true });
     await writeFile(
-      stateFile(agentId),
+      stateFile(subagentId),
       JSON.stringify({
         parentSessionId: sessionId,
-        agentId,
+        subagentId,
         agentType,
         ovSessionId,
-        ovAgentId,
+        peerId: effectivePeer.peerId,
+        peerSource: effectivePeer.source,
         startedAt: Date.now(),
       }),
     );
@@ -98,8 +85,5 @@ async function main() {
     logError("state_write", err);
   }
 
-  log("start", { agentId, agentType, ovSessionId, ovAgentId });
-  approve();
-}
-
-main().catch((err) => { logError("uncaught", err); approve(); });
+  log("start", { subagentId, agentType, ovSessionId, peerSource: effectivePeer.source });
+}).catch((err) => { logError("uncaught", err); approve(); });

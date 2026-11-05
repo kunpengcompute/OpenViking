@@ -223,7 +223,7 @@ describe("extractNewTurnTexts", () => {
 });
 
 describe("extractNewTurnMessages", () => {
-  it("keeps assistant toolCall messages that have no text block", () => {
+  it("drops assistant toolCall messages that have no text block", () => {
     const messages = [
       {
         role: "assistant",
@@ -237,15 +237,10 @@ describe("extractNewTurnMessages", () => {
     const { messages: extracted, newCount } = extractNewTurnMessages(messages, 0);
 
     expect(newCount).toBe(1);
-    expect(extracted).toEqual([
-      {
-        role: "assistant",
-        parts: [{ type: "text", text: "[tool: read_file]" }],
-      },
-    ]);
+    expect(extracted).toEqual([]);
   });
 
-  it("keeps assistant toolUse messages that have no text block", () => {
+  it("drops assistant toolUse messages that have no text block", () => {
     const messages = [
       {
         role: "assistant",
@@ -259,15 +254,10 @@ describe("extractNewTurnMessages", () => {
     const { messages: extracted, newCount } = extractNewTurnMessages(messages, 0);
 
     expect(newCount).toBe(1);
-    expect(extracted).toEqual([
-      {
-        role: "assistant",
-        parts: [{ type: "text", text: "[tool: grep]" }],
-      },
-    ]);
+    expect(extracted).toEqual([]);
   });
 
-  it("keeps multiple textless assistant tool calls in one placeholder", () => {
+  it("does not synthesize placeholders for multiple textless assistant tool calls", () => {
     const messages = [
       {
         role: "assistant",
@@ -280,12 +270,7 @@ describe("extractNewTurnMessages", () => {
 
     const { messages: extracted } = extractNewTurnMessages(messages, 0);
 
-    expect(extracted).toEqual([
-      {
-        role: "assistant",
-        parts: [{ type: "text", text: "[tool: read_file, grep]" }],
-      },
-    ]);
+    expect(extracted).toEqual([]);
   });
 
   it("does not create a placeholder for textless assistant messages without tool calls", () => {
@@ -300,6 +285,82 @@ describe("extractNewTurnMessages", () => {
 
     expect(newCount).toBe(1);
     expect(extracted).toEqual([]);
+  });
+
+  it("maps toolResult messages to assistant tool parts", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_1", name: "read", arguments: { path: "package.json" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "read",
+        content: [{ type: "text", text: "{\"name\":\"pkg\"}" }],
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool",
+            toolCallId: "call_1",
+            toolName: "read",
+            toolInput: { path: "package.json" },
+            toolOutput: "{\"name\":\"pkg\"}",
+            toolStatus: "completed",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("preserves failed toolResult status", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_failed",
+            name: "ov_read",
+            arguments: { uri: "viking://user/test/memories/experiences/missing.md" },
+          },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_failed",
+        toolName: "ov_read",
+        content: [{ type: "text", text: "OpenViking request failed" }],
+        isError: true,
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool",
+            toolCallId: "call_failed",
+            toolName: "ov_read",
+            toolInput: { uri: "viking://user/test/memories/experiences/missing.md" },
+            toolOutput: "OpenViking request failed",
+            toolStatus: "error",
+          },
+        ],
+      },
+    ]);
   });
 });
 

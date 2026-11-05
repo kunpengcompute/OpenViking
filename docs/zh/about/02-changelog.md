@@ -3,6 +3,249 @@
 OpenViking 的所有重要变更都将记录在此文件中。
 此更新日志从 [GitHub Releases](https://github.com/volcengine/OpenViking/releases) 自动生成。
 
+> 各版本条目记录发布时的行为，其中的命令和默认值可能已变更。安装请使用当前[部署指南](../guides/03-deployment.md)。历史升级步骤如需清空 workspace，应先停止写入并做好可恢复的备份；不要把旧版本的清理步骤套用到其他升级。
+
+## 未发布
+
+- **Working Memory 默认关闭（行为变更）**：commit 仍保存原文并抽取长期记忆，默认不生成
+  WM 或 checkpoint 摘要。用户需要单独升级已安装的 agent 插件；新版默认关闭自动归档
+  摘要注入和上下文接管，由宿主管理历史与压缩。VikingBot 仍默认使用 OV 管理上下文与压缩，
+  并在会话上下文 commit 时显式请求 WM。旧版序列化会省略 WM=true，因此过去即使
+  主动开启，保存后缺少该字段的策略升级后仍会变为 false，无法自动恢复用户当时的意图。
+  已入队的旧任务保持提交时的语义。新增 `enable_working_memory` 布尔参数仅覆盖本次
+  commit 的 WM，不覆盖其他策略。无 WM 的已完成归档仍可读取原文，摘要字段为空。
+  详见[升级说明](../guides/working-memory-default-off.md)；缺少完整宿主历史的旧会话
+  应先导出原文，通过宿主支持的入口完成历史交接，再切换模式。
+- **Watch API 迁移（不兼容变更）**：使用 `watch_interval > 0` 重新导入不再更新或恢复已有 Watch。
+  原生 Watch 暂停后仍独占目标，不兼容的目标复用返回 `409 Conflict`。
+  依赖重新导入来更新 Watch 的脚本应改用 `PATCH /api/v1/watches/{task_id}`
+  （恢复时设置 `is_active: true`），或先删除旧 Watch 再创建替代任务。
+  Connector Watch 可共享目标，但重复导入相同来源和目标会创建新的独立 Watch，重试并不幂等。
+  共享目标应通过任务 ID 管理；按 URI 查询多个可访问的 Watch 时返回 409。
+  一次性 Connector 导入（`watch_interval <= 0`）不影响已有 Watch，暂停或删除请使用 watches API。
+  详见[资源任务管理](../api/02-resources.md#任务管理操作)。
+- **Session policy 兼容性**：字符串 `"false"` 现在会正确关闭对应的记忆抽取开关。
+  现有 boolean-like 值暂时保持兼容并产生弃用警告；新配置应使用 JSON 布尔值。
+- **工作区 peer 派生规则**：coding agent 插件不再按工作目录派生工作区 peer，改为按 git 派生。新的默认值 `peer.source: "git"` 取仓库归一化后的 `origin` URL（`github.com-volcengine-openviking`），其次回退到仓库根路径，因此同一个仓库的每个 clone、worktree 和子目录共用同一个 peer，而 fork 仍是独立的 peer。不在 git 仓库中的目录现在完全不发送 peer，在那里记下的内容进入用户级空间，而不是为每个目录新建一个命名空间。要让这样的目录拥有独立记忆，在其中创建 `.openviking/config.json`，写入 `{"version": 1, "peer": {"id": "my-project"}}`。无需任何迁移：此前按工作目录派生的 id 随时可以在本地重新算出，而默认的 `peer_scope: "all"` 召回本来就会扫描所有 peer，因此写在旧 id 下的记忆照常召回（`peer_scope: "actor"` 时，Claude Code、Codex、OpenCode 和 DSH 插件会额外查询该 id）。设置 `peer.source: "cwd"`（或 `OPENVIKING_PEER_SOURCE=cwd`）即可保持旧行为。
+- **pi 扩展的工具面（不兼容变更）**：pi 扩展 0.4.0 移除自己手写的 7 个 `viking_*` REST 工具，改用官方 MCP 客户端连接服务端，因此工具清单由服务端 `tools/list` 的返回决定，不再来自扩展自带的目录。每个工具的名字是 `openviking_` 加服务端的工具名（`viking_search` → `openviking_search`），不保留旧名别名期；pi 的 `--tools` 和 `--exclude-tools` 按名字精确匹配，白名单里仍写 `viking_search` 的话，对应工具会静默消失，需要手动改名。这些工具的行为与其他 MCP harness 一致：`remember` 另开一个会话并立即提交，不再追加到当前 pi 会话；`read` 返回支持按行分页的文本（`level="abstract"` 和 `level="overview"` 两档已移除，替代路径是 `openviking_search(mode="context", detail="overview")`）；`forget` 直接删除传入的 URI；`add_resource` 对本地路径返回一次性上传 URL，由模型把文件 POST 上去。root api key 在 `/mcp` 上被拒绝（403），现在会导致整个会话一个工具都没有，而此前是工具照常注册、每次调用都返回空结果，这类部署需要改用 user 或 admin key。共享开关 `mcpEnabled: false` 现在对 pi 同样生效，以这种方式关掉工具不计作故障。以上各种情况下，recall、会话采集和上下文接管都照常工作，其他 harness 不受影响。完整的改名对照和升级说明见扩展 README 的 [Upgrading from 0.3.x](https://github.com/volcengine/OpenViking/blob/main/examples/pi-coding-agent-extension/README.md#upgrading-from-03x)。
+- **外部 peer identity 迁移**：日志导入中的混合文字标识改用无损的
+  `ext-<base64>` id。`ext-` 命名空间为编码身份保留，因此原本会进入该命名空间的
+  ASCII 身份也会被编码。系统不会自动读取旧的有损 peer 目录，因为多个身份可能彼此冲突，
+  也可能与真实 ASCII peer 冲突；迁移这些归属不明确的历史数据需要运维人员明确确认归属。
+
+## v0.4.9 (2026-07-10)
+
+### 重点更新
+
+- **Agent 工作区隔离**：Codex、Claude Code、OpenCode 和 Pi 集成支持从工作区派生 peer identity，实现项目级记忆隔离，并扩展共享安装器与混合 MCP 支持。
+- **检索与记忆正确性**：新增图片搜索，正确处理 agent-only / peer-only 记忆范围，并避免生成嵌套的记忆链接。
+- **存储与安全加固**：串行化本地 collection 懒加载，按后端约束 VikingDB content 写入，并阻止 Git submodule SSRF。
+- **VikingBot 与平台修复**：新增统一 gateway 路由和 OpenViking 鉴权，并修复渠道 sender metadata、仅 VLM 配置、Windows 向量后端和 benchmark 并发问题。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.8...v0.4.9)
+
+## v0.4.8 (2026-07-08)
+
+### 重点更新
+
+- **NVIDIA cuVS 向量后端**：支持 opt-in 的 GPU 精确/近似检索，以及本地后端的显存感知回退。
+- **递归网页导入**：基于 Scrapy 和 trafilatura，支持深度、页数、路径和下载链接限制的同站爬取。
+- **记忆 v3 与训练**：启用 v3 抽取链路、流式 patch-merge 更新和 session train/eval。
+- **Agent 插件安装**：Codex / Claude Code 支持远程 marketplace，stdio MCP 代理与 hooks 共享 `ovcli.conf` 凭据。
+- **文件系统与 RAGFS**：支持后端分页 glob、稳定的目录优先排序和标准相对路径匹配。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.7...v0.4.8)
+
+## v0.4.7 (2026-07-02)
+
+### 重点更新
+
+- **MCP 本地文件链路**：compact 工具描述降低上下文开销，签名 `temp_upload` token 支持本地文件自动入库。
+- **文件系统与版本管理**：新增 filesystem attrs 和账号级 `.ovgitignore` 规则。
+- **SDK 与鉴权**：Go SDK 新增 skill scope 和 grep 深度控制，OAuth client scope 持久化，并支持 seeded API key。
+- **Studio 与初始化体验**：重做 Connection & Identity 页面，修正 assumed account，并新增 TUI 风格初始化向导。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.6...v0.4.7)
+
+## v0.4.6 (2026-06-29)
+
+### 重点更新
+
+- **VikingFS 快照版本管理**：HTTP、Python SDK 和 CLI 支持 Git-backed `commit`、`log`、`show`、`restore`。
+- **整站导入**：支持 sitemap、sitemap index、RSS 和 Atom，并可生成持续刷新的资源树。
+- **共享 Agent Skills**：恢复 `viking://agent/skills` 账号级共享根，用户私有 skill 仍为默认目标。
+- **VikingDB BM25 grep 与 Studio 指标**：增强关键词检索与用户可见的使用指标。
+
+### 升级说明
+
+- 从 0.3.x 升级且仍有 legacy agent/session 数据时，应先在 v0.4.5 完成迁移和 cleanup，再升级到 v0.4.6 或更高版本。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.5...v0.4.6)
+
+## v0.4.5 (2026-06-24)
+
+### 重点更新
+
+- **认证角色序列化与 trusted 模式**：请求身份中的角色现在会在 storage、resource、session、queue、watch、summarizer 和语义处理路径中统一序列化为字符串角色；OpenViking 后端的 VikingBot 流程也补充了 trusted `auth_mode` 支持。
+- **CLI、Web Studio 与 Bot 配置可靠性**：CLI 配置向导中的用户管理设置更清晰，Web Studio 账号选择更稳定，VikingBot 认证处理更简单，失败的 session archive 现在可以跳过。
+- **Agent 集成召回与 OpenCode 文档**：Codex / OpenCode 集成新增 session-aware recall，OpenCode 插件文档收敛到单一维护中的插件。
+- **存储与 Session 稳定性加固**：QueueFS 语义处理支持非目录 memory URI，glob URI scheme 会被保留，event summary fallback、memory abstract 截断和 path-lock 进度日志更加稳健。
+- **CLI / SDK 接口打磨**：CLI 校验错误更清晰，旧服务端请求会避免发送较新的字段，Go SDK 暴露 `set_tags`，并纳入独立 Python HTTP SDK 提取。
+- **新增集成示例**：补充 OpenWebUI 与 Pi coding-agent 集成示例。
+
+### 升级说明
+
+- 运行认证或 trusted-mode 多租户部署时，建议升级到此版本以获得角色序列化修复。
+- Python 包版本由 `v0.4.5` tag 推导。
+- Docker 镜像由 release workflow 发布 `v0.4.5` 和 `latest` 标签。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.4...v0.4.5)
+
+## v0.4.4 (2026-06-18)
+
+### 重点更新
+
+- **插件化认证架构**：认证内部重构为 plugin-based 架构，为后续扩展和维护 auth mode 打下基础。
+- **Go SDK 搜索过滤**：Go SDK 暴露 search date 与 level filters，客户端可以更精确地约束检索范围。
+- **RAGFS 加密账号修复**：修正 RAGFS 根目录获取 encryption account ID 的异常路径。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.3...v0.4.4)
+
+## v0.4.3 (2026-06-18)
+
+### 重点更新
+
+- **RAGFS 缓存与迁移可靠性**：新增 CachedFileSystem，并支持 Redis、Mooncake、Yuanrong cache providers；legacy shape probe 会跳过 zero-byte 文件和 path locks，S3 head-object 错误返回更清晰，加密读取迁移路径增加 plaintext fallback。
+- **Go SDK 与代码导航**：支持 Go HTTP SDK 并补充文件系统示例文档，同时为 OpenCode 插件新增 code navigation endpoints。
+- **文档搜索与本地化**：新增 OpenViking-powered 文档搜索，并补齐本地化、SDK 和 Hermes wording 更新。
+- **Parser、Session 与 Task 修复**：修复 session ID encode、飞书 URL host 匹配、task tracker 加密绑定和 event overview refresh 等问题。
+- **安全依赖更新**：提升 `python-multipart` 和 `cryptography` 版本下限以修复高危公告，并让 UnderstandingAPI zip 下载使用 safe extraction 规避 Zip Slip 风险。
+- **插件与 Memory 后续修复**：更新 memory plugin recall/auth handling、OpenClaw 插件 release metadata、session skill YAML 规则和 tag-setting 支持。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.2...v0.4.3)
+
+## v0.4.2 (2026-06-17)
+
+### 重点更新
+
+- **OpenClaw 安装与运行时文档加固**：补充 OpenClaw installer 流程、运行时 setup/routing 模块和相关文档测试，确保插件安装契约持续受覆盖。
+- **Wiki 与 RAGFS 后续修复**：修正 wiki 链接，并让 RAGFS shape probe 忽略 legacy task 记录。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.4.1...v0.4.2)
+
+## v0.4.1 (2026-06-16)
+
+### 重点更新
+
+- **User / Peer 身份模型**：OpenViking 将数据 owner (`user`) 与交互对象 (`peer`) 分离，`agent_id` 仅作为 legacy 过渡配置映射到请求级 `actor_peer_id`。
+- **0.3.x legacy 迁移路径**：旧的 `viking://agent/...` 与 `viking://session/...` 数据可以兼容读取、迁移到新的 `viking://user/...` 布局、验证，并在确认不需要回滚后清理。
+- **多模态入库扩展**：会话与资源入库支持图片消息、Markdown 图片 URI 改写、飞书用户 token、外部 ParserRouter，以及更完整的图片向量化链路。
+- **OpenClaw 与检索诊断**：检索支持 `context_type`，OpenClaw 增加 Recall Trace、runtime query config、feature gates 和 actor peer scope wiring。
+- **Skills 与插件生命周期更新**：Skills 成为 user-scoped 上下文资产，Codex / Claude Code 插件路径补齐安装、pending queue、recall cache 和 failure cache 能力。
+- **模型与存储可靠性**：ordered VLM/Embedding credentials、failover/failback 错误分类、RAGFS multi-write、S3 content-type autodetect、vector migration 修复和 task 持久化提升生产可用性。
+
+### 升级说明
+
+- 新写入应迁移到 `viking://user/...`；`viking://agent/...` 仍可读取旧数据，但不再作为新的 memory、resource、session 或 skill 写入目标。
+- `agent_id` 是 legacy 过渡配置，会映射到请求级 `actor_peer_id`；不要同时配置 `agent_id` 与 `actor_peer_id`，legacy `agent_id` client 也不要再显式传 message-level `peer_id`。
+- legacy `role_id` 记忆隔离不再支持；请用 User / Peer 模型表达隔离边界。
+- 0.3.x 部署升级前应先备份数据，升级 server / CLI / SDK 到 0.4.1，验证 legacy 读取，再执行 `ov --sudo admin migrate --output json`，检查 task 结果后再 cleanup。
+- 使用新检索、skills、迁移或 OpenClaw surface 的集成，应重新生成固定的 client 或 schema。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.24...v0.4.1)
+
+## v0.3.24 (2026-06-05)
+
+### 重点更新
+
+- **CLI 配置体验与非交互式配置**：`ov config` 重构配置向导并优化结果输出，同时新增非交互式配置命令，可在自动化场景中无需交互提示即可脚本化完成配置。
+- **异步资源导入持久化**：异步执行的 `add_resource` 任务现在会被持久化，进行中的导入在服务重启后不再丢失。
+- **存储内部优化**：优化快照 tree 函数，并移除已废弃的 agfs HTTP 模式客户端。
+- **MiniMax 默认模型升级为 M3**：MiniMax 默认模型现为 M3。
+- **更精确的 embedding 错误分类**：`classify_api_error` 对数字错误码采用词边界匹配，减少对服务商错误码的误判。
+
+### 升级说明
+
+- agfs HTTP 模式客户端已移除；如果你依赖 HTTP 模式，请改用受支持的 agfs 接入方式。
+- MiniMax 默认模型现为 M3；如需此前的默认模型，请在配置中显式指定模型。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.23...v0.3.24)
+
+## v0.3.23 (2026-06-03)
+
+### 重点更新
+
+- **原生 `ov` CLI 体验重构**：`ov config` 现在是配置管理入口，可交互式添加、编辑、删除、切换配置；`ov config show`、`ov config validate`、`ov config switch` 保留为显式子命令。新增 `ov language` / `ov lang` 选择显示语言，`ov status [--verbose]` 提供聚合诊断视图，`ov health` 与错误提示改为更可读的渲染。
+- **Web Studio Playground 与身份管理**：Studio 侧边栏新增 Playground，可查看上下文树、运行 Terminal 操作并与 Agent 面板交互；Connection & Identity 页面支持保存连接、选择 account/user 身份、创建 account/user、复制或重新生成 API key。
+- **VikingBot 经验召回配置化**：新增 `bot.ov_server.exp_recall_limit`、`exp_recall_max_chars`，用于调整 agent experience 召回；本地与远端模式都按传入 `agent_id` 做经验命名空间隔离。
+- **资源 Watch 更易用**：`add_resource` 设置 `watch_interval > 0` 时不再强制要求显式 `to`；如果导入结果返回稳定 `root_uri`，watch task 会自动绑定到该 URI，CLI/MCP/文档示例同步更新。
+- **插件结构化工具结果与 CJK token 估算**：Claude Code / OpenClaw 插件改为向 OpenViking 写入结构化 tool parts，工具调用与结果不再只能内联到文本；CJK-aware token 估算覆盖 Python 与插件侧，降低中文、日文、韩文会话的预算低估风险。
+
+### 升级说明
+
+- `ov config setup-cli` 已移除，请使用裸 `ov config` 进行配置。首次使用新 CLI 时，交互环境会提示选择显示语言；非交互自动化应先运行 `ov language en` 或 `ov language zh-CN`。
+- `ov status` 默认展示整理后的诊断视图；需要原始组件数据时使用 `ov status --verbose` 或 `-o json`。
+- `ovcli.conf` 默认 URL 统一为 `http://127.0.0.1:1933`，配置序列化会跳过默认值和空字段。
+- 语义处理默认并发从 100 调整为 64，文档中 `vlm.max_concurrent` 默认值同步修正为 64；本地目录上传现在会跳过 symlink。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.22...v0.3.23)
+
+## v0.3.22 (2026-05-29)
+
+### 重点更新
+
+- **检索 query planner 可配置**：新增轻量 query planner 配置，可选择并调整检索阶段意图分析所用的模型。
+- **移除 legacy Memory V1**：删除已废弃的 memory v1 路径，memory `version` 字段现在会拒绝 `v1` 负载。
+- **LangChain 可靠性**：自动恢复失效的 OpenViking client，并支持 LangChain 集成的本地批量消息写入。
+- **VikingDB 健壮性**：向量检索会跳过 fields 损坏的候选，并为 VikingDB 增加 `ap-southeast-1` region host 映射。
+- **CLI 与 server 打磨**：`ov` CLI 在向 server 发请求前先报告缺失的 CLI 配置，server mode 术语从 `dev-implicit` 统一为 `dev`，并统一 embedding 输入截断逻辑。
+
+### 升级说明
+
+- Memory V1 已移除；调用方需使用当前的 memory `version`，`v1` 负载会被拒绝。
+- server mode 术语由 `dev-implicit` 改为 `dev`；请更新匹配旧术语的脚本或仪表盘。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.21...v0.3.22)
+
+## v0.3.21 (2026-05-27)
+
+### 重点更新
+
+- **Trajectory 记忆更适合检索与复盘**：trajectory schema 新增 `retrieval_anchor` 和 `embedding_template`，索引文本从完整内容收敛为 `trajectory_name + retrieval_anchor`；experience 与 trajectory 之间改为系统维护的 `derived_from` `StoredLink`，写入正向 `links` 与反向 `backlinks`，替代易丢失的 `source_trajectories` 元数据。
+- **会话消息支持批量写入**：REST API 新增 `POST /api/v1/sessions/{session_id}/messages/batch`，CLI 新增 `ov session add-messages`，适合导入历史对话或一次写入多轮消息；`ov add-memory` 也复用同一套严格 JSON 消息解析。
+- **OpenClaw 搜索工具改名为 `ov_search`**：OpenViking OpenClaw 插件不再注册 `memory_search`，避免与 OpenClaw 内置工具冲突；导入 resource/skill 后统一使用 `ov_search` 和 `/ov-search`。
+- **资源解析与二进制 URL 判断增强**：HTTP accessor 扩展图片、音频、视频和 Office/EPUB/zip 文档类型识别；当 `HEAD` 不可靠时会在 `GET` 后用响应头重新判断。Word、PowerPoint、Excel、EPUB、legacy doc 等本地转换路径改为线程中执行，不再阻塞事件循环。
+- **Web Studio 随 Python 安装包分发**：`setup`/`build` 会构建并打包 Web Studio 静态资源，pip/pipx 安装后 `/studio` 可直接使用，无需 Docker。
+- **LiteLLM VLM 增加 NVIDIA NIM 路由**：模型名中包含 `nvidia_nim` 或 `nemotron` 时可自动走 NVIDIA NIM 的 LiteLLM 前缀和 `NVIDIA_NIM_API_KEY` 环境变量。
+- **tau2/VikingBot 评测升级**：新增 `benchmark/tau2/vikingbot` 端到端 runner，支持 cold start、train trajectory commit、test 多次平均和跨 epoch 自改进评测；原 tau2 LLM harness 移到 `benchmark/tau2/llm`。
+
+### 升级说明
+
+- OpenClaw 用户需要把旧的 `/memory-search` 和 `memory_search` 调用迁移到 `/ov-search` 与 `ov_search`。
+- pip/pipx 和 Docker 构建链路现在统一通过 Python build 流程产出 Web Studio bundle；本地开发若不希望构建 Studio，可使用 `OV_SKIP_STUDIO_BUILD=1` 跳过。
+- `content.read` 新增 `raw=true` 参数；默认行为仍会隐藏 memory 内部字段，兼容已有调用方。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.20...v0.3.21)
+
+## v0.3.20 (2026-05-25)
+
+### 重点更新
+
+- **请求级 HTTP profiling**：服务端新增 `server.profile_enabled` 开关。开启后，请求带 `profile=1` 时会对当前 HTTP 请求启用 `cProfile`，并在 JSON 响应中追加 `profile` 行数组。`ov` CLI 新增 `--profile` 入口并能保留、展示 profile 输出。
+- **批量 Session 消息写入**：新增 `POST /api/v1/sessions/{session_id}/messages/batch` 和 Python HTTP client / Session wrapper 的 `batch_add_messages`，一次请求最多写入 100 条消息，减少 LangChain/LangGraph 等集成连续写消息时的 HTTP 往返。
+- **记忆向量化输入模板**：记忆 schema 新增顶层 `embedding_template`，替代字段级 `searchable` 标记。默认的 `entities`、`events`、`preferences` 模板现在会把关键字段和正文一起用于 embedding，提高语义召回命中。
+- **语义索引与锁稳定性**：resource 处理会先把 temp source 同步到 target 后再执行语义 DAG，diff 结果使用 target URI；语义锁 handoff 失效时会尝试重新获取 tree lock，锁冲突类错误会重排队而不是误触发 API circuit breaker。
+- **Embedding 输入保护**：embedding 队列会按 `embedding.max_input_tokens` 截断输入，并把过大输入错误分类为 `input_too_large`，避免对不可恢复的大输入反复重试。
+
+### 升级说明
+
+- 自定义 memory schema 如果还在字段上使用 `searchable: true`，应迁移到顶层 `embedding_template`。字段级 `searchable` 已不再参与 embedding 文本生成。
+- 配置项 `memory.enable_role_id_memory_isolate` 已统一为 `memory.role_id_memory_isolation_enabled`，请更新自定义 `ov.conf`。
+- `profile=1` 是调试能力，不建议在高流量生产路径默认开启；返回内容最多保留约 16 KiB profile 文本。
+- 批量消息 API 单次最多接受 100 条消息。
+
+[完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.19...v0.3.20)
+
 ## v0.3.19 (2026-05-22)
 
 ### 重点更新
@@ -30,7 +273,7 @@ OpenViking 的所有重要变更都将记录在此文件中。
 - **Web Studio 成为默认 Console**：新增 `web-studio` 前端 console workspace，随 Docker 与 pip 分发并通过 `/studio` 提供服务；OAuth authorize UI 迁入 Web Studio，legacy console 下线，同时保留 favicon 兼容路由。
 - **MCP / API / CLI 自动化能力**：Watch Management 覆盖 REST、`ov` CLI 与 MCP；新增本地文件 progressive single-entrypoint upload；增加 `code_outline`、`code_search`、`code_expand` 代码导航工具，并修正 upload-only 与 zip `--ignore-dirs` 的作用域处理。
 - **Agent 与 OpenClaw 生态**：OpenClaw setup helper 支持 npm 插件安装，插件文档对齐 ClawHub package metadata，新增 `ov_dream` OpenClaw skill，并支持将过大的 OpenClaw tool result externalize 到 OpenViking。
-- **Memory 与检索**：升级 trajectory extraction，新增 memory link 能力，支持通过开关启用 Vaka memory templates，修复缺失 tool-call 计数和缺失 `role_id` 的检索问题，并行化 hierarchical child search。
+- **Memory 与检索**：升级 trajectory extraction，新增 memory link 能力，支持通过开关启用 Vaka memory templates，修复缺失 tool-call 计数和消息 peer 检索缺失问题，并行化 hierarchical child search。
 - **Storage、VectorDB 与模型链路稳定性**：存储锁与 IO 异步化，异步客户端按 event loop 隔离；修复 semantic lock ownership、`mv not found` 误报、URI remapping、S3 grep 性能、VectorDB Unicode recovery、超大 bytes row、embedding 错误透出和 VLM LiteLLM native routes 等问题。
 - **可观测性、文档与部署打磨**：新增 VikingBot feedback observability，集中化 metric registry，usage audit SQLite 迁入 system data，刷新 Helm chart 默认配置，更新品牌资产与二维码，并补齐 public base URL、signed upload TTL、Watch API、MCP code tools、ready 探针和 `/studio` 迁移文档。
 
@@ -53,11 +296,11 @@ OpenViking 的所有重要变更都将记录在此文件中。
 - **原生 CLI 分发**：新增 `@openviking/cli` npm 包，可通过 `npm i -g @openviking/cli` 使用 `ov`；Rust CLI 发布流水线扩展 Linux musl 构建、npm trusted publishing 和 CLI 集成测试。
 - **检索与文件系统能力**：`find` / `search` 新增 `level` 过滤，可限定 L0 abstract、L1 overview 或 L2 文件命中；资源文件增加 Phase 1 WebDAV 适配；`observer.filesystem` 暴露文件系统观测入口。
 - **Console 与 Usage/Audit**：新增 Usage/Audit 模块和 `/api/v1/console/*` BFF，基于现有 observability event bus 统计 token、检索次数、上下文提交热力图、请求审计和上下文库存。
-- **存储与并发可靠性**：增强精确路径锁和生命周期锁修复内容写入并发覆盖；阻塞后端调用移出 event loop；QueueFS SQLite 持久化扩展；`storage.task_tracker.backend` 新增 `persistent` 后端支持多实例 task 查询。
+- **存储与并发可靠性**：增强精确路径锁和生命周期锁修复内容写入并发覆盖；阻塞后端调用移出 event loop；QueueFS SQLite 持久化扩展；task 记录现在会持久化以支持多实例查询；Git 仓库 `add_resource(wait=false)` 会返回已预占的 `root_uri`，并在导入完成前提供持久化 task 进度。
 
 ### 升级说明
 
-- `storage.task_tracker.backend` 是新增配置。单实例部署可继续使用默认 `memory`；多实例或需要重启后查询 `task_id` 的部署可切换到 `persistent`。
+- `storage.task_tracker` 已废弃并会被忽略。Task 记录始终持久化到各账号的 `_system/tasks` 目录。
 - `vlm.backup` 只支持一层 backup，且只在 rate limit、`5xx`、连接失败和 timeout 等可重试错误上触发；认证、权限和计费类错误不会自动切换。
 - `vlm.extra_request_body` 会合并到 OpenAI SDK / LiteLLM 的 `extra_body`，适合接入 Ollama、OpenAI-compatible gateway 或其他需要额外 JSON 字段的 provider。
 - Codex 插件新部署建议使用 `OPENVIKING_*` 环境变量调优；旧的 `ov.conf` 中 `codex.*` 配置仍保留兼容，但不再推荐作为首选。
@@ -72,14 +315,14 @@ OpenViking 的所有重要变更都将记录在此文件中。
 - **可观测性**：OTLP 导出支持自定义 `headers`，覆盖 traces、logs、metrics 三条链路，便于直连需要额外鉴权头或 gRPC metadata 的观测后端。
 - **上传**：本地目录扫描和上传现在遵循根目录及子目录中的 `.gitignore` 规则，减少构建产物和临时文件被误导入。
 - **检索**：`search` / `find` 支持一次传入多个 target URI，适合跨目录、跨仓库范围检索。
-- **多租户**：OpenClaw 插件明确 `agent_prefix` 仅作为前缀使用；OpenCode memory plugin 补上 tenant headers 透传。
-- **管理**：新增 agent namespace 发现能力，服务端 API、CLI 和文档同步支持列出指定 account 下已有的 agent namespace。
+- **多租户**：OpenClaw 插件明确 `peer_prefix` 仅作为 peer metadata 使用；OpenCode memory plugin 补上 tenant headers 透传。
+- **管理**：废弃的 agent namespace 发现入口已删除。
 
 ### 升级说明
 
 - OTLP 后端接入可通过 `headers` 统一配置鉴权信息（gRPC 模式为 metadata，HTTP 模式为请求头）。
 - 本地目录上传默认遵循 `.gitignore` 规则，此前被导入的临时/生成文件升级后可能被自动过滤。
-- OpenClaw 插件 `agent_prefix` 仅表示前缀，文档中 `agentId` 已统一迁移为 `agent_prefix`。
+- OpenClaw 插件运行时身份通过 `peer_prefix` peer metadata 表达，不再对应 OpenViking agent namespace。
 
 [完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.13...v0.3.14)
 
@@ -98,7 +341,7 @@ OpenViking 的所有重要变更都将记录在此文件中。
 ### 升级说明
 
 - `encryption.api_key_hashing.enabled` 需要显式配置（默认 `false`）。如依赖旧的隐式哈希行为，需手动开启。
-- OpenClaw 插件仅保留远程模式，不再启动本地子进程；`agentId` → `agent_prefix`，`recallTokenBudget` → `recallMaxInjectedChars`。
+- OpenClaw 插件仅保留远程模式，不再启动本地子进程；运行时 agent 身份迁移为 peer metadata，`recallTokenBudget` → `recallMaxInjectedChars`。
 
 [完整变更记录](https://github.com/volcengine/OpenViking/compare/v0.3.12...v0.3.13)
 
@@ -130,7 +373,7 @@ OpenViking 的所有重要变更都将记录在此文件中。
 - 调整 `recallTokenBudget` 和 `recallMaxContentChars` 默认值，降低 OpenClaw 自动召回注入过长上下文的风险。
 - `ov add-memory` 在异步 commit 场景下返回 `OK`，避免误判后台任务仍在执行时的状态。
 - `ov chat` 会从 `ovcli.conf` 读取鉴权配置并自动发送必要请求头。
-- OpenClaw 插件默认远端连接行为、鉴权、namespace 和 `role_id` 处理更贴合服务端多租户模型。
+- OpenClaw 插件默认远端连接行为、鉴权、namespace 和 `peer_id` 处理更贴合服务端多租户模型。
 
 ### 修复
 
@@ -173,7 +416,7 @@ Memory V2 现在作为默认记忆管线，采用全新格式、重构的抽取�
 ### 升级提示
 
 - 如果你经常通过 CLI 导入目录资源，建议在 `ovcli.conf` 中配置 `upload.ignore_dirs`。
-- 旧行为可通过 `"memory": { "version": "v1" }` 回退。
+- 旧版 memory v1 已移除；记忆抽取现在仅使用 v2。
 - `ov init` / `ov doctor` 请改用 `openviking-server init` / `openviking-server doctor`。
 - OpenRouter 或其他 OpenAI 兼容 rerank/VLM 服务可通过 `extra_headers` 注入平台要求的 Header。
 - S3 兼容实现批量删除有兼容问题时，可开启 `storage.agfs.s3.disable_batch_delete`。
@@ -338,7 +581,7 @@ LiteLLM 相关能力会暂时不可用，直到上游给出可信的修复版本
 
 ### 重点更新
 
-- OpenClaw 插件升级到 2.0（context engine），新增 OpenCode memory plugin，多智能体 memory isolation 基于 `agentId`。
+- OpenClaw 插件升级到 2.0（context engine），新增 OpenCode memory plugin，多智能体 memory isolation 基于 peer metadata。
 - Memory 冷热分层 archival 和 hotness scoring、长记忆 chunked vectorization、`used()` 使用追踪接口。
 - 分层检索集成 rerank、RetrievalObserver 检索质量观测。
 - 资源 watch scheduling、reindex endpoint、legacy `.doc`/`.xls` 解析支持、path locking 和 crash recovery。

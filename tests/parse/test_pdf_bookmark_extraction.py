@@ -8,6 +8,7 @@ and that _convert_local injects them as markdown headings.
 """
 
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +50,43 @@ class _FakePDFObjectRef:
 
 def _make_image_page(xobjects):
     return SimpleNamespace(page_obj=SimpleNamespace(resources={"XObject": xobjects}))
+
+
+class _FakeRenderedImage:
+    """Minimal rendered image stub that writes deterministic PNG bytes."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def save(self, buffer, format: str):
+        assert format == "PNG"
+        buffer.write(self._data)
+
+
+class _FakeCroppedPage:
+    """Minimal cropped page stub for image extraction tests."""
+
+    def __init__(self, rendered_image: _FakeRenderedImage):
+        self._rendered_image = rendered_image
+        self.resolution_calls = []
+
+    def to_image(self, resolution: int):
+        self.resolution_calls.append(resolution)
+        return self._rendered_image
+
+
+class _FakeImagePage:
+    """Minimal pdfplumber page stub for _extract_image_from_page tests."""
+
+    def __init__(self, *, width: int = 100, height: int = 200, image_bytes: bytes = b"png-bytes"):
+        self.width = width
+        self.height = height
+        self.crop_calls = []
+        self.cropped_page = _FakeCroppedPage(_FakeRenderedImage(image_bytes))
+
+    def crop(self, bbox):
+        self.crop_calls.append(bbox)
+        return self.cropped_page
 
 
 class _FakePage:
@@ -293,6 +331,106 @@ class TestConvertLocalBookmarks:
         assert meta["heading_source"] == "font_analysis"
 
     @pytest.mark.asyncio
+    async def test_convert_local_skips_images_stacked_on_same_bbox(self):
+        """Two image XObjects at the same spot must render (and save) only once."""
+        parser = PDFParser()
+        stacked = {"x0": 0.0, "top": 0.1, "x1": 595.0, "bottom": 841.9}
+        page = _FakePage("Page one")
+        page.images = [dict(stacked), dict(stacked)]
+        fake_pdf = SimpleNamespace(pages=[page])
+        fake_pdfplumber = SimpleNamespace(open=lambda _path: nullcontext(fake_pdf))
+        storage = MagicMock()
+        storage.save_image.return_value = Path("/media/dummy/images/page1_img1.png")
+        storage.media_dir = Path("/media")
+
+        with (
+            patch("openviking.parse.parsers.pdf.lazy_import", return_value=fake_pdfplumber),
+            patch.object(parser, "_extract_bookmarks", return_value=[]),
+            patch.object(parser, "_detect_headings_by_font", return_value=[]),
+            patch.object(parser, "_extract_image_from_page", return_value=b"png") as extract,
+        ):
+            markdown, meta = await parser._convert_local(
+                "dummy.pdf", storage=storage, resource_name="dummy"
+            )
+
+        # The duplicate is dropped before rendering, so it never costs a render.
+        assert extract.call_count == 1
+        assert storage.save_image.call_count == 1
+        assert meta["images_extracted"] == 1
+        assert meta["images_deduplicated"] == 1
+        assert markdown.count("![Page 1 Image") == 1
+
+    @pytest.mark.asyncio
+    async def test_convert_local_skips_images_rendering_to_same_bytes(self):
+        """Distinct bboxes that still render identically are caught by the hash."""
+        parser = PDFParser()
+        page = _FakePage("Page one")
+        page.images = [
+            {"x0": 0.0, "top": 0.0, "x1": 100.0, "bottom": 100.0},
+            {"x0": 5.0, "top": 5.0, "x1": 105.0, "bottom": 105.0},
+        ]
+        fake_pdf = SimpleNamespace(pages=[page])
+        fake_pdfplumber = SimpleNamespace(open=lambda _path: nullcontext(fake_pdf))
+        storage = MagicMock()
+        storage.save_image.return_value = Path("/media/dummy/images/page1_img1.png")
+        storage.media_dir = Path("/media")
+
+        with (
+            patch("openviking.parse.parsers.pdf.lazy_import", return_value=fake_pdfplumber),
+            patch.object(parser, "_extract_bookmarks", return_value=[]),
+            patch.object(parser, "_detect_headings_by_font", return_value=[]),
+            patch.object(parser, "_extract_image_from_page", return_value=b"png") as extract,
+        ):
+            _markdown, meta = await parser._convert_local(
+                "dummy.pdf", storage=storage, resource_name="dummy"
+            )
+
+        # Both are rendered (bboxes differ), but only one is saved.
+        assert extract.call_count == 2
+        assert storage.save_image.call_count == 1
+        assert meta["images_extracted"] == 1
+        assert meta["images_deduplicated"] == 1
+
+    @pytest.mark.asyncio
+    async def test_convert_local_keeps_distinct_images_and_repeats_across_pages(self):
+        """Dedup is per-page: a logo on every page survives on every page."""
+        parser = PDFParser()
+        logo = {"x0": 0.0, "top": 0.0, "x1": 50.0, "bottom": 50.0}
+        figure = {"x0": 0.0, "top": 200.0, "x1": 300.0, "bottom": 400.0}
+        page1, page2 = _FakePage("Page one"), _FakePage("Page two")
+        page1.images = [dict(logo), dict(figure)]
+        page2.images = [dict(logo)]
+        fake_pdf = SimpleNamespace(pages=[page1, page2])
+        fake_pdfplumber = SimpleNamespace(open=lambda _path: nullcontext(fake_pdf))
+        storage = MagicMock()
+        storage.save_image.return_value = Path("/media/dummy/images/img.png")
+        storage.media_dir = Path("/media")
+
+        renders = {
+            (0.0, 0.0, 50.0, 50.0): b"logo-png",
+            (0.0, 200.0, 300.0, 400.0): b"figure-png",
+        }
+
+        with (
+            patch("openviking.parse.parsers.pdf.lazy_import", return_value=fake_pdfplumber),
+            patch.object(parser, "_extract_bookmarks", return_value=[]),
+            patch.object(parser, "_detect_headings_by_font", return_value=[]),
+            patch.object(
+                parser,
+                "_extract_image_from_page",
+                side_effect=lambda _page, img: renders[
+                    (img["x0"], img["top"], img["x1"], img["bottom"])
+                ],
+            ),
+        ):
+            _markdown, meta = await parser._convert_local(
+                "dummy.pdf", storage=storage, resource_name="dummy"
+            )
+
+        assert meta["images_extracted"] == 3
+        assert meta["images_deduplicated"] == 0
+
+    @pytest.mark.asyncio
     async def test_convert_local_closes_page_after_each_page(self):
         parser = PDFParser()
         pages = [_FakePage("Page one"), _FakePage("Page two")]
@@ -350,39 +488,48 @@ class TestExtractImages:
     def setup_method(self):
         self.parser = PDFParser()
 
-    def test_extract_image_reads_resolved_pdfstream_data(self):
-        page = _make_image_page(
-            {
-                "Im1": _FakePDFObjectRef(_FakePDFStream(b"first-image")),
-            }
+    def test_extract_image_renders_cropped_bbox_as_png(self):
+        page = _FakeImagePage(image_bytes=b"rendered-png")
+
+        image_data = self.parser._extract_image_from_page(
+            page,
+            {"x0": 10, "top": 20, "x1": 40, "bottom": 60},
         )
 
-        assert self.parser._extract_image_from_page(page, {"name": "Im1"}) == b"first-image"
+        assert image_data == b"rendered-png"
+        assert page.crop_calls == [(10, 20, 40, 60)]
+        assert page.cropped_page.resolution_calls == [self.parser.config.image_resolution]
 
-    def test_extract_image_matches_requested_xobject_name(self):
-        page = _make_image_page(
-            {
-                "Im1": _FakePDFObjectRef(_FakePDFStream(b"first-image")),
-                "Im2": _FakePDFObjectRef(_FakePDFStream(b"second-image")),
-            }
+    def test_extract_image_clamps_bbox_to_page_bounds(self):
+        page = _FakeImagePage()
+
+        self.parser._extract_image_from_page(
+            page,
+            {"x0": -5, "top": -10, "x1": 150, "bottom": 250},
         )
 
-        assert self.parser._extract_image_from_page(page, {"name": "Im2"}) == b"second-image"
+        assert page.crop_calls == [(0, 0, page.width, page.height)]
 
-    def test_extract_image_allows_leading_slash_name_variants(self):
-        page = _make_image_page(
-            {
-                "/Im1": _FakePDFObjectRef(_FakePDFStream(b"slash-image")),
-            }
+    def test_extract_image_returns_none_for_zero_area_bbox(self):
+        page = _FakeImagePage()
+
+        assert (
+            self.parser._extract_image_from_page(
+                page,
+                {"x0": 30, "top": 40, "x1": 30, "bottom": 60},
+            )
+            is None
         )
+        assert page.crop_calls == []
 
-        assert self.parser._extract_image_from_page(page, {"name": "Im1"}) == b"slash-image"
+    def test_extract_image_returns_none_when_crop_fails(self):
+        page = MagicMock(width=100, height=200)
+        page.crop.side_effect = RuntimeError("crop failed")
 
-    def test_extract_image_returns_none_for_non_image_xobject(self):
-        page = _make_image_page(
-            {
-                "Form1": _FakePDFObjectRef(_FakePDFStream(b"form-data", subtype="Form")),
-            }
+        assert (
+            self.parser._extract_image_from_page(
+                page,
+                {"x0": 10, "top": 20, "x1": 40, "bottom": 60},
+            )
+            is None
         )
-
-        assert self.parser._extract_image_from_page(page, {"name": "Form1"}) is None

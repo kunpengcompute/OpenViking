@@ -5,7 +5,6 @@ Tests for JSON stable parsing utilities.
 """
 
 import json
-import logging
 from typing import List, Optional
 from unittest.mock import patch
 
@@ -18,7 +17,6 @@ from openviking.session.memory.utils import (
     extract_json_content,
     parse_json_with_stability,
     parse_memory_file_with_fields,
-    remove_json_trailing_content,
     value_fault_tolerance,
 )
 
@@ -77,19 +75,6 @@ Trailing content."""
         """Test empty string input returns empty string."""
         assert extract_json_content("") == ""
         assert extract_json_content("   ") == "   "
-
-
-class TestRemoveJsonTrailingContent:
-    """Tests for deprecated remove_json_trailing_content (alias for extract_json_content)."""
-
-    def test_alias_works(self):
-        """Test that remove_json_trailing_content is an alias for extract_json_content."""
-        content = """Alright, let's see.
-{"reasonning": "test"}
-And then some."""
-        result1 = extract_json_content(content)
-        result2 = remove_json_trailing_content(content)
-        assert result1 == result2
 
 
 class TestValueFaultTolerance:
@@ -180,6 +165,35 @@ class TestParseJsonWithStability:
         assert error is None
         assert data.reasonning == "test"
 
+    def test_handles_empty_list_for_operations_model(self):
+        """A bare [] from the operations model (opted in via _allow_empty_list_response)
+        is a valid 'no operations' outcome: mapped to an empty object, not an error."""
+
+        class OperationsLike(BaseModel):
+            reasonning: str = ""
+            tags: List[str] = Field(default_factory=list)
+
+        OperationsLike._allow_empty_list_response = True
+
+        data, error = parse_json_with_stability("[]", model_class=OperationsLike)
+        assert error is None
+        assert data.tags == []
+
+    def test_empty_list_fails_loud_without_opt_in(self):
+        """A bare [] for any model that has NOT opted in stays fail-loud, even if it
+        happens to expose an is_empty() convenience method."""
+
+        class HasIsEmptyButNotOptedIn(BaseModel):
+            tags: List[str] = Field(default_factory=list)
+
+            def is_empty(self) -> bool:
+                return not self.tags
+
+        for model in (self.TestModel, HasIsEmptyButNotOptedIn):
+            data, error = parse_json_with_stability("[]", model_class=model)
+            assert data is None
+            assert error is not None
+
     def test_filters_extra_fields(self):
         """Test extra fields are filtered when expected_fields is provided."""
         content = '{"reasonning": "test", "extra_field": "should be filtered", "count": 42}'
@@ -259,7 +273,7 @@ class TestMemoryOperationsIntegration:
         write_uris: List["TestMemoryOperationsIntegration.SimpleWriteOperation"] = Field(
             default_factory=list
         )
-        delete_uris: List[str] = Field(default_factory=list)
+        delete_ids: List[str] = Field(default_factory=list)
 
     def test_parses_nested_write_operations(self):
         """Test nested write operations parse correctly."""
@@ -277,16 +291,16 @@ class TestMemoryOperationsIntegration:
         assert data.write_uris[0].topic == "theme"
 
     def test_handles_string_instead_of_list_for_delete(self):
-        """Test single string for delete_uris wraps to list via tolerance."""
+        """Test single string for delete_ids wraps to list via tolerance."""
         # Note: This would need field-level tolerance applied
         content = """{
             "reasonning": "Removed old memory",
-            "delete_uris": "viking://user/default/memories/old.md"
+            "delete_ids": "viking://user/default/memories/old.md"
         }"""
         # First parse as raw dict
         data, error = parse_json_with_stability(content)
         assert error is None
-        assert data["delete_uris"] == "viking://user/default/memories/old.md"
+        assert data["delete_ids"] == "viking://user/default/memories/old.md"
 
     def test_recoverable_invalid_list_item_logs_below_error(self):
         """Test recoverable invalid list items do not emit error-level logs."""
@@ -363,7 +377,9 @@ class TestMemoryOperationsIntegration:
             }
         )
 
-        with patch("openviking.session.memory.utils.json_parser.logger.exception") as mock_exception:
+        with patch(
+            "openviking.session.memory.utils.json_parser.logger.exception"
+        ) as mock_exception:
             data, error = parse_json_with_stability(content, model_class=PreferenceOperations)
 
         assert error is None

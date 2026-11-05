@@ -1,9 +1,9 @@
 memory_type: skills
 description: |
   Record all skills uses，
-directory: "viking://agent/{{ agent_space }}/memories/skills"
+directory: "viking://user/{{ user_space }}/memories/skills"
 filename_template: "{{ skill_name }}.md"
-enabled: true
+enabled: false
 content_template: |
   Skill: {{ skill_name }}
   

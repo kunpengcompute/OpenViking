@@ -24,18 +24,7 @@ export type ConsoleRetrievalCounts = {
   total?: number
 }
 
-export type ConsoleAgentVisit = {
-  agent_id?: string
-  last_seen_at?: string
-}
-
-export type ConsoleAgentOverview = {
-  items?: ConsoleAgentVisit[]
-  total?: number
-}
-
 export type ConsoleDashboardSummaryResult = OvMaybeDisabled & {
-  agent_overview?: ConsoleAgentOverview
   context_counts?: ConsoleContextCounts
   today_retrievals?: ConsoleRetrievalCounts
   today_tokens?: ConsoleTokenCounts
@@ -85,10 +74,12 @@ export type ConsoleContextCommitsResult = ConsoleSeriesResult<ConsoleContextComm
 
 export type ConsoleAuditLogItem = {
   account_id?: string | null
-  agent_id?: string | null
   api_type?: string
   created_at?: string
   duration_ms?: number
+  error_code?: string | null
+  error_details?: Record<string, unknown> | null
+  error_message?: string | null
   method?: string
   request_id?: string | null
   route?: string

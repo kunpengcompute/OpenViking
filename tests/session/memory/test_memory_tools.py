@@ -6,15 +6,15 @@ Tests for memory tools.
 
 import pytest
 
-from openviking.session.memory.dataclass import MemoryFile
 from openviking.server.identity import RequestContext, Role, ToolContext
+from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.tools import (
     MEMORY_TOOLS_REGISTRY,
     MemoryLsTool,
     MemoryReadTool,
     MemorySearchTool,
     get_tool,
-    get_tool_schemas,
+    memory_maintenance_notice,
 )
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -45,7 +45,7 @@ class TestMemoryTools:
                     "Gina values [emotional support](../../events/2023/03/23/mutual_business_support.md) "
                     "with Jon.\n\n"
                     "<!-- MEMORY_FIELDS\n"
-                    "{\"memory_type\": \"experiences\"}\n"
+                    '{"memory_type": "experiences"}\n'
                     "-->"
                 )
 
@@ -105,6 +105,27 @@ class TestMemoryTools:
 
         assert called is True
         assert result["content"] == "1\tGina values emotional support with Jon."
+        assert "memory_maintenance_notice" not in result
+
+    def test_memory_maintenance_notice_is_conditional_and_explains_two_strategies(self):
+        assert memory_maintenance_notice("abcd", review_after_tokens=1) is None
+
+        notice = memory_maintenance_notice("abcde", review_after_tokens=1)
+
+        assert notice["maintenance_required"] is True
+        assert set(notice) == {"maintenance_required", "guidance"}
+        guidance = notice["guidance"]
+        assert "estimated at 2 tokens" in guidance
+        assert "above the 1-token readability target" in guidance
+        assert "maintenance is required" in guidance
+        assert "do not leave it as one broad oversized memory" in guidance
+        assert "split different behavioral choice dimensions" in guidance
+        assert "never invent multiple identities for one object" in guidance
+        assert "compact only duplicate wording" in guidance.lower()
+        assert "fact integrity takes priority" in guidance
+        assert "Preserve every distinct valid fact exactly once" in guidance
+        assert "only after every fact has one clear destination" in guidance
+        assert "Delete or replace the oversized source" in guidance
 
     @pytest.mark.asyncio
     async def test_read_tool_uses_offset_and_limit_for_visible_content(self):
@@ -114,7 +135,9 @@ class TestMemoryTools:
 
         class MockVikingFS:
             async def read_file(self, uri, ctx=None, **kwargs):
-                return "line1\nline2\nline3\n\n<!-- MEMORY_FIELDS\n{\"memory_type\": \"experiences\"}\n-->"
+                return (
+                    'line1\nline2\nline3\n\n<!-- MEMORY_FIELDS\n{"memory_type": "experiences"}\n-->'
+                )
 
         tool_ctx = ToolContext(
             viking_fs=MockVikingFS(),
@@ -142,7 +165,7 @@ class TestMemoryTools:
 
         class MockVikingFS:
             async def read_file(self, uri, ctx=None, **kwargs):
-                return "line1\nline2\n\n<!-- MEMORY_FIELDS\n{\"memory_type\": \"experiences\"}\n-->"
+                return 'line1\nline2\n\n<!-- MEMORY_FIELDS\n{"memory_type": "experiences"}\n-->'
 
         tool_ctx = ToolContext(
             viking_fs=MockVikingFS(),
@@ -199,14 +222,12 @@ class TestMemoryTools:
                 self.received_ctx = ctx
                 self.received_target_uri = target_uri
                 self.received_limit = limit
-                _ = ctx.namespace_policy
                 return MockSearchResult()
 
         request_ctx = RequestContext(
             user=UserIdentifier(
                 account_id="test-account",
                 user_id="test-user",
-                agent_id="test-agent",
             ),
             role=Role.USER,
         )
@@ -261,9 +282,3 @@ class TestMemoryTools:
         read_tool = get_tool("read")
         assert read_tool is not None
         assert isinstance(read_tool, MemoryReadTool)
-
-        # Check get_tool_schemas
-        schemas = get_tool_schemas()
-        schema_names = [s["function"]["name"] for s in schemas]
-        assert "read" in schema_names
-        assert all(name in MEMORY_TOOLS_REGISTRY for name in schema_names)

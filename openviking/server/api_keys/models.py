@@ -5,7 +5,20 @@
 from dataclasses import dataclass, field
 from typing import Dict
 
-from openviking.server.identity import AccountNamespacePolicy, Role
+from openviking.server.identity import Role
+from openviking_cli.exceptions import InvalidArgumentError, PermissionDeniedError
+
+
+def validate_account_user_role(role: str) -> Role:
+    """Account users may be USER or ADMIN; ROOT is the configured server identity."""
+    resolved_role = Role(role)
+    if resolved_role == Role.ROOT:
+        raise PermissionDeniedError(
+            "Account users cannot be assigned ROOT; use server.root_api_key for ROOT access."
+        )
+    if resolved_role not in (Role.USER, Role.ADMIN):
+        raise InvalidArgumentError("Account user role must be user or admin.")
+    return resolved_role
 
 
 @dataclass
@@ -25,4 +38,6 @@ class AccountInfo:
 
     created_at: str
     users: Dict[str, dict] = field(default_factory=dict)
-    namespace_policy: AccountNamespacePolicy = field(default_factory=AccountNamespacePolicy)
+    groups: Dict[str, dict] = field(default_factory=dict)
+    groups_loaded: bool = True
+    deletion: dict | None = None

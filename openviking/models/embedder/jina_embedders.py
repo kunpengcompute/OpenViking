@@ -30,6 +30,11 @@ DEFAULT_JINA_CODE_DOCUMENT_TASK = "nl2code.passage"
 _UNSET = object()
 
 
+def get_jina_model_default_dimension(model_name: Optional[str]) -> int:
+    """Get the default (maximum) output dimension for a Jina embedding model."""
+    return JINA_MODEL_DIMENSIONS.get(model_name or "", 1024)
+
+
 def _get_default_task_params(model_name: str) -> tuple[str, str]:
     """Return the default Jina task names for the selected model."""
     if model_name.startswith("jina-code-embeddings-"):
@@ -125,7 +130,7 @@ class JinaDenseEmbedder(DenseEmbedderBase):
         self._async_client_cache = LoopScopedAsyncClientCache()
 
         # Determine dimension
-        max_dim = JINA_MODEL_DIMENSIONS.get(model_name, 1024)
+        max_dim = get_jina_model_default_dimension(model_name)
         if dimension is not None and dimension > max_dim:
             raise ValueError(
                 f"Requested dimension {dimension} exceeds maximum {max_dim} for model '{model_name}'. "
@@ -243,82 +248,6 @@ class JinaDenseEmbedder(DenseEmbedderBase):
             raise RuntimeError(f"Jina API error: {e.message}") from e
         except Exception as e:
             raise RuntimeError(f"Embedding failed: {str(e)}") from e
-
-    def embed_batch(self, texts: List[str], is_query: bool = False) -> List[EmbedResult]:
-        """Batch embedding (Jina native support)
-
-        Args:
-            texts: List of texts
-            is_query: Flag to indicate if these are query embeddings
-
-        Returns:
-            List[EmbedResult]: List of embedding results
-
-        Raises:
-            RuntimeError: When API call fails
-        """
-        if not texts:
-            return []
-
-        def _call() -> List[EmbedResult]:
-            response = self.client.embeddings.create(**self._build_kwargs(texts, is_query=is_query))
-
-            return [EmbedResult(dense_vector=item.embedding) for item in response.data]
-
-        try:
-            results = self._run_with_retry(
-                _call,
-                logger=logger,
-                operation_name="Jina batch embedding",
-            )
-            # Estimate token usage for batch
-            total_tokens = sum(self._estimate_tokens(text) for text in texts)
-            self.update_token_usage(
-                model_name=self.model_name,
-                provider="jina",
-                prompt_tokens=total_tokens,
-                completion_tokens=0,
-            )
-            return results
-        except openai.APIError as e:
-            self._raise_task_error(e)
-            raise RuntimeError(f"Jina API error: {e.message}") from e
-        except Exception as e:
-            raise RuntimeError(f"Batch embedding failed: {str(e)}") from e
-
-    async def embed_batch_async(
-        self, texts: List[str], is_query: bool = False
-    ) -> List[EmbedResult]:
-        if not texts:
-            return []
-
-        client = self._get_async_client()
-
-        async def _call() -> List[EmbedResult]:
-            response = await client.embeddings.create(
-                **self._build_kwargs(texts, is_query=is_query)
-            )
-            return [EmbedResult(dense_vector=item.embedding) for item in response.data]
-
-        try:
-            results = await self._run_with_async_retry(
-                _call,
-                logger=logger,
-                operation_name="Jina async batch embedding",
-            )
-            total_tokens = sum(self._estimate_tokens(text) for text in texts)
-            self.update_token_usage(
-                model_name=self.model_name,
-                provider="jina",
-                prompt_tokens=total_tokens,
-                completion_tokens=0,
-            )
-            return results
-        except openai.APIError as e:
-            self._raise_task_error(e)
-            raise RuntimeError(f"Jina API error: {e.message}") from e
-        except Exception as e:
-            raise RuntimeError(f"Batch embedding failed: {str(e)}") from e
 
     def get_dimension(self) -> int:
         """Get embedding dimension

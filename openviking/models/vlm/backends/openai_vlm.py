@@ -4,13 +4,22 @@
 
 import base64
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
+import httpx
+
+from openviking.models.network import (
+    create_optional_async_httpx_client,
+    create_optional_sync_httpx_client,
+)
 from openviking.telemetry import tracer
 from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
+from openviking.utils.message_format import format_messages, sanitize_openai_messages
+from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
 try:
@@ -32,18 +41,9 @@ _DASHSCOPE_HOSTS = {
 }
 
 
-_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
-
-
-def _is_reasoning_model(model: Optional[str]) -> bool:
-    """OpenAI reasoning-model families reject `max_tokens` and non-default `temperature`.
-
-    They require `max_completion_tokens` and only accept `temperature=1` (server default).
-    """
-    if not model:
-        return False
-    name = model.lower()
-    return any(name.startswith(p) for p in _REASONING_MODEL_PREFIXES)
+# These names select existing OpenAI request defaults, not general reasoning capability.
+# gpt-5 and later generations (gpt-6, gpt-7, ...) share the o-series request contract.
+_OPENAI_REASONING_MODEL_PATTERN = re.compile(r"(?:gpt-(?:[5-9]|[1-9]\d)|o[134])")
 
 
 def _build_openai_client_kwargs(
@@ -52,7 +52,7 @@ def _build_openai_client_kwargs(
     api_base: str,
     api_version: str | None,
     extra_headers: Dict[str, str] | None,
-    timeout: float = 60.0,
+    timeout: float = 600.0,
 ) -> Dict[str, Any]:
     """Build kwargs dict shared by sync and async OpenAI/Azure client constructors."""
     if provider == "azure":
@@ -82,7 +82,19 @@ class OpenAIVLM(VLMBase):
         self._sync_client = None
         self._async_client_cache = LoopScopedAsyncClientCache()
         self.api_version = config.get("api_version")
-        self.reasoning_effort = config.get("reasoning_effort", "low")
+        self.reasoning_effort = config.get("reasoning_effort")
+        self.keepalive_expiry = config.get("keepalive_expiry")
+
+    def _http_client_kwargs(self) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"timeout": self.timeout}
+        if self.keepalive_expiry is not None:
+            defaults = openai.DEFAULT_CONNECTION_LIMITS
+            kwargs["limits"] = httpx.Limits(
+                max_connections=defaults.max_connections,
+                max_keepalive_connections=defaults.max_keepalive_connections,
+                keepalive_expiry=self.keepalive_expiry,
+            )
+        return kwargs
 
     def get_client(self):
         """Get sync client"""
@@ -97,6 +109,16 @@ class OpenAIVLM(VLMBase):
                 self.extra_headers,
                 self.timeout,
             )
+            http_kwargs = self._http_client_kwargs()
+            http_client = create_optional_sync_httpx_client(
+                self.api_base,
+                client_cls=openai.DefaultHttpxClient,
+                **http_kwargs,
+            )
+            if http_client is None and self.keepalive_expiry is not None:
+                http_client = openai.DefaultHttpxClient(**http_kwargs)
+            if http_client is not None:
+                kwargs["http_client"] = http_client
             if self.provider == "azure":
                 self._sync_client = openai.AzureOpenAI(**kwargs)
             else:
@@ -115,6 +137,16 @@ class OpenAIVLM(VLMBase):
             self.extra_headers,
             self.timeout,
         )
+        http_kwargs = self._http_client_kwargs()
+        http_client = create_optional_async_httpx_client(
+            self.api_base,
+            client_cls=openai.DefaultAsyncHttpxClient,
+            **http_kwargs,
+        )
+        if http_client is None and self.keepalive_expiry is not None:
+            http_client = openai.DefaultAsyncHttpxClient(**http_kwargs)
+        if http_client is not None:
+            kwargs["http_client"] = http_client
         if self.provider == "azure":
             return openai.AsyncAzureOpenAI(**kwargs)
         return openai.AsyncOpenAI(**kwargs)
@@ -122,6 +154,12 @@ class OpenAIVLM(VLMBase):
     def get_async_client(self):
         """Get an async client scoped to the current event loop."""
         return self._async_client_cache.get(self._build_async_client)
+
+    def close(self) -> None:
+        """Close clients and HTTP transports owned by this backend."""
+        if self._sync_client is not None:
+            self._sync_client.close()
+        self._async_client_cache.close_all_with_close()
 
     def _supports_enable_thinking(self) -> bool:
         """Return True for OpenAI-compatible DashScope endpoints that accept enable_thinking."""
@@ -141,8 +179,23 @@ class OpenAIVLM(VLMBase):
 
         return host.lower() in _DASHSCOPE_HOSTS
 
-    def _apply_provider_specific_extra_body(self, kwargs: Dict[str, Any], thinking: bool) -> None:
-        """Attach provider-specific raw body parameters understood by compatible APIs."""
+    def _apply_completion_params(
+        self, kwargs: Dict[str, Any], thinking: bool, max_tokens: Optional[int] = None
+    ) -> None:
+        """Apply model defaults, explicit settings, and provider-specific body fields."""
+        if _OPENAI_REASONING_MODEL_PATTERN.match(kwargs["model"].lower()):
+            max_tokens_param = "max_completion_tokens"
+            kwargs["reasoning_effort"] = "low"
+        else:
+            max_tokens_param = "max_tokens"
+            kwargs["temperature"] = self.temperature
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if effective_max_tokens is not None:
+            kwargs[max_tokens_param] = effective_max_tokens
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+
         extra_body = dict(self.extra_request_body)
         if self._supports_enable_thinking():
             extra_body["enable_thinking"] = bool(thinking)
@@ -158,12 +211,20 @@ class OpenAIVLM(VLMBase):
             tracer.info(f"response.usage={response.usage}")
             prompt_tokens = response.usage.prompt_tokens
             completion_tokens = response.usage.completion_tokens
+            prompt_tokens_details = getattr(response.usage, "prompt_tokens_details", None)
+            completion_tokens_details = getattr(response.usage, "completion_tokens_details", None)
+            prompt_cached_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+            completion_reasoning_tokens = (
+                getattr(completion_tokens_details, "reasoning_tokens", 0) or 0
+            )
             self.update_token_usage(
                 model_name=self.model or "gpt-4o-mini",
                 provider=self.provider,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 duration_seconds=duration_seconds,
+                prompt_cached_tokens=prompt_cached_tokens,
+                completion_reasoning_tokens=completion_reasoning_tokens,
             )
         return
 
@@ -183,6 +244,9 @@ class OpenAIVLM(VLMBase):
 
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from OpenAI response. Returns str or VLMResponse based on has_tools."""
+        if isinstance(response, str):
+            return VLMResponse(content=response) if has_tools else response
+
         choice = response.choices[0]
         message = choice.message
         tracer.info(f"result={message.content}")
@@ -211,22 +275,18 @@ class OpenAIVLM(VLMBase):
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         thinking: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         effective_thinking = self.thinking if thinking is None else thinking
-        kwargs_messages = messages or [{"role": "user", "content": prompt}]
+        kwargs_messages = sanitize_openai_messages(
+            messages or [{"role": "user", "content": prompt}]
+        )
         model = self.model or "gpt-4o-mini"
-        is_reasoning = _is_reasoning_model(model)
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": kwargs_messages,
         }
-        if is_reasoning:
-            kwargs["reasoning_effort"] = self.reasoning_effort
-        else:
-            kwargs["temperature"] = self.temperature
-        self._apply_provider_specific_extra_body(kwargs, effective_thinking)
-        max_tokens = self.max_tokens or 32768
-        kwargs["max_completion_tokens" if is_reasoning else "max_tokens"] = max_tokens
+        self._apply_completion_params(kwargs, effective_thinking, max_tokens=max_tokens)
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -243,28 +303,21 @@ class OpenAIVLM(VLMBase):
     ) -> Dict[str, Any]:
         effective_thinking = self.thinking if thinking is None else thinking
         if messages:
-            kwargs_messages = messages
+            kwargs_messages = sanitize_openai_messages(messages)
         else:
             content = []
             if images:
                 content.extend(self._prepare_image(img) for img in images)
             if prompt:
                 content.append({"type": "text", "text": prompt})
-            kwargs_messages = [{"role": "user", "content": content}]
+            kwargs_messages = sanitize_openai_messages([{"role": "user", "content": content}])
 
         model = self.model or "gpt-4o-mini"
-        is_reasoning = _is_reasoning_model(model)
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": kwargs_messages,
         }
-        if is_reasoning:
-            kwargs["reasoning_effort"] = self.reasoning_effort
-        else:
-            kwargs["temperature"] = self.temperature
-        self._apply_provider_specific_extra_body(kwargs, effective_thinking)
-        max_tokens = self.max_tokens or 32768
-        kwargs["max_completion_tokens" if is_reasoning else "max_tokens"] = max_tokens
+        self._apply_completion_params(kwargs, effective_thinking)
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -297,7 +350,7 @@ class OpenAIVLM(VLMBase):
             t0 = time.perf_counter()
             response = client.chat.completions.create(**kwargs)
             elapsed = time.perf_counter() - t0
-            if tools:
+            if tools is not None:
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
                 return self._build_vlm_response(response, has_tools=True)
             return self._extract_completion_content(response, elapsed)
@@ -309,7 +362,6 @@ class OpenAIVLM(VLMBase):
             operation_name="OpenAI VLM completion",
         )
 
-    @tracer("openai.vlm.call", ignore_result=True, ignore_args=["messages"])
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -317,23 +369,29 @@ class OpenAIVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously"""
         effective_thinking = self.thinking if thinking is None else thinking
         client = self.get_async_client()
-        kwargs = self._build_text_kwargs(prompt, tools, tool_choice, messages, effective_thinking)
+        kwargs = self._build_text_kwargs(
+            prompt, tools, tool_choice, messages, effective_thinking, max_tokens=max_tokens
+        )
 
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()
             response = await client.chat.completions.create(**kwargs)
             elapsed = time.perf_counter() - t0
-            if tools:
+            if tools is not None:
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)
 
-        # 用 tracer.info 打印请求
-        tracer.info(f"messages={json.dumps(kwargs, ensure_ascii=False, indent=2)}")
+        # 用 tracer.info 打印请求（人类可读格式）
+        tracer.info(
+            "llm_input_messages="
+            + format_messages(redact_image_data_urls(kwargs.get("messages", [])))
+        )
 
         return await retry_async(
             _call,
@@ -413,7 +471,7 @@ class OpenAIVLM(VLMBase):
             t0 = time.perf_counter()
             response = client.chat.completions.create(**kwargs)
             elapsed = time.perf_counter() - t0
-            if tools:
+            if tools is not None:
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
                 return self._build_vlm_response(response, has_tools=True)
             return self._extract_completion_content(response, elapsed)
@@ -445,7 +503,7 @@ class OpenAIVLM(VLMBase):
             t0 = time.perf_counter()
             response = await client.chat.completions.create(**kwargs)
             elapsed = time.perf_counter() - t0
-            if tools:
+            if tools is not None:
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)

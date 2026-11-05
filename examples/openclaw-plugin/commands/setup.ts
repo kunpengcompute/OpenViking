@@ -4,6 +4,15 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { getEnv } from "../runtime-utils.js";
+import {
+  cleanOpenVikingRequestHeaders,
+  type OpenVikingRequestHeaders,
+} from "../request-headers.js";
+import {
+  createSetupNetworkProbes,
+  type SetupApiKeyProbeResult,
+  type SetupHealthResult,
+} from "../services/setup/probe-service.js";
 
 const HOME = os.homedir();
 const OPENCLAW_DIR = getEnv("OPENCLAW_STATE_DIR") || path.join(HOME, ".openclaw");
@@ -56,6 +65,35 @@ function readCompatRangeFromManifest(): { min: string; max: string } {
 
 const PLUGIN_VERSION = readPluginVersion();
 const { min: COMPATIBLE_SERVER_MIN, max: COMPATIBLE_SERVER_MAX } = readCompatRangeFromManifest();
+const CONFIG_KEYS_TO_PRESERVE = [
+  "contextManagementMode",
+  "targetUri",
+  "headers",
+  "timeoutMs",
+  "autoCapture",
+  "captureMode",
+  "captureMaxLength",
+  "autoRecall",
+  "recallResources",
+  "recallTargetTypes",
+  "recallLimit",
+  "recallScoreThreshold",
+  "recallMaxInjectedChars",
+  "recallMaxContentChars",
+  "recallPreferAbstract",
+  "recallTokenBudget",
+  "commitTokenThresholdRatio",
+  "commitRetentionMode",
+  "commitKeepRecentCount",
+  "bypassSessionPatterns",
+  "emitStandardDiagnostics",
+  "logFindRequests",
+] as const;
+
+type PeerRole = "none" | "assistant" | "sender";
+const DEFAULT_SETUP_PEER_ROLE: PeerRole = "none";
+type RecallTargetType = "resource" | "user" | "agent";
+const ALLOWED_RECALL_TARGET_TYPES = ["resource", "user", "agent"] as const;
 
 type CommandProgram = {
   command: (name: string) => CommandBuilder;
@@ -81,29 +119,152 @@ function maskKey(key: string): string {
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
 }
 
-function isValidAgentPrefixInput(value: string): boolean {
+function nonEmptyOpenVikingRequestHeaders(value: unknown): OpenVikingRequestHeaders | undefined {
+  const headers = cleanOpenVikingRequestHeaders(value);
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function isValidPeerPrefixInput(value: string): boolean {
   const trimmed = value.trim();
   return !trimmed || /^[a-zA-Z0-9_-]+$/.test(trimmed);
 }
 
-async function askAgentPrefix(
+function normalizePeerRole(value: unknown): PeerRole | undefined {
+  if (typeof value !== "string") return undefined;
+  const role = value.trim().toLowerCase();
+  if (role === "person") return "sender";
+  if (role === "none" || role === "assistant" || role === "sender") return role;
+  return undefined;
+}
+
+// `person` survives only in existing configs; setup input must say `sender`.
+function normalizePeerRoleInput(value: unknown): PeerRole | undefined {
+  if (typeof value === "string" && value.trim().toLowerCase() === "person") return undefined;
+  return normalizePeerRole(value);
+}
+
+function resolveExistingPeerRole(existing: Record<string, unknown> | null | undefined): PeerRole {
+  const explicit = normalizePeerRole(existing?.peer_role);
+  if (explicit) return explicit;
+  return DEFAULT_SETUP_PEER_ROLE;
+}
+
+function resolveExistingPeerPrefix(existing: Record<string, unknown> | null | undefined): string {
+  const value = existing?.peer_prefix;
+  if (typeof value !== "string" || !value.trim()) return "";
+  const trimmed = value.trim();
+  return trimmed === "default" ? "" : trimmed;
+}
+
+function resolveSetupPeerRole(value: unknown): PeerRole {
+  if (value === undefined) return DEFAULT_SETUP_PEER_ROLE;
+  const role = normalizePeerRoleInput(value);
+  if (role) return role;
+  throw new Error('peer_role must be "none", "assistant", or "sender" ("person" was renamed to "sender")');
+}
+
+function normalizeSetupRecallTargetTypes(value: unknown): RecallTargetType[] | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const entries = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,\n]/)
+      : [];
+  const seen = new Set<RecallTargetType>();
+  const normalized: RecallTargetType[] = [];
+  const unknown: string[] = [];
+
+  for (const raw of entries) {
+    if (typeof raw !== "string") {
+      continue;
+    }
+    const entry = raw.trim();
+    if (!entry) {
+      continue;
+    }
+    if ((ALLOWED_RECALL_TARGET_TYPES as readonly string[]).includes(entry)) {
+      const typed = entry as RecallTargetType;
+      if (!seen.has(typed)) {
+        seen.add(typed);
+        normalized.push(typed);
+      }
+    } else {
+      unknown.push(entry);
+    }
+  }
+
+  if (unknown.length > 0) {
+    throw new Error(`recall-target-types contains unknown resource types: ${unknown.join(", ")}`);
+  }
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function preserveCurrentConfig(existing: Record<string, unknown> | null | undefined) {
+  const config: Record<string, unknown> = {};
+  if (!existing) {
+    return config;
+  }
+  for (const key of CONFIG_KEYS_TO_PRESERVE) {
+    if (key in existing) {
+      config[key] = existing[key];
+    }
+  }
+  return config;
+}
+
+async function askPeerRole(
+  zh: boolean,
+  q: (prompt: string, def?: string) => Promise<string>,
+  defaultValue: PeerRole,
+): Promise<PeerRole> {
+  console.log(
+    `  ${tr(
+      zh,
+      "Memory scope — none (default): viking://user/<user_id>/memories, shared across all conversations; " +
+        "assistant: viking://user/<user_id>/peers/<assistant_id>/memories; " +
+        "sender: viking://user/<user_id>/peers/<sender_id>/memories.",
+      "记忆归属 —— none（默认）：viking://user/<user_id>/memories，所有对话共享；" +
+        "assistant：viking://user/<user_id>/peers/<assistant_id>/memories；" +
+        "sender：viking://user/<user_id>/peers/<sender_id>/memories。",
+    )}`,
+  );
+  while (true) {
+    const value = await q(
+      tr(zh, "Memory scope (none/assistant/sender)", "记忆归属（none/assistant/sender）"),
+      defaultValue,
+    );
+    const role = normalizePeerRoleInput(value);
+    if (role) return role;
+    console.log(
+      `  ✗ ${tr(
+        zh,
+        'Memory scope must be "none", "assistant", or "sender" ("person" was renamed to "sender").',
+        '记忆归属必须是 "none"、"assistant" 或 "sender"（"person" 已更名为 "sender"）。',
+      )}`,
+    );
+  }
+}
+
+async function askPeerPrefix(
   zh: boolean,
   q: (prompt: string, def?: string) => Promise<string>,
   defaultValue: string,
 ): Promise<string> {
   while (true) {
     const value = (await q(
-      tr(zh, "Agent Prefix (optional)", "Agent Prefix（可选）"),
+      tr(zh, "Peer Prefix (optional)", "Peer Prefix（可选）"),
       defaultValue,
     )).trim();
-    if (isValidAgentPrefixInput(value)) {
+    if (isValidPeerPrefixInput(value)) {
       return value;
     }
     console.log(
       `  ✗ ${tr(
         zh,
-        "Agent Prefix may only contain letters, digits, underscores, and hyphens, or be empty.",
-        "Agent Prefix 只能包含字母、数字、下划线和连字符，或留空。",
+        "Peer Prefix may only contain letters, digits, underscores, and hyphens, or be empty.",
+        "Peer Prefix 只能包含字母、数字、下划线和连字符，或留空。",
       )}`,
     );
   }
@@ -120,14 +281,7 @@ function ask(rl: readline.Interface, prompt: string, defaultValue = ""): Promise
 
 type VersionCompatibility = "compatible" | "server_too_old" | "server_too_new" | "unknown";
 
-type HealthResult = {
-  ok: boolean;
-  version: string;
-  error: string;
-  compatibility: VersionCompatibility;
-  pluginVersion: string;
-  compatRange: string;
-};
+type HealthResult = SetupHealthResult;
 
 function parseVersionTuple(v: string): number[] | null {
   const cleaned = v.replace(/^v/i, "").split("-")[0];
@@ -168,116 +322,13 @@ function formatCompatRange(): string {
   return "any";
 }
 
-type ApiKeyProbeResult = {
-  keyType: "user_key" | "root_key" | "no_key" | "unknown";
-  needsAccountId: boolean;
-  needsUserId: boolean;
-  detail: string;
-};
+type ApiKeyProbeResult = SetupApiKeyProbeResult;
 
-async function probeApiKeyType(baseUrl: string, apiKey?: string): Promise<ApiKeyProbeResult> {
-  if (!apiKey) return { keyType: "no_key", needsAccountId: false, needsUserId: false, detail: "No API key configured" };
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10_000);
-  const sessionsUrl = `${baseUrl.replace(/\/+$/, "")}/api/v1/sessions?limit=1`;
-  try {
-    const headers: Record<string, string> = { "X-API-Key": apiKey };
-    const response = await fetch(sessionsUrl, {
-      headers,
-      signal: controller.signal,
-    });
-
-    if (response.ok) {
-      return { keyType: "user_key", needsAccountId: false, needsUserId: false, detail: "API key has full user context" };
-    }
-
-    // Server raises InvalidArgumentError (-> HTTP 400) when a ROOT key calls
-    // tenant-scoped endpoints without X-OpenViking-Account / X-OpenViking-User.
-    // 401/403 may also be returned by older versions, FastAPI validation can
-    // surface as 422. Treat all four as candidates for tenant-context errors.
-    if ([400, 401, 403, 422].includes(response.status)) {
-      let body = "";
-      try {
-        body = await response.text();
-      } catch { /* ignore parse errors */ }
-      const lower = body.toLowerCase();
-      const needsAccount = /x-openviking-account|account[_ ]?id|account context|tenant/.test(lower);
-      const needsUser = /x-openviking-user|user[_ ]?id|user context|user key/.test(lower);
-      if (needsAccount || needsUser) {
-        return {
-          keyType: "root_key",
-          needsAccountId: needsAccount,
-          needsUserId: needsUser,
-          detail: body.slice(0, 200),
-        };
-      }
-
-      // Body did not name account/user/tenant explicitly (custom auth middleware,
-      // localized message, etc.). Re-probe with placeholder tenant headers; if
-      // the failure was due to missing tenant headers the response will change.
-      try {
-        const probeHeaders: Record<string, string> = {
-          "X-API-Key": apiKey,
-          "X-OpenViking-Account": "__probe__",
-          "X-OpenViking-User": "__probe__",
-        };
-        const probe2 = await fetch(sessionsUrl, {
-          headers: probeHeaders,
-          signal: controller.signal,
-        });
-        if (probe2.status !== response.status) {
-          return {
-            keyType: "root_key",
-            needsAccountId: true,
-            needsUserId: true,
-            detail: body.slice(0, 200) || `HTTP ${response.status} -> ${probe2.status} after adding tenant headers`,
-          };
-        }
-      } catch { /* ignore probe errors, fall through to unknown */ }
-
-      if (response.status === 401 || response.status === 403) {
-        return { keyType: "unknown", needsAccountId: false, needsUserId: false, detail: `HTTP ${response.status} - authentication failed, verify your API key` };
-      }
-      return { keyType: "unknown", needsAccountId: false, needsUserId: false, detail: `HTTP ${response.status}${body ? ` - ${body.slice(0, 160)}` : ""}` };
-    }
-
-    return { keyType: "unknown", needsAccountId: false, needsUserId: false, detail: `HTTP ${response.status}` };
-  } catch (err) {
-    return { keyType: "unknown", needsAccountId: false, needsUserId: false, detail: String(err instanceof Error ? err.message : err) };
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function checkServiceHealth(baseUrl: string, apiKey?: string): Promise<HealthResult> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const headers: Record<string, string> = {};
-    if (apiKey) headers["X-API-Key"] = apiKey;
-    const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/health`, {
-      headers,
-      signal: controller.signal,
-    });
-    if (response.ok) {
-      try {
-        const data = await response.json() as Record<string, unknown>;
-        const result = (data.result ?? data) as Record<string, unknown>;
-        const version = String(result.version ?? data.version ?? "");
-        const compatibility = checkVersionCompatibility(version);
-        return { ok: true, version, error: "", compatibility, pluginVersion: PLUGIN_VERSION, compatRange: formatCompatRange() };
-      } catch {
-        return { ok: true, version: "", error: "", compatibility: "unknown", pluginVersion: PLUGIN_VERSION, compatRange: formatCompatRange() };
-      }
-    }
-    return { ok: false, version: "", error: `HTTP ${response.status}`, compatibility: "unknown", pluginVersion: PLUGIN_VERSION, compatRange: formatCompatRange() };
-  } catch (err) {
-    return { ok: false, version: "", error: String(err instanceof Error ? err.message : err), compatibility: "unknown", pluginVersion: PLUGIN_VERSION, compatRange: formatCompatRange() };
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
+const setupProbes = createSetupNetworkProbes({
+  pluginVersion: PLUGIN_VERSION,
+  compatRange: formatCompatRange(),
+  checkVersionCompatibility,
+});
 
 function readOpenClawConfig(configPath: string): Record<string, unknown> {
   if (!fs.existsSync(configPath)) return {};
@@ -366,9 +417,11 @@ type SetupResult = {
     mode: string;
     baseUrl: string;
     apiKey?: string;
-    agent_prefix?: string;
+    peer_role?: PeerRole;
+    peer_prefix?: string;
     accountId?: string;
     userId?: string;
+    recallTargetTypes?: string[];
   };
   health?: HealthResult;
   keyProbe?: ApiKeyProbeResult;
@@ -388,7 +441,8 @@ type StatusResult = {
     mode: string;
     baseUrl: string;
     hasApiKey: boolean;
-    agent_prefix?: string;
+    peer_role: PeerRole;
+    peer_prefix?: string;
     hasAccountId: boolean;
     hasUserId: boolean;
   };
@@ -449,21 +503,23 @@ export function registerSetupCli(api: any): void {
         .option("--zh", "Chinese prompts")
         .option("--base-url <url>", "OpenViking server URL (enables non-interactive mode)")
         .option("--api-key <key>", "API key for authentication")
-        .option("--agent-prefix <prefix>", "Agent routing prefix for namespace isolation")
+        .option("--peer-role <role>", "Memory scope: none (shared), assistant (per assistant), or sender (per sender)")
+        .option("--peer-prefix <prefix>", "Prefix for assistant peer_id values")
         .option("--account-id <id>", "Account ID (required for root API keys)")
         .option("--user-id <id>", "User ID (required for root API keys)")
+        .option("--recall-target-types <types>", "Comma-separated recall target types: user, agent, resource")
         .option("--allow-offline", "Allow config write even if server is unreachable")
         .option("--force-slot", "Replace existing contextEngine slot even if owned by another plugin")
         .option("--json", "Output result as JSON (machine-readable)")
         .action(async (...args: unknown[]) => {
           const options = (args[0] ?? {}) as Record<string, unknown>;
           const {
-            reconfigure, zh: zhOpt, baseUrl, apiKey, agentPrefix,
-            accountId, userId, allowOffline, forceSlot, json: jsonOpt,
+            reconfigure, zh: zhOpt, baseUrl, apiKey, peerRole, peerPrefix,
+            accountId, userId, recallTargetTypes, allowOffline, forceSlot, json: jsonOpt,
           } = options as {
             reconfigure?: boolean; zh?: boolean; baseUrl?: string;
-            apiKey?: string; agentPrefix?: string; accountId?: string;
-            userId?: string; allowOffline?: boolean; forceSlot?: boolean;
+            apiKey?: string; peerRole?: string; peerPrefix?: string; accountId?: string;
+            userId?: string; recallTargetTypes?: string; allowOffline?: boolean; forceSlot?: boolean;
             json?: boolean;
           };
           const zh = detectLangZh(options);
@@ -475,9 +531,11 @@ export function registerSetupCli(api: any): void {
             const result = await setupNonInteractive(configPath, {
               baseUrl: baseUrl!,
               apiKey,
-              agentPrefix,
+              peerRole,
+              peerPrefix,
               accountId,
               userId,
+              recallTargetTypes: normalizeSetupRecallTargetTypes(recallTargetTypes),
               allowOffline: !!allowOffline,
               forceSlot: !!forceSlot,
             });
@@ -533,7 +591,9 @@ export function registerSetupCli(api: any): void {
               console.log(`  mode:    ${existing.mode}`);
               console.log(`  baseUrl: ${existing.baseUrl ?? DEFAULT_REMOTE_URL}`);
               if (existing.apiKey) console.log(`  apiKey:  ${maskKey(String(existing.apiKey))}`);
-              if (existing.agent_prefix) console.log(`  agent_prefix: ${existing.agent_prefix}`);
+              console.log(`  peer_role: ${resolveExistingPeerRole(existing)}`);
+              const existingPeerPrefix = resolveExistingPeerPrefix(existing);
+              if (existingPeerPrefix) console.log(`  peer_prefix: ${existingPeerPrefix}`);
               console.log("");
               console.log(tr(
                 zh,
@@ -637,8 +697,9 @@ async function runRemoteCheck(
 ): Promise<void> {
   const baseUrl = String(existing.baseUrl ?? DEFAULT_REMOTE_URL);
   const apiKey = existing.apiKey ? String(existing.apiKey) : undefined;
+  const headers = nonEmptyOpenVikingRequestHeaders(existing.headers);
   console.log(tr(zh, `Testing connectivity to ${baseUrl}...`, `正在测试连接 ${baseUrl}...`));
-  const health = await checkServiceHealth(baseUrl, apiKey);
+  const health = await setupProbes.checkServiceHealth(baseUrl, apiKey, headers);
   if (health.ok) {
     const ver = health.version ? ` (version: ${health.version})` : "";
     console.log(`  ✓ ${tr(zh, `Connected successfully${ver}`, `连接成功${ver}`)}`);
@@ -651,13 +712,28 @@ async function runRemoteCheck(
 
 async function setupNonInteractive(
   configPath: string,
-  params: { baseUrl: string; apiKey?: string; agentPrefix?: string; accountId?: string; userId?: string; allowOffline?: boolean; forceSlot?: boolean },
+  params: {
+    baseUrl: string;
+    apiKey?: string;
+    peerRole?: string;
+    peerPrefix?: string;
+    accountId?: string;
+    userId?: string;
+    recallTargetTypes?: string[];
+    allowOffline?: boolean;
+    forceSlot?: boolean;
+  },
 ): Promise<SetupResult> {
   try {
-    const { baseUrl, apiKey, agentPrefix, accountId, userId, allowOffline, forceSlot } = params;
+    const { baseUrl, apiKey, peerPrefix, accountId, userId, recallTargetTypes, allowOffline, forceSlot } = params;
+    const resolvedPeerRole = resolveSetupPeerRole(params.peerRole);
+    const resolvedPeerPrefix = (peerPrefix ?? "").trim();
+    if (!isValidPeerPrefixInput(resolvedPeerPrefix)) {
+      throw new Error("peer_prefix may only contain letters, digits, underscores, and hyphens, or be empty");
+    }
 
     // Phase 1: validate connectivity and key type BEFORE writing config
-    const health = await checkServiceHealth(baseUrl, apiKey);
+    const health = await setupProbes.checkServiceHealth(baseUrl, apiKey);
 
     if (!health.ok && !allowOffline) {
       return {
@@ -670,7 +746,7 @@ async function setupNonInteractive(
       };
     }
 
-    const keyProbe = health.ok ? await probeApiKeyType(baseUrl, apiKey) : undefined;
+    const keyProbe = health.ok ? await setupProbes.probeApiKeyType(baseUrl, apiKey) : undefined;
 
     if (keyProbe?.keyType === "root_key" && (!accountId || !userId)) {
       const missing: string[] = [];
@@ -694,9 +770,13 @@ async function setupNonInteractive(
     // Phase 2: all checks passed (or --allow-offline), write config and activate slot
     const pluginCfg: Record<string, unknown> = { mode: "remote", baseUrl };
     if (apiKey) pluginCfg.apiKey = apiKey;
-    if (agentPrefix) pluginCfg.agent_prefix = agentPrefix;
+    pluginCfg.peer_role = resolvedPeerRole;
+    if (resolvedPeerPrefix) pluginCfg.peer_prefix = resolvedPeerPrefix;
     if (accountId) pluginCfg.accountId = accountId;
     if (userId) pluginCfg.userId = userId;
+    if (recallTargetTypes && recallTargetTypes.length > 0) {
+      pluginCfg.recallTargetTypes = recallTargetTypes;
+    }
 
     writeConfig(configPath, pluginCfg);
     const slot = activateContextEngineSlot(configPath, !!forceSlot);
@@ -709,9 +789,11 @@ async function setupNonInteractive(
           mode: "remote",
           baseUrl,
           ...(apiKey ? { apiKey: maskKey(apiKey) } : {}),
-          ...(agentPrefix ? { agent_prefix: agentPrefix } : {}),
+          peer_role: resolvedPeerRole,
+          ...(resolvedPeerPrefix ? { peer_prefix: resolvedPeerPrefix } : {}),
           ...(accountId ? { accountId } : {}),
           ...(userId ? { userId } : {}),
+          ...(recallTargetTypes && recallTargetTypes.length > 0 ? { recallTargetTypes } : {}),
         },
         health,
         keyProbe,
@@ -727,9 +809,11 @@ async function setupNonInteractive(
         mode: "remote",
         baseUrl,
         ...(apiKey ? { apiKey: maskKey(apiKey) } : {}),
-        ...(agentPrefix ? { agent_prefix: agentPrefix } : {}),
+        peer_role: resolvedPeerRole,
+        ...(resolvedPeerPrefix ? { peer_prefix: resolvedPeerPrefix } : {}),
         ...(accountId ? { accountId } : {}),
         ...(userId ? { userId } : {}),
+        ...(recallTargetTypes && recallTargetTypes.length > 0 ? { recallTargetTypes } : {}),
       },
       health,
       keyProbe,
@@ -754,9 +838,11 @@ function printSetupResult(zh: boolean, result: SetupResult): void {
       console.log(`  mode:    ${result.config.mode}`);
       console.log(`  baseUrl: ${result.config.baseUrl}`);
       if (result.config.apiKey) console.log(`  apiKey:  ${result.config.apiKey}`);
-      if (result.config.agent_prefix) console.log(`  agent_prefix: ${result.config.agent_prefix}`);
+      console.log(`  peer_role: ${result.config.peer_role ?? DEFAULT_SETUP_PEER_ROLE}`);
+      if (result.config.peer_prefix) console.log(`  peer_prefix: ${result.config.peer_prefix}`);
       if (result.config.accountId) console.log(`  accountId: ${result.config.accountId}`);
       if (result.config.userId) console.log(`  userId:  ${result.config.userId}`);
+      if (result.config.recallTargetTypes) console.log(`  recallTargetTypes: ${result.config.recallTargetTypes.join(",")}`);
     }
     console.log("");
     if (result.health?.ok) {
@@ -795,17 +881,19 @@ async function getStatus(configPath: string): Promise<StatusResult> {
 
   const baseUrl = String(existing.baseUrl ?? DEFAULT_REMOTE_URL);
   const apiKey = existing.apiKey ? String(existing.apiKey) : undefined;
-  const health = await checkServiceHealth(baseUrl, apiKey);
-  const keyProbe = health.ok ? await probeApiKeyType(baseUrl, apiKey) : undefined;
+  const headers = nonEmptyOpenVikingRequestHeaders(existing.headers);
+  const health = await setupProbes.checkServiceHealth(baseUrl, apiKey, headers);
+  const keyProbe = health.ok ? await setupProbes.probeApiKeyType(baseUrl, apiKey, headers) : undefined;
 
-  const agentPrefix = existing.agent_prefix ?? existing.agentId;
+  const peerPrefix = resolveExistingPeerPrefix(existing);
   return {
     configured: true,
     config: {
       mode: String(existing.mode ?? "remote"),
       baseUrl,
       hasApiKey: !!existing.apiKey,
-      ...(agentPrefix ? { agent_prefix: String(agentPrefix) } : {}),
+      peer_role: resolveExistingPeerRole(existing),
+      ...(peerPrefix ? { peer_prefix: peerPrefix } : {}),
       hasAccountId: !!existing.accountId,
       hasUserId: !!existing.userId,
     },
@@ -869,7 +957,8 @@ function printStatus(zh: boolean, result: StatusResult): void {
     console.log(`  mode:      ${result.config.mode}`);
     console.log(`  baseUrl:   ${result.config.baseUrl}`);
     console.log(`  apiKey:    ${result.config.hasApiKey ? "set" : "not set"}`);
-    if (result.config.agent_prefix) console.log(`  agent_prefix: ${result.config.agent_prefix}`);
+    console.log(`  peer_role: ${result.config.peer_role}`);
+    if (result.config.peer_prefix) console.log(`  peer_prefix: ${result.config.peer_prefix}`);
     console.log(`  accountId: ${result.config.hasAccountId ? "set" : "not set"}`);
     console.log(`  userId:    ${result.config.hasUserId ? "set" : "not set"}`);
   }
@@ -904,7 +993,9 @@ async function setupRemote(
     ? String(existing.baseUrl)
     : DEFAULT_REMOTE_URL;
   const defaultApiKey = existing?.apiKey ? String(existing.apiKey) : "";
-  const defaultAgentPrefix = existing?.agent_prefix ? String(existing.agent_prefix) : "";
+  const defaultPeerRole = resolveExistingPeerRole(existing);
+  const defaultPeerPrefix = resolveExistingPeerPrefix(existing);
+  const headers = nonEmptyOpenVikingRequestHeaders(existing?.headers);
 
   const baseUrl = await q(tr(zh, "OpenViking server URL", "OpenViking 服务器地址"), defaultUrl);
   const apiKey = await q(tr(zh, "API Key (optional)", "API Key（可选）"), defaultApiKey);
@@ -914,7 +1005,7 @@ async function setupRemote(
 
   if (apiKey) {
     console.log(tr(zh, "  Detecting API key type...", "  正在检测 API Key 类型..."));
-    const probe = await probeApiKeyType(baseUrl, apiKey);
+    const probe = await setupProbes.probeApiKeyType(baseUrl, apiKey, headers);
     if (probe.keyType === "root_key") {
       console.log(tr(zh,
         "  ⚠ Root API key detected. accountId and userId are required.",
@@ -927,12 +1018,15 @@ async function setupRemote(
     }
   }
 
-  const agentPrefix = await askAgentPrefix(zh, q, defaultAgentPrefix);
+  const peerRole = await askPeerRole(zh, q, defaultPeerRole);
+  const peerPrefix = peerRole === "assistant"
+    ? await askPeerPrefix(zh, q, defaultPeerPrefix)
+    : "";
 
   console.log("");
 
   console.log(tr(zh, `Testing connectivity to ${baseUrl}...`, `正在测试连接 ${baseUrl}...`));
-  const health = await checkServiceHealth(baseUrl, apiKey || undefined);
+  const health = await setupProbes.checkServiceHealth(baseUrl, apiKey || undefined, headers);
   if (health.ok) {
     const ver = health.version ? ` (version: ${health.version})` : "";
     console.log(`  ✓ ${tr(zh, `Connected successfully${ver}`, `连接成功${ver}`)}`);
@@ -948,20 +1042,19 @@ async function setupRemote(
   console.log("");
 
   const pluginCfg: Record<string, unknown> = {
-    ...(existing ?? {}),
+    ...preserveCurrentConfig(existing),
     mode: "remote",
     baseUrl,
   };
   if (apiKey) pluginCfg.apiKey = apiKey;
   else delete pluginCfg.apiKey;
-  if (agentPrefix) pluginCfg.agent_prefix = agentPrefix;
-  else delete pluginCfg.agent_prefix;
+  pluginCfg.peer_role = peerRole;
+  if (peerPrefix) pluginCfg.peer_prefix = peerPrefix;
+  else delete pluginCfg.peer_prefix;
   if (accountId) pluginCfg.accountId = accountId;
   else delete pluginCfg.accountId;
   if (userId) pluginCfg.userId = userId;
   else delete pluginCfg.userId;
-  delete pluginCfg.configPath;
-  delete pluginCfg.port;
 
   writeConfig(configPath, pluginCfg);
 
@@ -971,7 +1064,8 @@ async function setupRemote(
   console.log(`  ${tr(zh, "mode:", "模式:")}    remote`);
   console.log(`  baseUrl: ${baseUrl}`);
   if (apiKey) console.log(`  apiKey:  ${maskKey(apiKey)}`);
-  if (agentPrefix) console.log(`  agent_prefix: ${agentPrefix}`);
+  console.log(`  peer_role: ${peerRole}`);
+  if (peerPrefix) console.log(`  peer_prefix: ${peerPrefix}`);
   if (accountId) console.log(`  accountId: ${accountId}`);
   if (userId) console.log(`  userId:  ${userId}`);
   printSlotResult(zh, slotResult);
@@ -985,7 +1079,10 @@ async function setupRemote(
 
 export const __test__ = {
   isLegacyLocalMode,
-  isValidAgentPrefixInput,
+  isValidPeerPrefixInput,
+  normalizePeerRole,
+  resolveSetupPeerRole,
+  normalizeSetupRecallTargetTypes,
   activateContextEngineSlot,
   isContextEngineSlotActive,
   getStatus,
@@ -993,7 +1090,6 @@ export const __test__ = {
   checkVersionCompatibility,
   parseVersionTuple,
   compareVersions,
-  probeApiKeyType,
   ensureInstallRecord,
   findPluginPackageRoot,
   readCompatRangeFromManifest,
