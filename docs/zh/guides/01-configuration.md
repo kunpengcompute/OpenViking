@@ -562,7 +562,6 @@ openviking-server doctor
 | `timeout` | float | 单次 VLM API 请求的 HTTP 超时时间（秒），传递给底层 OpenAI/LiteLLM 客户端。慢端点（如 DashScope、本地推理）可调大。必须 `> 0`（默认：`60.0`） |
 | `extra_headers` | object | 兼容 HTTP provider 的自定义请求头。`kimi` 默认已注入所需订阅请求头，也支持在这里覆盖或扩展 |
 | `extra_request_body` | object | 传给 OpenAI 兼容 completion 请求的额外 JSON body 字段，可用于 Ollama `{"think": false}` 等 provider 专有参数 |
-| `stream` | bool | 启用流式模式（OpenAI 兼容 provider 可用，默认：`false`） |
 
 `vlm.max_retries` 仅对瞬时错误生效，例如 `429`、`5xx`、超时和连接错误；认证、鉴权、欠费等永久错误不会自动重试。退避策略为指数退避，初始延迟 `0.5s`，上限 `8s`，并带随机抖动。
 
@@ -638,23 +637,7 @@ LiteLLM 的 Bedrock bearer-token API-key 鉴权，请设置 `forward_api_key=tru
 }
 ```
 
-**流式模式**
-
-对于返回 SSE（Server-Sent Events）格式响应的 OpenAI 兼容 provider，启用 `stream` 模式：
-
-```json
-{
-  "vlm": {
-    "provider": "openai",
-    "api_key": "your-api-key",
-    "model": "gpt-4o",
-    "api_base": "https://api.example.com/v1",
-    "stream": true
-  }
-}
-```
-
-> **注意**: OpenAI SDK 需要 `stream=true` 才能正确解析 SSE 响应。使用强制返回 SSE 格式的 provider 时，必须将此选项设置为 `true`。
+OpenViking VLM 调用返回完整响应。VLM 和凭据配置中的 `stream` 选项（包括 `extra_request_body.stream`）会在加载配置时返回校验错误。
 
 ### query_planner
 
@@ -1528,8 +1511,7 @@ Task 记录文件位于所属账号的系统目录：
     "max_concurrent": 64,
     "max_retries": 3,
     "extra_headers": {},
-    "extra_request_body": {},
-    "stream": false
+    "extra_request_body": {}
   },
   "rerank": {
     "provider": "volcengine|openai",

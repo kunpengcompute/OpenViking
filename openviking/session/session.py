@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from sys import maxsize
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -36,7 +37,7 @@ from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.time_utils import get_current_timestamp
 from openviking.utils.token_estimation import estimate_text_tokens
-from openviking_cli.exceptions import FailedPreconditionError
+from openviking_cli.exceptions import FailedPreconditionError, NotFoundError, ResourceExhaustedError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger, run_async
 from openviking_cli.utils.config import get_openviking_config
@@ -935,6 +936,8 @@ class Session:
                         parts=[part],
                         peer_id=peer_id,
                         created_at=created_at,
+                        message_kind=spec.get("message_kind"),
+                        source_message_ids=spec.get("source_message_ids"),
                     )
                     for part in parts
                 ]
@@ -947,6 +950,8 @@ class Session:
                     parts=parts,
                     peer_id=peer_id,
                     created_at=created_at,
+                    message_kind=spec.get("message_kind"),
+                    source_message_ids=spec.get("source_message_ids"),
                 )
                 self._externalize_large_tool_outputs(msg)
                 all_messages.append(msg)
@@ -960,6 +965,9 @@ class Session:
         parts: List[Part],
         peer_id: Optional[str] = None,
         created_at: str = None,
+        *,
+        message_kind: Optional[str] = None,
+        source_message_ids: Optional[List[str]] = None,
     ) -> Message:
         """Add a message.
 
@@ -973,6 +981,8 @@ class Session:
                     "parts": parts,
                     "peer_id": peer_id,
                     "created_at": created_at,
+                    "message_kind": message_kind,
+                    "source_message_ids": source_message_ids,
                 }
             ]
         )
@@ -1709,12 +1719,20 @@ class Session:
 
     async def get_session_context(self, token_budget: int = 128_000) -> Dict[str, Any]:
         """Get assembled session context with the latest summary archive and merged messages."""
-        if token_budget < 0:
+        if type(token_budget) is not int or token_budget < 0:
             raise ValueError("token_budget must be greater than or equal to 0")
 
         context = await self._collect_session_context_components()
-        merged_messages = context["messages"]
-
+        latest_archive = context["latest_archive"]
+        latest_archive_tokens = latest_archive["overview_tokens"] if latest_archive else 0
+        if latest_archive_tokens > token_budget:
+            raise ResourceExhaustedError(
+                "Session summary exceeds the history budget",
+                details={"token_budget": token_budget, "summary_tokens": latest_archive_tokens},
+            )
+        merged_messages = self._budget_recent_messages(
+            context["messages"], token_budget - latest_archive_tokens
+        )
         message_tokens = sum(m.estimated_tokens for m in merged_messages)
 
         # 精简日志：只打印关键信息
@@ -1722,16 +1740,6 @@ class Session:
             f"[get_session_context] session_id={self.session_id}, "
             f"messages={len(merged_messages)}, tokens={message_tokens}"
         )
-
-        remaining_budget = max(0, token_budget - message_tokens)
-
-        latest_archive = context["latest_archive"]
-        include_latest_overview = bool(
-            latest_archive and latest_archive["overview_tokens"] <= remaining_budget
-        )
-        latest_archive_tokens = latest_archive["overview_tokens"] if include_latest_overview else 0
-        if include_latest_overview:
-            remaining_budget -= latest_archive_tokens
 
         # pre_archive_abstracts: 保留字段返回空数组，保持 API 向下兼容
         included_pre_archive_abstracts: List[Dict[str, str]] = []
@@ -1744,9 +1752,8 @@ class Session:
         )
 
         return {
-            "latest_archive_overview": (
-                latest_archive["overview"] if include_latest_overview else ""
-            ),
+            "latest_finished_archive_id": context["latest_finished_archive_id"],
+            "latest_archive_overview": (latest_archive["overview"] if latest_archive else ""),
             "pre_archive_abstracts": [],  # 保持 API 向后兼容，返回空数组
             "messages": [m.to_dict() for m in merged_messages],
             "estimatedTokens": message_tokens + archive_tokens,
@@ -1810,10 +1817,13 @@ class Session:
 
     async def _collect_session_context_components(self) -> Dict[str, Any]:
         """Collect the latest summary archive and merged pending/live messages."""
-        completed_archives = await self._get_completed_archive_refs()
+        # Capture each archive's state once. A background task finishing during
+        # subsequent reads must not mix a new boundary with an older message view.
+        archives = await self._get_archive_states()
+        completed_archives = [archive for archive in archives if archive["state"] == "done"]
         latest_archive = None
         pre_archive_abstracts: List[Dict[str, Any]] = []
-        failed_archives = 0
+        failed_archives = sum(archive["state"] == "failed" for archive in archives)
 
         for archive in completed_archives:
             if latest_archive is None:
@@ -1825,6 +1835,7 @@ class Session:
                 latest_archive = {
                     "archive_id": archive["archive_id"],
                     "archive_uri": archive["archive_uri"],
+                    "index": archive["index"],
                     "overview": overview,
                     "overview_tokens": await self._read_archive_overview_tokens(
                         archive["archive_uri"], overview
@@ -1843,21 +1854,28 @@ class Session:
                 failed_archives += 1
 
         return {
+            "latest_finished_archive_id": self._latest_finished_archive_id(archives),
             "latest_archive": latest_archive,
             "pre_archive_abstracts": pre_archive_abstracts,
-            "total_archives": len(completed_archives),
+            "total_archives": sum(archive["state"] != "pending" for archive in archives),
             "failed_archives": failed_archives,
-            "messages": await self._get_pending_archive_messages() + list(self._messages),
+            "messages": await self._get_pending_archive_messages(
+                archives, latest_archive["index"] if latest_archive else 0
+            )
+            + list(self._messages),
         }
 
     async def _list_archive_refs(self) -> List[Dict[str, Any]]:
         """List archive refs sorted by archive index descending."""
-        if not self._viking_fs or self.compression.compression_index <= 0:
+        if not self._viking_fs:
             return []
 
         try:
-            history_items = await self._viking_fs.ls(f"{self._session_uri}/history", ctx=self.ctx)
-        except Exception:
+            # The default ls limit can hide the newest archive in long sessions.
+            history_items = await self._viking_fs.ls(
+                f"{self._session_uri}/history", node_limit=maxsize, ctx=self.ctx
+            )
+        except (NotFoundError, FileNotFoundError):
             return []
 
         refs: List[Dict[str, Any]] = []
@@ -1956,17 +1974,14 @@ class Session:
         """Read archived messages from one archive."""
         try:
             content = await self._viking_fs.read_file(f"{archive_uri}/messages.jsonl", ctx=self.ctx)
-        except Exception:
+        except (NotFoundError, FileNotFoundError):
             return []
 
         messages: List[Message] = []
         for line in content.strip().split("\n"):
             if not line.strip():
                 continue
-            try:
-                messages.append(Message.from_dict(json.loads(line)))
-            except Exception:
-                continue
+            messages.append(Message.from_dict(json.loads(line)))
 
         return messages
 
@@ -2000,20 +2015,17 @@ class Session:
         summary = await self._get_latest_completed_archive_summary(exclude_archive_uri)
         return summary["overview"] if summary else ""
 
-    async def _get_pending_archive_messages(self) -> List[Message]:
-        """Return messages from incomplete archives newer than the latest completed archive."""
-        latest_completed_index = max(0, self._meta.commit_count)
-        incomplete_archives: List[Dict[str, Any]] = []
-        for archive in sorted(await self._list_archive_refs(), key=lambda item: item["index"]):
-            try:
-                await self._viking_fs.read_file(f"{archive['archive_uri']}/.done", ctx=self.ctx)
-                latest_completed_index = max(latest_completed_index, archive["index"])
-            except Exception:
-                incomplete_archives.append(archive)
+    async def _get_pending_archive_messages(
+        self, archives: List[Dict[str, Any]], covered_index: int
+    ) -> List[Message]:
+        """Return raw messages not covered by the selected cumulative overview.
 
+        Failed, running, or summary-less archives above this cutoff retain their
+        raw input. commit_count is not evidence that a summary covers messages.
+        """
         pending_messages: List[Message] = []
-        for archive in incomplete_archives:
-            if archive["index"] <= latest_completed_index:
+        for archive in sorted(archives, key=lambda item: item["index"]):
+            if archive["index"] <= covered_index:
                 continue
             pending_messages.extend(await self._read_archive_messages(archive["archive_uri"]))
 
@@ -3417,3 +3429,71 @@ class Session:
 
     def __repr__(self) -> str:
         return f"Session(user={self.user}, id={self.session_id})"
+
+    @staticmethod
+    def _budget_recent_messages(messages: List[Message], budget: int) -> List[Message]:
+        """Keep a contiguous recent suffix, with parallel calls/results as one group."""
+        groups: list[list[Message]] = []
+        pending: set[str] = set()
+        group: list[Message] = []
+        for message in messages:
+            group.append(message)
+            for part in message.parts:
+                if isinstance(part, ToolPart) and part.tool_id:
+                    if message.role == "assistant":
+                        pending.add(part.tool_id)
+                    else:
+                        pending.discard(part.tool_id)
+            if not pending:
+                groups.append(group)
+                group = []
+        if group:
+            groups.append(group)
+        start = len(groups)
+        for index in range(len(groups) - 1, -1, -1):
+            tokens = sum(m.estimated_tokens for m in groups[index])
+            if tokens > budget:
+                break
+            budget -= tokens
+            start = index
+        return [message for group in groups[start:] for message in group]
+
+    async def get_latest_finished_archive_id(self) -> Optional[str]:
+        """Get the newest archive in a successful or failed terminal state.
+
+        Derive this from persisted markers instead of commit_count, which advances
+        during Phase 1 while background processing may still be running.
+        """
+        for archive in await self._list_archive_refs():
+            if await self._get_archive_state(archive["archive_uri"]) != "pending":
+                return archive["archive_id"]
+        return None
+
+    @staticmethod
+    def _latest_finished_archive_id(archives: List[Dict[str, Any]]) -> Optional[str]:
+        return next(
+            (archive["archive_id"] for archive in archives if archive["state"] != "pending"),
+            None,
+        )
+
+    async def _archive_marker_exists(self, archive_uri: str, marker: str) -> bool:
+        try:
+            await self._viking_fs.read_file(f"{archive_uri}/{marker}", ctx=self.ctx)
+        except (NotFoundError, FileNotFoundError):
+            return False
+        return True
+
+    async def _get_archive_state(self, archive_uri: str) -> str:
+        if await self._archive_marker_exists(archive_uri, ".done"):
+            return "done"
+        if await self._archive_marker_exists(archive_uri, ".failed.json"):
+            return "failed"
+        return "pending"
+
+    async def _get_archive_states(self) -> List[Dict[str, Any]]:
+        """Capture archive states in descending order, with .done taking precedence."""
+        archives = []
+        for archive in await self._list_archive_refs():
+            state = await self._get_archive_state(archive["archive_uri"])
+            archives.append({**archive, "state": state})
+        return archives

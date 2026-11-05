@@ -171,15 +171,15 @@ class TestFormatSimplified:
 
         assert formatted == "2025-12-01"
 
-    def test_format_just_under_24h_shows_time(self):
-        """Test formatting shows time for just under 24 hours."""
+    def test_format_previous_utc_date_shows_date_even_within_24h(self):
+        """Test the previous UTC date is displayed as a date, even within 24 hours."""
         now = datetime(2026, 3, 26, 15, 0, 0)
         dt = datetime(2026, 3, 25, 16, 0, 0)
 
         formatted = format_simplified(dt, now)
 
-        # 16:00 is less than 24 hours ago
-        assert formatted == "16:00:00"
+        # This timestamp belongs to the previous UTC date.
+        assert formatted == "2026-03-25"
 
     def test_format_just_over_24h_shows_date(self):
         """Test formatting shows date for just over 24 hours."""

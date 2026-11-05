@@ -7,10 +7,12 @@ Provides client implementations for embedded (LocalClient) and HTTP (AsyncHTTPCl
 
 from openviking_cli.client.base import BaseClient
 from openviking_cli.client.http import AsyncHTTPClient
+from openviking_cli.client.identity import OVIdentity
 from openviking_cli.client.sync_http import SyncHTTPClient
 
 __all__ = [
     "BaseClient",
+    "OVIdentity",
     "AsyncHTTPClient",
     "SyncHTTPClient",
 ]

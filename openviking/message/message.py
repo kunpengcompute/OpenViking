@@ -24,6 +24,10 @@ class Message:
     parts: List[Part]
     peer_id: Optional[str] = None
     created_at: str = None
+    message_kind: Optional[
+        Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
+    ] = None
+    source_message_ids: Optional[List[str]] = None
 
     @property
     def content(self) -> str:
@@ -83,6 +87,10 @@ class Message:
         }
         if self.peer_id is not None:
             data["peer_id"] = self.peer_id
+        if self.message_kind is not None:
+            data["message_kind"] = self.message_kind
+        if self.source_message_ids is not None:
+            data["source_message_ids"] = list(self.source_message_ids)
         return data
 
     def _part_to_dict(self, part: Part) -> dict:
@@ -235,6 +243,12 @@ class Message:
             parts=parts,
             peer_id=peer_id,
             created_at=data.get("created_at"),
+            message_kind=data.get("message_kind"),
+            source_message_ids=(
+                list(data["source_message_ids"])
+                if isinstance(data.get("source_message_ids"), list)
+                else None
+            ),
         )
 
     def get_tool_parts(self) -> List[ToolPart]:

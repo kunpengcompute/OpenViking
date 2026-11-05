@@ -591,7 +591,6 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 | `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `60.0`) |
 | `extra_headers` | object | Custom HTTP headers for compatible HTTP providers. `kimi` also accepts header overrides, but already injects the required subscription headers by default |
 | `extra_request_body` | object | Extra JSON body fields for OpenAI-compatible completion requests, useful for provider-specific options such as Ollama `{"think": false}` |
-| `stream` | bool | Enable streaming mode (for OpenAI-compatible providers, default: `false`) |
 
 `vlm.max_retries` only applies to transient errors such as `429`, `5xx`, timeouts, and connection failures. Permanent authentication, authorization, and billing errors are not retried automatically. The backoff strategy is exponential backoff with jitter, starting at `0.5s` and capped at `8s`.
 
@@ -668,23 +667,7 @@ For OpenAI-compatible providers that accept provider-specific JSON body fields, 
 }
 ```
 
-**Streaming Mode**
-
-For OpenAI-compatible providers that return SSE (Server-Sent Events) format responses, enable `stream` mode:
-
-```json
-{
-  "vlm": {
-    "provider": "openai",
-    "api_key": "your-api-key",
-    "model": "gpt-4o",
-    "api_base": "https://api.example.com/v1",
-    "stream": true
-  }
-}
-```
-
-> **Note**: The OpenAI SDK requires `stream=true` to properly parse SSE responses. When using providers that force SSE format, you must set this option to `true`.
+OpenViking VLM calls return complete responses. The `stream` option is rejected in VLM and credential configuration, including `extra_request_body`.
 
 ### query_planner
 
@@ -1555,8 +1538,7 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "max_concurrent": 64,
     "max_retries": 3,
     "extra_headers": {},
-    "extra_request_body": {},
-    "stream": false
+    "extra_request_body": {}
   },
   "rerank": {
     "provider": "volcengine|openai",

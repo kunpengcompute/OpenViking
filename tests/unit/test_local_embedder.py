@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from openviking.models.embedder import local_embedders
 from openviking.models.embedder.local_embedders import (
     DEFAULT_BGE_ZH_QUERY_INSTRUCTION,
     DEFAULT_LOCAL_DENSE_MODEL,
@@ -101,8 +102,11 @@ def test_local_embedder_requires_optional_dependency(monkeypatch, tmp_path):
     model_path.write_bytes(b"gguf")
 
     monkeypatch.setattr(
-        "openviking.models.embedder.local_embedders.importlib.import_module",
-        lambda _name: (_ for _ in ()).throw(ImportError("missing llama_cpp")),
+        local_embedders,
+        "importlib",
+        SimpleNamespace(
+            import_module=lambda _name: (_ for _ in ()).throw(ImportError("missing llama_cpp"))
+        ),
     )
 
     with pytest.raises(EmbeddingConfigurationError, match="openviking\\[local-embed\\]"):
@@ -114,8 +118,9 @@ def test_local_embedder_uses_explicit_model_path(monkeypatch, tmp_path):
     model_path.write_bytes(b"gguf")
 
     monkeypatch.setattr(
-        "openviking.models.embedder.local_embedders.importlib.import_module",
-        lambda _name: SimpleNamespace(Llama=_FakeLlama),
+        local_embedders,
+        "importlib",
+        SimpleNamespace(import_module=lambda _name: SimpleNamespace(Llama=_FakeLlama)),
     )
 
     embedder = LocalDenseEmbedder(model_path=str(model_path))
@@ -137,8 +142,9 @@ def test_local_embedder_downloads_default_model_and_prefixes_query(monkeypatch, 
         return _FakeResponse(b"gguf")
 
     monkeypatch.setattr(
-        "openviking.models.embedder.local_embedders.importlib.import_module",
-        lambda _name: SimpleNamespace(Llama=_FakeLlama),
+        local_embedders,
+        "importlib",
+        SimpleNamespace(import_module=lambda _name: SimpleNamespace(Llama=_FakeLlama)),
     )
     monkeypatch.setattr("openviking.models.embedder.local_embedders.requests.get", _fake_get)
 
@@ -157,8 +163,9 @@ def test_local_embedder_embed_batch_preserves_count(monkeypatch, tmp_path):
     model_path.write_bytes(b"gguf")
 
     monkeypatch.setattr(
-        "openviking.models.embedder.local_embedders.importlib.import_module",
-        lambda _name: SimpleNamespace(Llama=_FakeLlama),
+        local_embedders,
+        "importlib",
+        SimpleNamespace(import_module=lambda _name: SimpleNamespace(Llama=_FakeLlama)),
     )
 
     embedder = LocalDenseEmbedder(model_path=str(model_path))
@@ -180,8 +187,9 @@ def test_local_embedder_embed_batch_falls_back_to_sequential(monkeypatch, tmp_pa
     _FakeLlamaFailBatch.inputs = []
 
     monkeypatch.setattr(
-        "openviking.models.embedder.local_embedders.importlib.import_module",
-        lambda _name: SimpleNamespace(Llama=_FakeLlamaFailBatch),
+        local_embedders,
+        "importlib",
+        SimpleNamespace(import_module=lambda _name: SimpleNamespace(Llama=_FakeLlamaFailBatch)),
     )
 
     embedder = LocalDenseEmbedder(model_path=str(model_path))
@@ -209,8 +217,11 @@ def test_local_embedder_embed_batch_uses_sequential_mode_when_native_batch_unsup
     _FakeLlamaSequentialOnly.inputs = []
 
     monkeypatch.setattr(
-        "openviking.models.embedder.local_embedders.importlib.import_module",
-        lambda _name: SimpleNamespace(Llama=_FakeLlamaSequentialOnly),
+        local_embedders,
+        "importlib",
+        SimpleNamespace(
+            import_module=lambda _name: SimpleNamespace(Llama=_FakeLlamaSequentialOnly)
+        ),
     )
 
     embedder = LocalDenseEmbedder(model_path=str(model_path))

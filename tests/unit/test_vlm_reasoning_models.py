@@ -115,7 +115,7 @@ class TestReasoningModelTextKwargs:
         assert kwargs["temperature"] == 0.5
         assert "reasoning_effort" not in kwargs
 
-    def test_reasoning_model_without_max_tokens_omits_both(self):
+    def test_reasoning_model_without_max_tokens_uses_default_completion_budget(self):
         vlm = OpenAIVLM(
             {
                 "api_key": "sk-test",
@@ -125,7 +125,7 @@ class TestReasoningModelTextKwargs:
         )
         kwargs = vlm._build_text_kwargs(prompt="hi")
         assert "max_tokens" not in kwargs
-        assert "max_completion_tokens" not in kwargs
+        assert kwargs["max_completion_tokens"] == 32768
         assert "temperature" not in kwargs
 
 

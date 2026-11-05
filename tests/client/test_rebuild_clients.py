@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0
+
 import asyncio
+import json
 import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 import openviking_cli.client.http as http_module
@@ -226,13 +230,6 @@ async def test_local_client_add_message_accepts_image_parts():
 
 
 async def test_async_http_client_batch_add_messages_posts_batch_payload():
-    client = AsyncHTTPClient(url="http://localhost:1933")
-    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
-    client._http = fake_http
-    client._handle_response_data = lambda _response: {
-        "result": {"session_id": "batch-session", "message_count": 2, "added": 2}
-    }
-
     messages = [
         {
             "role": "user",
@@ -242,39 +239,48 @@ async def test_async_http_client_batch_add_messages_posts_batch_payload():
         },
         {"role": "assistant", "parts": [{"type": "text", "text": "hi"}]},
     ]
+    expected = {"session_id": "batch-session", "message_count": 2, "added": 2}
+    requests = []
 
-    result = await client.batch_add_messages("batch-session", messages)
+    async def handle(request):
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/sessions/batch-session/messages/batch"
+        assert json.loads(request.content) == {"messages": messages}
+        return httpx.Response(200, json={"status": "ok", "result": expected})
 
-    assert result == {"session_id": "batch-session", "message_count": 2, "added": 2}
-    fake_http.post.assert_awaited_once_with(
-        "/api/v1/sessions/batch-session/messages/batch",
-        json={"messages": messages},
-    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as pool:
+        client = AsyncHTTPClient(url="http://localhost:1933", http_client=pool)
+        await client.initialize()
+        assert await client.batch_add_messages("batch-session", messages) == expected
+        await client.close()
+        assert not pool.is_closed
+    assert len(requests) == 1
 
 
 async def test_async_http_client_reindex_posts_content_reindex():
-    client = AsyncHTTPClient(url="http://localhost:1933")
-    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
-    client._http = fake_http
-    with patch.object(
-        client, "_handle_response", return_value={"status": "completed"}
-    ) as mock_handle:
-        result = await client.reindex(
-            "viking://resources/demo",
-            mode="vectors_only",
-            wait=False,
-        )
+    requests = []
 
-    assert result == {"status": "completed"}
-    fake_http.post.assert_awaited_once_with(
-        "/api/v1/content/reindex",
-        json={
+    async def handle(request):
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/content/reindex"
+        assert json.loads(request.content) == {
             "uri": "viking://resources/demo",
             "mode": "vectors_only",
             "wait": False,
-        },
-    )
-    assert mock_handle.called
+        }
+        return httpx.Response(200, json={"status": "ok", "result": {"status": "completed"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as pool:
+        client = AsyncHTTPClient(url="http://localhost:1933", http_client=pool)
+        await client.initialize()
+        assert await client.reindex("viking://resources/demo", mode="vectors_only", wait=False) == {
+            "status": "completed"
+        }
+        await client.close()
+        assert not pool.is_closed
+    assert len(requests) == 1
 
 
 def test_sync_http_client_reindex_forwards_to_async_client():

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0
+
 import importlib.util
 import json
 import sys
@@ -65,8 +67,6 @@ def test_build_session_messages_non_group_uses_sample_peer_and_prefixes_speaker(
     assert [msg["peer_id"] for msg in messages] == ["conv-26", "conv-26"]
     assert messages[0]["text"] == "Alice: Hi Bob"
     assert messages[1]["text"] == "Bob: Hello Alice"
-
-
 
 
 @pytest.mark.asyncio
@@ -140,7 +140,7 @@ def test_load_locomo_qa_keeps_internal_and_original_sample_ids(tmp_path):
 def test_run_vikingbot_chat_non_group_builds_sender_without_memory_peers(monkeypatch):
     calls = []
 
-    def fake_run(cmd, capture_output, text, timeout=None, check=False):
+    def fake_run(cmd, capture_output, text, timeout=None, check=False, env=None):
         calls.append(cmd)
         return SimpleNamespace(
             stdout=json.dumps(
@@ -157,15 +157,18 @@ def test_run_vikingbot_chat_non_group_builds_sender_without_memory_peers(monkeyp
 
     monkeypatch.setattr(RUN_EVAL.subprocess, "run", fake_run)
 
-    response, token_usage, _time_cost, iteration, tools_used_names = RUN_EVAL.run_vikingbot_chat(
-        question="Who said hello?",
-        question_time="2023-05-08",
-        sender_peer_id="conv-26",
-        question_id="sample_0_qa0",
-        config="/tmp/ov.conf",
-        memory_peer_ids=None,
+    response, token_usage, _time_cost, iteration, tools_used_names, log_file = (
+        RUN_EVAL.run_vikingbot_chat(
+            question="Who said hello?",
+            question_time="2023-05-08",
+            sender_peer_id="conv-26",
+            question_id="sample_0_qa0",
+            config="/tmp/ov.conf",
+            memory_peer_ids=None,
+        )
     )
 
+    assert log_file == RUN_EVAL.build_bot_log_file("sample_0_qa0")
     assert response == "ok"
     assert token_usage == {"total_tokens": 3}
     assert iteration == 1

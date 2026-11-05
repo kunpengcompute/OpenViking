@@ -328,3 +328,15 @@ class SessionService:
         )
         self._record_lifecycle_metric("extract", "ok")
         return memories
+
+    async def get_context(
+        self, session_id: str, ctx: RequestContext, token_budget: int = 128_000
+    ) -> Dict[str, Any]:
+        """Read live messages and the archive boundary under the session path lock."""
+        from openviking.storage.transaction import LockContext, get_lock_manager
+
+        session = await self.get(session_id, ctx)
+        path = self._viking_fs._uri_to_path(session.uri, ctx=ctx)
+        async with LockContext(get_lock_manager(), [path], lock_mode="exact"):
+            await session.load()
+            return await session.get_session_context(token_budget=token_budget)

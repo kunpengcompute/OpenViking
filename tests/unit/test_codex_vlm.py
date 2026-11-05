@@ -204,7 +204,9 @@ def test_vlm_config_default_provider_resolves_codex(_mock_auth_available):
     provider_config, provider_name = config.get_provider_config()
 
     assert provider_name == "openai-codex"
-    assert provider_config == {}
+    assert provider_config["api_key"] is None
+    assert "sk-test" not in provider_config.values()
+    assert provider_config["api_base"] is None
 
 
 @patch("openviking.models.vlm.backends.codex_auth.has_codex_auth_available", return_value=True)
@@ -425,25 +427,10 @@ def test_codex_auth_refresh_requires_persisted_client_id(tmp_path, monkeypatch):
 @patch("openviking.models.vlm.backends.codex_vlm.openai.OpenAI")
 @patch("openviking.models.vlm.backends.codex_vlm.resolve_codex_runtime_credentials")
 def test_codex_streaming_is_rejected(mock_resolve, mock_openai_class):
-    mock_resolve.return_value = {
-        "api_key": "oauth-token",
-        "base_url": "https://chatgpt.com/backend-api/codex",
-    }
-    mock_real_client = MagicMock()
-    mock_openai_class.return_value = mock_real_client
-
-    vlm = CodexVLM(
-        {
-            "provider": "openai-codex",
-            "model": "gpt-5.3-codex",
-            "stream": True,
-        }
-    )
-
-    with pytest.raises(NotImplementedError, match="Streaming is not supported"):
-        vlm.get_completion("hello")
-
-    mock_real_client.responses.create.assert_not_called()
+    with pytest.raises(ValueError, match="stream.*not supported"):
+        VLMConfig(provider="openai-codex", model="gpt-5.3-codex", stream=True)
+    mock_resolve.assert_not_called()
+    mock_openai_class.assert_not_called()
 
 
 @patch("openviking.models.vlm.backends.codex_vlm.openai.OpenAI")

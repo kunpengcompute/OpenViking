@@ -297,6 +297,9 @@ class BaseClient(ABC):
         created_at: str | None = None,
         peer_id: str | None = None,
         telemetry: TelemetryRequest = False,
+        *,
+        message_kind: str | None = None,
+        source_message_ids: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Add a message to a session.
 
@@ -308,6 +311,9 @@ class BaseClient(ABC):
             created_at: Message creation time (ISO format string)
             peer_id: Optional stable interaction peer identity.
             telemetry: Whether to attach operation telemetry data to the result.
+
+        message_kind and source_message_ids optionally preserve semantic type
+        and caller identity through storage and subsequent reads.
 
         If both content and parts are provided, parts takes precedence.
         """

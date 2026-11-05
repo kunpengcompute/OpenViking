@@ -494,7 +494,8 @@ class TestContextWithUser:
         user = UserIdentifier(account_id="account-123", user_id="user-123")
         ctx = Context(uri="viking://session/test/msg/1.md", user=user)
 
-        assert ctx.owner_user_id is None
+        assert ctx.owner_user_id == user.user_id
+        assert Context.from_dict(ctx.to_dict()).owner_user_id == user.user_id
         assert ctx.owner_space == user.user_id
 
     def test_owner_fields_resource_default(self):

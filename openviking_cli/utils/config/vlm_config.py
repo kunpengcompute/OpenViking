@@ -18,6 +18,22 @@ def _normalize_provider_name(name: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _reject_stream_config(data: Any, location: str) -> None:
+    """Backport upstream #4541: VLM requests return complete responses."""
+    if not isinstance(data, dict):
+        return
+    if "stream" in data:
+        raise ValueError(
+            f"{location}.stream is not supported; OpenViking VLM calls return complete responses"
+        )
+    body = data.get("extra_request_body")
+    if isinstance(body, dict) and "stream" in body:
+        raise ValueError(
+            f"{location}.extra_request_body.stream is not supported; "
+            "OpenViking VLM calls return complete responses"
+        )
+
+
 class VLMCredential(BaseModel):
     """Single VLM credential configuration for multi-credential failover."""
 
@@ -41,9 +57,14 @@ class VLMCredential(BaseModel):
     extra_request_body: Optional[Dict[str, Any]] = Field(
         default=None, description="Extra JSON body fields"
     )
-    stream: Optional[bool] = Field(default=None, description="Enable streaming mode")
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_stream_config(cls, data: Any) -> Any:
+        _reject_stream_config(data, "vlm.credentials[]")
+        return data
 
 
 class VLMConfig(BaseModel):
@@ -113,10 +134,6 @@ class VLMConfig(BaseModel):
         ),
     )
 
-    stream: bool = Field(
-        default=False, description="Enable streaming mode for OpenAI-compatible providers"
-    )
-
     # New multi-credential configuration
     credentials: List[VLMCredential] = Field(
         default_factory=list,
@@ -138,6 +155,7 @@ class VLMConfig(BaseModel):
     @classmethod
     def sync_provider_backend(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            _reject_stream_config(data, "vlm")
             provider = data.get("provider")
             backend = data.get("backend")
 
@@ -152,6 +170,7 @@ class VLMConfig(BaseModel):
                 provider_sources: Dict[str, str] = {}
                 for name, config in providers.items():
                     normalized_name = _normalize_provider_name(name) or str(name)
+                    _reject_stream_config(config, f"vlm.providers.{normalized_name}")
                     existing_name = provider_sources.get(normalized_name)
                     if existing_name is not None and existing_name != str(name):
                         raise ValueError(
@@ -221,7 +240,6 @@ class VLMConfig(BaseModel):
             or self.api_base
             or self.extra_headers
             or self.extra_request_body
-            or self.stream
             or self.forward_api_key is not None
         ):
             if self.provider not in self.providers:
@@ -242,8 +260,6 @@ class VLMConfig(BaseModel):
                 and "extra_request_body" not in self.providers[self.provider]
             ):
                 self.providers[self.provider]["extra_request_body"] = self.extra_request_body
-            if self.stream and "stream" not in self.providers[self.provider]:
-                self.providers[self.provider]["stream"] = self.stream
 
     def _normalize_credentials(self):
         """Normalize credentials configuration:
@@ -277,11 +293,6 @@ class VLMConfig(BaseModel):
                 extra_request_body=(
                     primary_cfg.get("extra_request_body") or self.extra_request_body
                 ),
-                stream=(
-                    primary_cfg.get("stream")
-                    if primary_cfg.get("stream") is not None
-                    else self.stream
-                ),
             )
             migrated_credentials.append(primary_cred)
 
@@ -304,11 +315,6 @@ class VLMConfig(BaseModel):
                 extra_headers=backup_cfg.get("extra_headers") or self.backup.extra_headers,
                 extra_request_body=(
                     backup_cfg.get("extra_request_body") or self.backup.extra_request_body
-                ),
-                stream=(
-                    backup_cfg.get("stream")
-                    if backup_cfg.get("stream") is not None
-                    else self.backup.stream
                 ),
             )
             migrated_credentials.append(backup_cred)
@@ -344,11 +350,6 @@ class VLMConfig(BaseModel):
                         extra_request_body=(
                             provider_cfg.get("extra_request_body") or self.extra_request_body
                         ),
-                        stream=(
-                            provider_cfg.get("stream")
-                            if provider_cfg.get("stream") is not None
-                            else self.stream
-                        ),
                     )
                 )
 
@@ -377,8 +378,6 @@ class VLMConfig(BaseModel):
                 cred.extra_headers = self.extra_headers
             if not cred.extra_request_body:
                 cred.extra_request_body = self.extra_request_body
-            if cred.stream is None:
-                cred.stream = self.stream
 
     def _has_legacy_provider_config(self) -> bool:
         """Check if there's legacy provider config (not credentials-based)."""
@@ -430,8 +429,6 @@ class VLMConfig(BaseModel):
             config["extra_headers"] = self.extra_headers
         if self.extra_request_body and "extra_request_body" not in config:
             config["extra_request_body"] = self.extra_request_body
-        if self.stream and "stream" not in config:
-            config["stream"] = self.stream
         return config
 
     def _provider_has_usable_credentials(self, provider_name: str, config: Dict[str, Any]) -> bool:
@@ -463,7 +460,6 @@ class VLMConfig(BaseModel):
                     "forward_api_key": cred.forward_api_key,
                     "extra_headers": cred.extra_headers,
                     "extra_request_body": cred.extra_request_body,
-                    "stream": cred.stream,
                 },
                 cred.provider,
             )
@@ -550,7 +546,6 @@ class VLMConfig(BaseModel):
             "provider": credential.provider,
             "thinking": self.thinking,
             "max_tokens": self.max_tokens,
-            "stream": credential.stream if credential.stream is not None else self.stream,
             "api_version": credential.api_version,
         }
 
@@ -571,11 +566,6 @@ class VLMConfig(BaseModel):
         """Build VLM instance config dict."""
         config, name = self.get_provider_config()
 
-        # Get stream from provider config if available, fallback to self.stream
-        stream = (
-            config.get("stream") if config and config.get("stream") is not None else self.stream
-        )
-
         result = {
             "model": self.model,
             "temperature": self.temperature,
@@ -584,7 +574,6 @@ class VLMConfig(BaseModel):
             "provider": name,
             "thinking": self.thinking,
             "max_tokens": self.max_tokens,
-            "stream": stream,
             "api_version": self.api_version,
         }
 

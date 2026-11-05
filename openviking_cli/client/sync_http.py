@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 from openviking.telemetry import TelemetryRequest
 from openviking.utils.search_filters import SearchContextTypeInput
 from openviking_cli.client.http import AsyncHTTPClient
+from openviking_cli.client.identity import ClientAuthMode, OVIdentity, _identity_arguments
 from openviking_cli.utils import run_async
 
 
@@ -41,6 +42,8 @@ class SyncHTTPClient:
         timeout: float = 60.0,
         extra_headers: Optional[Dict[str, str]] = None,
         profile_enabled: Optional[bool] = None,
+        *,
+        auth_mode: ClientAuthMode = "api_key",
     ):
         self._async_client = AsyncHTTPClient(
             url=url,
@@ -53,6 +56,7 @@ class SyncHTTPClient:
             timeout=timeout,
             extra_headers=extra_headers,
             profile_enabled=profile_enabled,
+            auth_mode=auth_mode,
         )
         self._initialized = False
 
@@ -83,15 +87,19 @@ class SyncHTTPClient:
         """
         return self._async_client.session(session_id, must_exist=must_exist)
 
-    def session_exists(self, session_id: str) -> bool:
+    def session_exists(self, session_id: str, *, identity: OVIdentity | None = None) -> bool:
         """Check whether a session exists in storage."""
-        return run_async(self._async_client.session_exists(session_id))
+        return run_async(
+            self._async_client.session_exists(session_id, **_identity_arguments(identity))
+        )
 
     def create_session(
         self,
         session_id: Optional[str] = None,
         telemetry: TelemetryRequest = False,
         memory_policy: Optional[Dict[str, Any]] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Create a new session.
 
@@ -104,28 +112,97 @@ class SyncHTTPClient:
                 session_id,
                 telemetry=telemetry,
                 memory_policy=memory_policy,
+                **_identity_arguments(identity),
             )
         )
 
-    def list_sessions(self) -> List[Any]:
+    def list_sessions(self, *, identity: OVIdentity | None = None) -> List[Any]:
         """List all sessions."""
-        return run_async(self._async_client.list_sessions())
+        return run_async(self._async_client.list_sessions(**_identity_arguments(identity)))
 
-    def get_session(self, session_id: str, *, auto_create: bool = False) -> Dict[str, Any]:
+    def get_session(
+        self, session_id: str, *, auto_create: bool = False, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Get session details."""
-        return run_async(self._async_client.get_session(session_id, auto_create=auto_create))
+        return run_async(
+            self._async_client.get_session(
+                session_id, auto_create=auto_create, **_identity_arguments(identity)
+            )
+        )
 
-    def get_session_context(self, session_id: str, token_budget: int = 128_000) -> Dict[str, Any]:
+    def get_session_context(
+        self, session_id: str, token_budget: int = 128_000, *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Get assembled session context."""
-        return run_async(self._async_client.get_session_context(session_id, token_budget))
+        return run_async(
+            self._async_client.get_session_context(
+                session_id, token_budget, **_identity_arguments(identity)
+            )
+        )
 
-    def get_session_archive(self, session_id: str, archive_id: str) -> Dict[str, Any]:
+    def get_session_archive(
+        self, session_id: str, archive_id: str, *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Get one completed archive for a session."""
-        return run_async(self._async_client.get_session_archive(session_id, archive_id))
+        return run_async(
+            self._async_client.get_session_archive(
+                session_id, archive_id, **_identity_arguments(identity)
+            )
+        )
 
-    def delete_session(self, session_id: str) -> None:
+    def read_tool_result(
+        self,
+        session_id: str,
+        tool_result_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 20_000,
+        identity: OVIdentity | None = None,
+    ) -> Dict[str, Any]:
+        """Read a bounded range from a session's externalized tool result."""
+        return run_async(
+            self._async_client.read_tool_result(
+                session_id,
+                tool_result_id,
+                offset=offset,
+                limit=limit,
+                **_identity_arguments(identity),
+            )
+        )
+
+    def search_tool_result(
+        self,
+        session_id: str,
+        tool_result_id: str,
+        *,
+        query: str,
+        limit: int = 20,
+        identity: OVIdentity | None = None,
+    ) -> Dict[str, Any]:
+        """Search within a session's externalized tool result."""
+        return run_async(
+            self._async_client.search_tool_result(
+                session_id,
+                tool_result_id,
+                query=query,
+                limit=limit,
+                **_identity_arguments(identity),
+            )
+        )
+
+    def list_tool_results(
+        self, session_id: str, *, limit: int = 50, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
+        """List tool-result references in this session."""
+        return run_async(
+            self._async_client.list_tool_results(
+                session_id, limit=limit, **_identity_arguments(identity)
+            )
+        )
+
+    def delete_session(self, session_id: str, *, identity: OVIdentity | None = None) -> None:
         """Delete a session."""
-        run_async(self._async_client.delete_session(session_id))
+        run_async(self._async_client.delete_session(session_id, **_identity_arguments(identity)))
 
     def add_message(
         self,
@@ -136,6 +213,10 @@ class SyncHTTPClient:
         created_at: str | None = None,
         peer_id: str | None = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
+        message_kind: str | None = None,
+        source_message_ids: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Add a message to a session.
 
@@ -149,6 +230,11 @@ class SyncHTTPClient:
 
         If both content and parts are provided, parts takes precedence.
         """
+        options: dict[str, Any] = dict(_identity_arguments(identity))
+        if message_kind is not None:
+            options["message_kind"] = message_kind
+        if source_message_ids is not None:
+            options["source_message_ids"] = source_message_ids
         return run_async(
             self._async_client.add_message(
                 session_id,
@@ -158,6 +244,7 @@ class SyncHTTPClient:
                 created_at,
                 peer_id,
                 telemetry,
+                **options,
             )
         )
 
@@ -166,6 +253,8 @@ class SyncHTTPClient:
         session_id: str,
         messages: list[dict],
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Add multiple messages to a session in a single request.
 
@@ -180,28 +269,48 @@ class SyncHTTPClient:
         """
         return run_async(
             self._async_client.batch_add_messages(
-                session_id,
-                messages,
-                telemetry,
+                session_id, messages, telemetry, **_identity_arguments(identity)
             )
         )
 
-    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+    def get_task(
+        self, task_id: str, *, identity: OVIdentity | None = None
+    ) -> Optional[Dict[str, Any]]:
         """Query background task status."""
-        return run_async(self._async_client.get_task(task_id))
+        return run_async(self._async_client.get_task(task_id, **_identity_arguments(identity)))
 
     def reindex(
         self,
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Trigger reindex for a URI."""
         return run_async(
             self._async_client.reindex(
-                uri=uri,
-                mode=mode,
-                wait=wait,
+                uri=uri, mode=mode, wait=wait, **_identity_arguments(identity)
+            )
+        )
+
+    def list_tasks(
+        self,
+        *,
+        task_type: str | None = None,
+        status: str | None = None,
+        resource_id: str | None = None,
+        limit: int = 50,
+        identity: OVIdentity | None = None,
+    ) -> list[dict[str, Any]]:
+        """List persisted tasks using the same per-request identity as the session."""
+        return run_async(
+            self._async_client.list_tasks(
+                task_type=task_type,
+                status=status,
+                resource_id=resource_id,
+                limit=limit,
+                **_identity_arguments(identity),
             )
         )
 
@@ -211,6 +320,7 @@ class SyncHTTPClient:
         telemetry: TelemetryRequest = False,
         *,
         keep_recent_count: int = 0,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Commit a session (archive and extract memories)."""
         return run_async(
@@ -218,6 +328,7 @@ class SyncHTTPClient:
                 session_id,
                 telemetry=telemetry,
                 keep_recent_count=keep_recent_count,
+                **_identity_arguments(identity),
             )
         )
 
@@ -240,6 +351,8 @@ class SyncHTTPClient:
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking."""
         if to and parent:
@@ -261,6 +374,7 @@ class SyncHTTPClient:
                 watch_interval=watch_interval,
                 args=args,
                 telemetry=telemetry,
+                **_identity_arguments(identity),
             )
         )
 
@@ -270,15 +384,27 @@ class SyncHTTPClient:
         wait: bool = False,
         timeout: Optional[float] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Add skill to OpenViking."""
         return run_async(
-            self._async_client.add_skill(data, wait=wait, timeout=timeout, telemetry=telemetry)
+            self._async_client.add_skill(
+                data,
+                wait=wait,
+                timeout=timeout,
+                telemetry=telemetry,
+                **_identity_arguments(identity),
+            )
         )
 
-    def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def wait_processed(
+        self, timeout: Optional[float] = None, *, identity: OVIdentity | None = None
+    ) -> Dict[str, Any]:
         """Wait for all processing to complete."""
-        return run_async(self._async_client.wait_processed(timeout))
+        return run_async(
+            self._async_client.wait_processed(timeout, **_identity_arguments(identity))
+        )
 
     # ============= Search =============
 
@@ -294,6 +420,8 @@ class SyncHTTPClient:
         filter: Optional[Dict] = None,
         context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ):
         """Semantic search with optional session context."""
         return run_async(
@@ -308,6 +436,7 @@ class SyncHTTPClient:
                 filter=filter,
                 context_type=context_type,
                 telemetry=telemetry,
+                **_identity_arguments(identity),
             )
         )
 
@@ -321,6 +450,8 @@ class SyncHTTPClient:
         filter: Optional[Dict] = None,
         context_type: Optional[SearchContextTypeInput] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ):
         """Semantic search without session context."""
         return run_async(
@@ -333,6 +464,7 @@ class SyncHTTPClient:
                 filter,
                 context_type,
                 telemetry=telemetry,
+                **_identity_arguments(identity),
             )
         )
 
@@ -343,15 +475,26 @@ class SyncHTTPClient:
         case_insensitive: bool = False,
         node_limit: Optional[int] = None,
         exclude_uri: Optional[str] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict:
         """Content search with pattern."""
         return run_async(
-            self._async_client.grep(uri, pattern, case_insensitive, node_limit, exclude_uri)
+            self._async_client.grep(
+                uri,
+                pattern,
+                case_insensitive,
+                node_limit,
+                exclude_uri,
+                **_identity_arguments(identity),
+            )
         )
 
-    def glob(self, pattern: str, uri: str = "viking://") -> Dict:
+    def glob(
+        self, pattern: str, uri: str = "viking://", *, identity: OVIdentity | None = None
+    ) -> Dict:
         """File pattern matching."""
-        return run_async(self._async_client.glob(pattern, uri))
+        return run_async(self._async_client.glob(pattern, uri, **_identity_arguments(identity)))
 
     # ============= File System =============
 
@@ -364,6 +507,8 @@ class SyncHTTPClient:
         abs_limit: int = 256,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
+        *,
+        identity: OVIdentity | None = None,
     ) -> List[Any]:
         """List directory contents."""
         return run_async(
@@ -375,6 +520,7 @@ class SyncHTTPClient:
                 abs_limit=abs_limit,
                 show_all_hidden=show_all_hidden,
                 node_limit=node_limit,
+                **_identity_arguments(identity),
             )
         )
 
@@ -385,6 +531,8 @@ class SyncHTTPClient:
         abs_limit: int = 128,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
+        *,
+        identity: OVIdentity | None = None,
     ) -> List[Dict[str, Any]]:
         """Get directory tree."""
         return run_async(
@@ -394,38 +542,49 @@ class SyncHTTPClient:
                 abs_limit=abs_limit,
                 show_all_hidden=show_all_hidden,
                 node_limit=node_limit,
+                **_identity_arguments(identity),
             )
         )
 
-    def stat(self, uri: str) -> Dict:
+    def stat(self, uri: str, *, identity: OVIdentity | None = None) -> Dict:
         """Get resource status."""
-        return run_async(self._async_client.stat(uri))
+        return run_async(self._async_client.stat(uri, **_identity_arguments(identity)))
 
-    def mkdir(self, uri: str, description: Optional[str] = None) -> None:
+    def mkdir(
+        self, uri: str, description: Optional[str] = None, *, identity: OVIdentity | None = None
+    ) -> None:
         """Create directory."""
-        run_async(self._async_client.mkdir(uri, description=description))
+        run_async(
+            self._async_client.mkdir(uri, description=description, **_identity_arguments(identity))
+        )
 
-    def rm(self, uri: str, recursive: bool = False) -> None:
+    def rm(self, uri: str, recursive: bool = False, *, identity: OVIdentity | None = None) -> None:
         """Remove resource."""
-        run_async(self._async_client.rm(uri, recursive))
+        run_async(self._async_client.rm(uri, recursive, **_identity_arguments(identity)))
 
-    def mv(self, from_uri: str, to_uri: str) -> None:
+    def mv(self, from_uri: str, to_uri: str, *, identity: OVIdentity | None = None) -> None:
         """Move resource."""
-        run_async(self._async_client.mv(from_uri, to_uri))
+        run_async(self._async_client.mv(from_uri, to_uri, **_identity_arguments(identity)))
 
     # ============= Content =============
 
-    def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+    def read(
+        self, uri: str, offset: int = 0, limit: int = -1, *, identity: OVIdentity | None = None
+    ) -> str:
         """Read file content."""
-        return run_async(self._async_client.read(uri, offset=offset, limit=limit))
+        return run_async(
+            self._async_client.read(
+                uri, offset=offset, limit=limit, **_identity_arguments(identity)
+            )
+        )
 
-    def abstract(self, uri: str) -> str:
+    def abstract(self, uri: str, *, identity: OVIdentity | None = None) -> str:
         """Read L0 abstract."""
-        return run_async(self._async_client.abstract(uri))
+        return run_async(self._async_client.abstract(uri, **_identity_arguments(identity)))
 
-    def overview(self, uri: str) -> str:
+    def overview(self, uri: str, *, identity: OVIdentity | None = None) -> str:
         """Read L1 overview."""
-        return run_async(self._async_client.overview(uri))
+        return run_async(self._async_client.overview(uri, **_identity_arguments(identity)))
 
     def write(
         self,
@@ -435,6 +594,8 @@ class SyncHTTPClient:
         wait: bool = False,
         timeout: Optional[float] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> Dict[str, Any]:
         """Write text content to an existing file and refresh semantics/vectors."""
         return run_async(
@@ -445,22 +606,30 @@ class SyncHTTPClient:
                 wait=wait,
                 timeout=timeout,
                 telemetry=telemetry,
+                **_identity_arguments(identity),
             )
         )
 
     # ============= Relations =============
 
-    def relations(self, uri: str) -> List[Dict[str, Any]]:
+    def relations(self, uri: str, *, identity: OVIdentity | None = None) -> List[Dict[str, Any]]:
         """Get relations for a resource."""
-        return run_async(self._async_client.relations(uri))
+        return run_async(self._async_client.relations(uri, **_identity_arguments(identity)))
 
-    def link(self, from_uri: str, uris: Union[str, List[str]], reason: str = "") -> None:
+    def link(
+        self,
+        from_uri: str,
+        uris: Union[str, List[str]],
+        reason: str = "",
+        *,
+        identity: OVIdentity | None = None,
+    ) -> None:
         """Create link between resources."""
-        run_async(self._async_client.link(from_uri, uris, reason))
+        run_async(self._async_client.link(from_uri, uris, reason, **_identity_arguments(identity)))
 
-    def unlink(self, from_uri: str, uri: str) -> None:
+    def unlink(self, from_uri: str, uri: str, *, identity: OVIdentity | None = None) -> None:
         """Remove link between resources."""
-        run_async(self._async_client.unlink(from_uri, uri))
+        run_async(self._async_client.unlink(from_uri, uri, **_identity_arguments(identity)))
 
     # ============= Pack =============
 
@@ -469,6 +638,8 @@ class SyncHTTPClient:
         uri: str,
         to: str,
         include_vectors: bool = False,
+        *,
+        identity: OVIdentity | None = None,
     ) -> str:
         """Export context as .ovpack file and save to local path.
 
@@ -479,11 +650,21 @@ class SyncHTTPClient:
         Returns:
             Local file path where the .ovpack was saved
         """
-        return run_async(self._async_client.export_ovpack(uri, to, include_vectors=include_vectors))
+        return run_async(
+            self._async_client.export_ovpack(
+                uri, to, include_vectors=include_vectors, **_identity_arguments(identity)
+            )
+        )
 
-    def backup_ovpack(self, to: str, include_vectors: bool = False) -> str:
+    def backup_ovpack(
+        self, to: str, include_vectors: bool = False, *, identity: OVIdentity | None = None
+    ) -> str:
         """Back up public scopes as a restore-only .ovpack file."""
-        return run_async(self._async_client.backup_ovpack(to, include_vectors=include_vectors))
+        return run_async(
+            self._async_client.backup_ovpack(
+                to, include_vectors=include_vectors, **_identity_arguments(identity)
+            )
+        )
 
     def import_ovpack(
         self,
@@ -491,6 +672,8 @@ class SyncHTTPClient:
         target: str,
         on_conflict: Optional[str] = None,
         vector_mode: Optional[str] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> str:
         """Import .ovpack file."""
         return run_async(
@@ -499,6 +682,7 @@ class SyncHTTPClient:
                 target,
                 on_conflict=on_conflict,
                 vector_mode=vector_mode,
+                **_identity_arguments(identity),
             )
         )
 
@@ -507,6 +691,8 @@ class SyncHTTPClient:
         file_path: str,
         on_conflict: Optional[str] = None,
         vector_mode: Optional[str] = None,
+        *,
+        identity: OVIdentity | None = None,
     ) -> str:
         """Restore backup .ovpack file."""
         return run_async(
@@ -514,12 +700,13 @@ class SyncHTTPClient:
                 file_path,
                 on_conflict=on_conflict,
                 vector_mode=vector_mode,
+                **_identity_arguments(identity),
             )
         )
 
-    def check_consistency(self, uri: str) -> Dict[str, Any]:
+    def check_consistency(self, uri: str, *, identity: OVIdentity | None = None) -> Dict[str, Any]:
         """Check filesystem/vector-index consistency for a URI subtree."""
-        return run_async(self._async_client.check_consistency(uri))
+        return run_async(self._async_client.check_consistency(uri, **_identity_arguments(identity)))
 
     # ============= Admin =============
 
