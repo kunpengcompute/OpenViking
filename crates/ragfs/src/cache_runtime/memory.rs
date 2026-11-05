@@ -150,6 +150,11 @@ impl MemoryMockProvider {
         keys
     }
 
+    /// Return the keys of each observed MGET for batch-boundary assertions.
+    pub fn observed_read_batches(&self) -> Vec<Vec<String>> {
+        self.seen_batch_get_keys.lock().unwrap().clone()
+    }
+
     /// Return the maximum number of concurrent get calls since the last reset.
     pub fn max_concurrent_gets(&self) -> u64 {
         self.max_active_gets.load(Ordering::Relaxed)

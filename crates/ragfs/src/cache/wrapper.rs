@@ -20,15 +20,21 @@ use futures::stream::{self, StreamExt};
 use regex::Regex;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-const GREP_CACHE_FILE_CONCURRENCY: usize = 8;
+const GREP_CACHE_FETCH_BATCH_SIZE: usize = 256;
 const GENERATION_PUT_CONCURRENCY: usize = 8;
+
+fn grep_cache_file_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() * 2).clamp(16, 100))
+        .unwrap_or(16)
+}
 
 /// Namespace prepended to every provider key owned by one wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +158,7 @@ impl CachedFileSystem {
 
         let base_path = normalize_prefix_path(path);
         let mut result = Vec::new();
+        let generation_cache = Mutex::new(HashMap::new());
         let mut stack = vec![TreeTask::VisitDir(base_path.clone())];
         let traversal_limit = node_limit.map(|limit| offset.unwrap_or(0).saturating_add(limit));
 
@@ -171,8 +178,9 @@ impl CachedFileSystem {
                     }
 
                     let entries = self
-                        .read_dir(&current_path, None, None, sort_by, sort_order)
+                        .read_dir_with_generation_cache(&current_path, &generation_cache)
                         .await?;
+                    let entries = apply_read_dir_options(entries, None, None, sort_by, sort_order);
                     for entry in entries.into_iter().rev() {
                         let is_hidden_file = !entry.is_dir && entry.name.starts_with('.');
                         if is_hidden_file && !show_hidden {
@@ -305,7 +313,7 @@ impl CachedFileSystem {
                 }
 
                 file_batch.push(current_path);
-                if file_batch.len() >= GREP_CACHE_FILE_CONCURRENCY {
+                if file_batch.len() >= GREP_CACHE_FETCH_BATCH_SIZE {
                     self.flush_grep_file_batch(
                         &mut file_batch,
                         &base_path,
@@ -355,22 +363,31 @@ impl CachedFileSystem {
             .map(|limit| limit.saturating_sub(result.count))
             .unwrap_or(usize::MAX);
         let files = std::mem::take(file_batch);
-        let mut indexed = stream::iter(files.into_iter().enumerate())
-            .map(|(index, path)| async move {
-                let matches = self
-                    .grep_cached_file(
-                        &path,
-                        base_path,
-                        re,
-                        remaining_limit,
-                        options.before_context,
-                        options.after_context,
-                        generation_cache,
-                    )
-                    .await;
+        let cached = self.probe_grep_file_batch(&files, generation_cache).await;
+        let mut indexed = stream::iter(files.into_iter().zip(cached).enumerate())
+            .map(|(index, (path, cached))| async move {
+                let content = match cached {
+                    Some(content) => content,
+                    None => match self
+                        .read_with_generation_cache(&path, 0, 0, generation_cache)
+                        .await
+                    {
+                        Ok(content) => Bytes::from(content),
+                        Err(error) => return (index, Err(error)),
+                    },
+                };
+                let matches = Self::grep_content(
+                    &content,
+                    &path,
+                    base_path,
+                    re,
+                    remaining_limit,
+                    options.before_context,
+                    options.after_context,
+                );
                 (index, matches)
             })
-            .buffer_unordered(GREP_CACHE_FILE_CONCURRENCY)
+            .buffer_unordered(grep_cache_file_concurrency())
             .collect::<Vec<_>>()
             .await;
 
@@ -391,20 +408,16 @@ impl CachedFileSystem {
         Ok(())
     }
 
-    async fn grep_cached_file(
-        &self,
+    fn grep_content(
+        content: &[u8],
         path: &str,
         base_path: &str,
         re: &Regex,
         remaining_limit: usize,
         before_context: usize,
         after_context: usize,
-        generation_cache: &Mutex<HashMap<String, u64>>,
     ) -> Result<Vec<GrepMatch>> {
-        let content = self
-            .read_with_generation_cache(path, 0, 0, generation_cache)
-            .await?;
-        let content_str = String::from_utf8_lossy(&content);
+        let content_str = String::from_utf8_lossy(content);
         let rel_file = relative_match_file(base_path, path);
         let mut result = GrepResult {
             matches: Vec::with_capacity(remaining_limit.min(64)),
@@ -434,6 +447,116 @@ impl CachedFileSystem {
 
         drop(collector);
         Ok(result.matches)
+    }
+
+    async fn probe_grep_file_batch(
+        &self,
+        paths: &[String],
+        generation_cache: &Mutex<HashMap<String, u64>>,
+    ) -> Vec<Option<Bytes>> {
+        let mut result = vec![None; paths.len()];
+        // As with single-file probes, serialize validation against local writes.
+        let _operation_guard = self.operation_lock.read().await;
+        let mut eligible = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            if self.policy.cache_file(path, 0) && !self.is_runtime_bypassed(path).await {
+                let path = normalize_path(path);
+                eligible.push((index, self.file_key(&path), path));
+            }
+        }
+        let keys = eligible
+            .iter()
+            .map(|(_, key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return result;
+        }
+        let values = match self.cache_batch_get(&keys).await {
+            Ok(values) => values,
+            Err(_) => {
+                self.metrics.error();
+                for (_, _, path) in eligible {
+                    self.mark_bypass(&path).await;
+                }
+                return result;
+            }
+        };
+
+        // Decode the whole batch in one blocking task. File payloads remain
+        // slices of the provider's Bytes buffers instead of being copied.
+        let decoded = tokio::task::spawn_blocking(move || {
+            eligible
+                .into_iter()
+                .zip(values)
+                .filter_map(|((index, key, path), value)| {
+                    value.map(|value| (index, key, path, CacheEnvelope::decode(value)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.metrics.error();
+                return result;
+            }
+        };
+        let mut candidates = Vec::new();
+        let mut generation_keys = Vec::new();
+        let mut seen = HashSet::new();
+        for (index, key, path, envelope) in decoded {
+            match envelope {
+                Ok(envelope) if envelope.matches(CacheObjectKind::File, &path) => {
+                    for snapshot in envelope.generations() {
+                        if seen.insert(snapshot.key.clone()) {
+                            generation_keys.push(snapshot.key.clone());
+                        }
+                    }
+                    candidates.push((index, key, path, envelope));
+                }
+                _ => {
+                    self.metrics.error();
+                    self.cache_delete(&key, &path).await;
+                }
+            }
+        }
+        let generations = match self
+            .current_generations_memoized(&generation_keys, generation_cache)
+            .await
+        {
+            Ok(values) => generation_keys
+                .into_iter()
+                .zip(values)
+                .collect::<HashMap<_, _>>(),
+            Err(_) => {
+                self.metrics.error();
+                for (_, _, path, _) in candidates {
+                    self.mark_bypass(&path).await;
+                }
+                return result;
+            }
+        };
+        for (index, key, path, envelope) in candidates {
+            if !envelope
+                .generations()
+                .iter()
+                .all(|snapshot| generations.get(&snapshot.key) == Some(&snapshot.value))
+            {
+                self.cache_delete(&key, &path).await;
+                continue;
+            }
+            match envelope.into_file() {
+                Ok(data) => {
+                    self.metrics.file_hit(data.len());
+                    result[index] = Some(data);
+                }
+                Err(_) => {
+                    self.metrics.error();
+                    self.cache_delete(&key, &path).await;
+                }
+            }
+        }
+        result
     }
 
     async fn cache_get(&self, key: &str) -> CacheResult<Option<Bytes>> {
@@ -1472,3 +1595,6 @@ fn nonzero_random_u64() -> u64 {
         value
     }
 }
+
+#[cfg(test)]
+mod tests;
