@@ -1,0 +1,2501 @@
+OpenViking v0.5.0 CacheFS query caching and Redis read optimizations
+
+Source-PR: https://gitcode.com/boostkit/OpenViking/pull/20
+Source-Head: 0c7153840f625305486092a05d522b76a610bf23
+Upstream-Base: v0.5.0 (20f9c11362ad16193b0daa4a414e1095061af427)
+Scope: the nine CacheFS feature files after the imported baseline;
+       excludes baseline import, CI integration and documentation changes.
+Apply from the upstream repository root with: git apply --check <patch>
+Then apply with: git apply <patch>
+
+diff --git a/crates/ragfs/src/cache/envelope.rs b/crates/ragfs/src/cache/envelope.rs
+index 851bb2902e4c57f9d63f0dacaf038111537cadbb..84a7df1d373b38d3ae26ff0ce934e61f603ecb94 100644
+--- a/crates/ragfs/src/cache/envelope.rs
++++ b/crates/ragfs/src/cache/envelope.rs
+@@ -3,31 +3,33 @@
+ use crate::cache_runtime::{CacheError, CacheResult};
+ use crate::core::FileInfo;
+ use bytes::Bytes;
+-use serde::{Deserialize, Serialize};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+-const CACHE_ENVELOPE_VERSION: u8 = 1;
++const CACHE_ENVELOPE_MAGIC: &[u8; 4] = b"RGFC";
++const CACHE_ENVELOPE_VERSION: u8 = 2;
++const KIND_FILE: u8 = 1;
++const KIND_DIRECTORY: u8 = 2;
+ 
+-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum CacheObjectKind {
+     File,
+     Directory,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize)]
++#[derive(Debug, Clone)]
+ pub(crate) struct GenerationSnapshot {
+     pub key: String,
+     pub value: u64,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize)]
++#[derive(Debug, Clone)]
+ enum CachePayload {
+-    File(Vec<u8>),
++    File(Bytes),
+     Directory(Vec<FileInfo>),
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize)]
++#[derive(Debug, Clone)]
+ pub(crate) struct CacheEnvelope {
+-    version: u8,
+     kind: CacheObjectKind,
+     path: String,
+     generations: Vec<GenerationSnapshot>,
+@@ -37,11 +39,10 @@ pub(crate) struct CacheEnvelope {
+ impl CacheEnvelope {
+     pub fn file(path: String, data: Vec<u8>, generations: Vec<GenerationSnapshot>) -> Self {
+         Self {
+-            version: CACHE_ENVELOPE_VERSION,
+             kind: CacheObjectKind::File,
+             path,
+             generations,
+-            payload: CachePayload::File(data),
++            payload: CachePayload::File(Bytes::from(data)),
+         }
+     }
+ 
+@@ -51,7 +52,6 @@ impl CacheEnvelope {
+         generations: Vec<GenerationSnapshot>,
+     ) -> Self {
+         Self {
+-            version: CACHE_ENVELOPE_VERSION,
+             kind: CacheObjectKind::Directory,
+             path,
+             generations,
+@@ -60,21 +60,88 @@ impl CacheEnvelope {
+     }
+ 
+     pub fn encode(&self) -> CacheResult<Bytes> {
+-        serde_json::to_vec(self)
+-            .map(Bytes::from)
+-            .map_err(|error| CacheError::InvalidData(error.to_string()))
++        let mut encoded = Vec::new();
++        encoded.extend_from_slice(CACHE_ENVELOPE_MAGIC);
++        encoded.push(CACHE_ENVELOPE_VERSION);
++        encoded.push(match self.kind {
++            CacheObjectKind::File => KIND_FILE,
++            CacheObjectKind::Directory => KIND_DIRECTORY,
++        });
++        write_string(&mut encoded, &self.path)?;
++        write_u32(&mut encoded, self.generations.len())?;
++        for snapshot in &self.generations {
++            write_string(&mut encoded, &snapshot.key)?;
++            encoded.extend_from_slice(&snapshot.value.to_be_bytes());
++        }
++        match &self.payload {
++            CachePayload::File(data) => {
++                write_u64(&mut encoded, data.len())?;
++                encoded.extend_from_slice(data);
++            }
++            CachePayload::Directory(entries) => {
++                let payload = encode_directory_payload(entries)?;
++                write_u64(&mut encoded, payload.len())?;
++                encoded.extend_from_slice(&payload);
++            }
++        }
++        Ok(Bytes::from(encoded))
+     }
+ 
+-    pub fn decode(value: &[u8]) -> CacheResult<Self> {
+-        let envelope: Self = serde_json::from_slice(value)
+-            .map_err(|error| CacheError::InvalidData(error.to_string()))?;
+-        if envelope.version != CACHE_ENVELOPE_VERSION {
++    pub fn decode(value: Bytes) -> CacheResult<Self> {
++        let mut reader = BinaryReader::new(&value);
++        let magic = reader.read_bytes(CACHE_ENVELOPE_MAGIC.len())?;
++        if magic != CACHE_ENVELOPE_MAGIC {
++            return Err(CacheError::InvalidData(
++                "invalid envelope magic".to_string(),
++            ));
++        }
++        let version = reader.read_u8()?;
++        if version != CACHE_ENVELOPE_VERSION {
+             return Err(CacheError::InvalidData(format!(
+-                "unsupported envelope version {}",
+-                envelope.version
++                "unsupported envelope version {version}"
+             )));
+         }
+-        Ok(envelope)
++        let kind = match reader.read_u8()? {
++            KIND_FILE => CacheObjectKind::File,
++            KIND_DIRECTORY => CacheObjectKind::Directory,
++            other => {
++                return Err(CacheError::InvalidData(format!(
++                    "unsupported envelope kind {other}"
++                )))
++            }
++        };
++        let path = reader.read_string()?;
++        let generation_count = reader.read_count(12)?;
++        let mut generations = Vec::with_capacity(generation_count);
++        for _ in 0..generation_count {
++            generations.push(GenerationSnapshot {
++                key: reader.read_string()?,
++                value: reader.read_u64()?,
++            });
++        }
++        let payload_len = usize::try_from(reader.read_u64()?)
++            .map_err(|_| CacheError::InvalidData("cache envelope payload too large".to_string()))?;
++        let payload_start = reader.position;
++        let payload_bytes = reader.read_bytes(payload_len)?;
++        if !reader.is_finished() {
++            return Err(CacheError::InvalidData(
++                "trailing bytes in cache envelope".to_string(),
++            ));
++        }
++        let payload = match kind {
++            CacheObjectKind::File => {
++                CachePayload::File(value.slice(payload_start..payload_start + payload_len))
++            }
++            CacheObjectKind::Directory => {
++                CachePayload::Directory(decode_directory_payload(payload_bytes)?)
++            }
++        };
++        Ok(Self {
++            kind,
++            path,
++            generations,
++            payload,
++        })
+     }
+ 
+     pub fn matches(&self, kind: CacheObjectKind, path: &str) -> bool {
+@@ -85,7 +152,7 @@ impl CacheEnvelope {
+         &self.generations
+     }
+ 
+-    pub fn into_file(self) -> CacheResult<Vec<u8>> {
++    pub fn into_file(self) -> CacheResult<Bytes> {
+         match self.payload {
+             CachePayload::File(data) => Ok(data),
+             CachePayload::Directory(_) => {
+@@ -103,3 +170,194 @@ impl CacheEnvelope {
+         }
+     }
+ }
++
++fn write_u32(buffer: &mut Vec<u8>, value: usize) -> CacheResult<()> {
++    let value = u32::try_from(value)
++        .map_err(|_| CacheError::InvalidData("cache envelope field too large".to_string()))?;
++    buffer.extend_from_slice(&value.to_be_bytes());
++    Ok(())
++}
++
++fn write_u64(buffer: &mut Vec<u8>, value: usize) -> CacheResult<()> {
++    let value = u64::try_from(value)
++        .map_err(|_| CacheError::InvalidData("cache envelope payload too large".to_string()))?;
++    buffer.extend_from_slice(&value.to_be_bytes());
++    Ok(())
++}
++
++fn write_string(buffer: &mut Vec<u8>, value: &str) -> CacheResult<()> {
++    write_u32(buffer, value.len())?;
++    buffer.extend_from_slice(value.as_bytes());
++    Ok(())
++}
++
++fn encode_directory_payload(entries: &[FileInfo]) -> CacheResult<Vec<u8>> {
++    let mut encoded = Vec::new();
++    write_u32(&mut encoded, entries.len())?;
++    for entry in entries {
++        write_string(&mut encoded, &entry.name)?;
++        encoded.extend_from_slice(&entry.size.to_be_bytes());
++        encoded.extend_from_slice(&entry.mode.to_be_bytes());
++        let (secs, nanos) = system_time_to_parts(entry.mod_time)?;
++        encoded.extend_from_slice(&secs.to_be_bytes());
++        encoded.extend_from_slice(&nanos.to_be_bytes());
++        encoded.push(u8::from(entry.is_dir));
++    }
++    Ok(encoded)
++}
++
++fn decode_directory_payload(value: &[u8]) -> CacheResult<Vec<FileInfo>> {
++    let mut reader = BinaryReader::new(value);
++    let entry_count = reader.read_count(29)?;
++    let mut entries = Vec::with_capacity(entry_count);
++    for _ in 0..entry_count {
++        let name = reader.read_string()?;
++        let size = reader.read_u64()?;
++        let mode = reader.read_u32()?;
++        let secs = reader.read_i64()?;
++        let nanos = reader.read_u32()?;
++        if nanos >= 1_000_000_000 {
++            return Err(CacheError::InvalidData(
++                "invalid FileInfo timestamp nanos".to_string(),
++            ));
++        }
++        let is_dir = match reader.read_u8()? {
++            0 => false,
++            1 => true,
++            _ => {
++                return Err(CacheError::InvalidData(
++                    "invalid FileInfo directory flag".to_string(),
++                ))
++            }
++        };
++        entries.push(FileInfo {
++            name,
++            size,
++            mode,
++            mod_time: parts_to_system_time(secs, nanos)?,
++            is_dir,
++        });
++    }
++    if !reader.is_finished() {
++        return Err(CacheError::InvalidData(
++            "trailing bytes in directory payload".to_string(),
++        ));
++    }
++    Ok(entries)
++}
++
++// Use signed Unix seconds with a nonnegative nanosecond fraction, including
++// timestamps before the epoch (e.g. -0.5s is encoded as -1s + 500,000,000ns).
++fn system_time_to_parts(value: SystemTime) -> CacheResult<(i64, u32)> {
++    let parts = match value.duration_since(UNIX_EPOCH) {
++        Ok(duration) => i64::try_from(duration.as_secs())
++            .ok()
++            .map(|secs| (secs, duration.subsec_nanos())),
++        Err(error) => {
++            let duration = error.duration();
++            let nanos = duration.subsec_nanos();
++            i64::try_from(duration.as_secs())
++                .ok()
++                .and_then(|secs| secs.checked_neg())
++                .and_then(|secs| {
++                    if nanos == 0 {
++                        Some((secs, 0))
++                    } else {
++                        secs.checked_sub(1)
++                            .map(|secs| (secs, 1_000_000_000 - nanos))
++                    }
++                })
++        }
++    };
++    parts.ok_or_else(|| CacheError::InvalidData("FileInfo timestamp out of range".to_string()))
++}
++
++fn parts_to_system_time(secs: i64, nanos: u32) -> CacheResult<SystemTime> {
++    let seconds = Duration::from_secs(secs.unsigned_abs());
++    let base = if secs >= 0 {
++        UNIX_EPOCH.checked_add(seconds)
++    } else {
++        UNIX_EPOCH.checked_sub(seconds)
++    };
++    base.and_then(|time| time.checked_add(Duration::from_nanos(u64::from(nanos))))
++        .ok_or_else(|| CacheError::InvalidData("FileInfo timestamp out of range".to_string()))
++}
++
++struct BinaryReader<'a> {
++    value: &'a [u8],
++    position: usize,
++}
++
++impl<'a> BinaryReader<'a> {
++    fn new(value: &'a [u8]) -> Self {
++        Self { value, position: 0 }
++    }
++
++    fn is_finished(&self) -> bool {
++        self.position == self.value.len()
++    }
++
++    fn read_bytes(&mut self, len: usize) -> CacheResult<&'a [u8]> {
++        let end = self
++            .position
++            .checked_add(len)
++            .ok_or_else(|| CacheError::InvalidData("cache envelope offset overflow".to_string()))?;
++        if end > self.value.len() {
++            return Err(CacheError::InvalidData(
++                "truncated cache envelope".to_string(),
++            ));
++        }
++        let bytes = &self.value[self.position..end];
++        self.position = end;
++        Ok(bytes)
++    }
++
++    fn read_count(&mut self, min_item_size: usize) -> CacheResult<usize> {
++        let count = self.read_u32()? as usize;
++        if count > (self.value.len() - self.position) / min_item_size {
++            return Err(CacheError::InvalidData(
++                "invalid cache envelope item count".to_string(),
++            ));
++        }
++        Ok(count)
++    }
++
++    fn read_u8(&mut self) -> CacheResult<u8> {
++        Ok(self.read_bytes(1)?[0])
++    }
++
++    fn read_u32(&mut self) -> CacheResult<u32> {
++        let bytes: [u8; 4] = self
++            .read_bytes(4)?
++            .try_into()
++            .map_err(|_| CacheError::InvalidData("invalid u32 in cache envelope".to_string()))?;
++        Ok(u32::from_be_bytes(bytes))
++    }
++
++    fn read_u64(&mut self) -> CacheResult<u64> {
++        let bytes: [u8; 8] = self
++            .read_bytes(8)?
++            .try_into()
++            .map_err(|_| CacheError::InvalidData("invalid u64 in cache envelope".to_string()))?;
++        Ok(u64::from_be_bytes(bytes))
++    }
++
++    fn read_i64(&mut self) -> CacheResult<i64> {
++        let bytes: [u8; 8] = self
++            .read_bytes(8)?
++            .try_into()
++            .map_err(|_| CacheError::InvalidData("invalid i64 in cache envelope".to_string()))?;
++        Ok(i64::from_be_bytes(bytes))
++    }
++
++    fn read_string(&mut self) -> CacheResult<String> {
++        let len = self.read_u32()? as usize;
++        let bytes = self.read_bytes(len)?;
++        std::str::from_utf8(bytes)
++            .map(str::to_owned)
++            .map_err(|error| CacheError::InvalidData(error.to_string()))
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/ragfs/src/cache/envelope/tests.rs b/crates/ragfs/src/cache/envelope/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6ff77cf3f719c80b7c23eb81792cf9f8d5f0d82
+--- /dev/null
++++ b/crates/ragfs/src/cache/envelope/tests.rs
+@@ -0,0 +1,142 @@
++use super::*;
++
++fn generations() -> Vec<GenerationSnapshot> {
++    vec![GenerationSnapshot {
++        key: "ragfs:v2:test:subtree:0123456789abcdef".to_string(),
++        value: u64::MAX,
++    }]
++}
++
++#[test]
++fn binary_files_round_trip_and_borrow_the_encoded_payload() {
++    for data in [Vec::new(), (0..=255).collect::<Vec<u8>>(), vec![b'x'; 1024]] {
++        let encoded = CacheEnvelope::file("/文档/a.txt".into(), data.clone(), generations())
++            .encode()
++            .unwrap();
++        assert!(encoded.starts_with(b"RGFC\x02\x01"));
++        let decoded = CacheEnvelope::decode(encoded.clone()).unwrap();
++        assert!(decoded.matches(CacheObjectKind::File, "/文档/a.txt"));
++        assert_eq!(decoded.generations()[0].key, generations()[0].key);
++        assert_eq!(decoded.generations()[0].value, u64::MAX);
++        let payload = decoded.into_file().unwrap();
++        assert_eq!(payload.as_ref(), data);
++        if !data.is_empty() {
++            assert_eq!(
++                payload.as_ptr(),
++                encoded[encoded.len() - data.len()..].as_ptr()
++            );
++        }
++        if data.len() == 1024 {
++            let json = serde_json::to_vec(&serde_json::json!({
++                "version": 1, "kind": "File", "path": "/文档/a.txt",
++                "generations": [{"key": generations()[0].key, "value": u64::MAX}],
++                "payload": {"File": data}
++            }))
++            .unwrap();
++            assert!(encoded.len() * 3 < json.len());
++        }
++    }
++}
++
++#[test]
++fn binary_directories_preserve_metadata_and_subsecond_timestamps() {
++    let times = [
++        UNIX_EPOCH,
++        UNIX_EPOCH + Duration::new(123, 987_654_321),
++        UNIX_EPOCH - Duration::from_millis(500),
++        UNIX_EPOCH - Duration::new(123, 987_654_321),
++    ];
++    let entries = times
++        .into_iter()
++        .enumerate()
++        .map(|(index, time)| {
++            FileInfo::new(
++                format!(".目录-{index}"),
++                u64::MAX,
++                u32::MAX,
++                time,
++                index % 2 == 0,
++            )
++        })
++        .collect::<Vec<_>>();
++    for entries in [Vec::new(), entries] {
++        let encoded = CacheEnvelope::directory("/docs".into(), entries.clone(), generations())
++            .encode()
++            .unwrap();
++        assert!(encoded.starts_with(b"RGFC\x02\x02"));
++        let decoded = CacheEnvelope::decode(encoded).unwrap();
++        assert!(decoded.matches(CacheObjectKind::Directory, "/docs"));
++        assert_eq!(decoded.generations()[0].value, u64::MAX);
++        let actual = decoded.into_directory().unwrap();
++        assert_eq!(actual.len(), entries.len());
++        for (actual, expected) in actual.iter().zip(entries) {
++            assert_eq!(actual.name, expected.name);
++            assert_eq!(actual.size, expected.size);
++            assert_eq!(actual.mode, expected.mode);
++            assert_eq!(actual.mod_time, expected.mod_time);
++            assert_eq!(actual.is_dir, expected.is_dir);
++        }
++    }
++}
++
++#[test]
++fn malformed_envelopes_are_rejected_without_panicking_or_large_allocations() {
++    let file = CacheEnvelope::file("/a".into(), b"payload".to_vec(), generations())
++        .encode()
++        .unwrap();
++    let directory = CacheEnvelope::directory(
++        "/a".into(),
++        vec![FileInfo::new("b".into(), 1, 0o644, UNIX_EPOCH, false)],
++        Vec::new(),
++    )
++    .encode()
++    .unwrap();
++    for encoded in [&file, &directory] {
++        for length in 0..encoded.len() {
++            assert!(CacheEnvelope::decode(encoded.slice(..length)).is_err());
++        }
++        let mut trailing = encoded.to_vec();
++        trailing.push(0);
++        assert!(CacheEnvelope::decode(trailing.into()).is_err());
++    }
++    let mut invalid = Vec::new();
++    for (index, value) in [(0, b'?'), (4, 1), (5, 0), (10, 0xff)] {
++        let mut bytes = file.to_vec();
++        bytes[index] = value;
++        invalid.push(bytes);
++    }
++    let mut huge_generations = file.to_vec();
++    huge_generations[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
++    invalid.push(huge_generations);
++    let mut huge_payload = file.to_vec();
++    let payload_length_offset = file.len() - b"payload".len() - 8;
++    huge_payload[payload_length_offset..payload_length_offset + 8]
++        .copy_from_slice(&u64::MAX.to_be_bytes());
++    invalid.push(huge_payload);
++    let mut huge_directory = directory.to_vec();
++    // This fixture has a two-byte path, no generations and a four-byte entry count.
++    huge_directory[24..28].copy_from_slice(&u32::MAX.to_be_bytes());
++    invalid.push(huge_directory);
++    let mut bad_nanos = directory.to_vec();
++    let nanos_offset = bad_nanos.len() - 5;
++    bad_nanos[nanos_offset..nanos_offset + 4].copy_from_slice(&1_000_000_000u32.to_be_bytes());
++    invalid.push(bad_nanos);
++    let mut bad_flag = directory.to_vec();
++    *bad_flag.last_mut().unwrap() = 2;
++    invalid.push(bad_flag);
++    invalid.push(
++        br#"{"version":1,"kind":"File","path":"/a","generations":[],"payload":{"File":[1]}}"#
++            .to_vec(),
++    );
++    for value in invalid {
++        assert!(CacheEnvelope::decode(value.into()).is_err());
++    }
++    assert!(CacheEnvelope::decode(file)
++        .unwrap()
++        .into_directory()
++        .is_err());
++    assert!(CacheEnvelope::decode(directory)
++        .unwrap()
++        .into_file()
++        .is_err());
++}
+diff --git a/crates/ragfs/src/cache/mod.rs b/crates/ragfs/src/cache/mod.rs
+index 6c3ca10e45cefe98ee1b9ad33d6f70012b216b91..29987ec282b9a4c93381f90cc32104d74392a8db 100644
+--- a/crates/ragfs/src/cache/mod.rs
++++ b/crates/ragfs/src/cache/mod.rs
+@@ -7,6 +7,7 @@
+ mod envelope;
+ mod metrics;
+ mod policy;
++mod query;
+ mod wrapper;
+ 
+ pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
+diff --git a/crates/ragfs/src/cache/query.rs b/crates/ragfs/src/cache/query.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6bde5ede187f3470665aaa5ee1bbe3ca3afbcce
+--- /dev/null
++++ b/crates/ragfs/src/cache/query.rs
+@@ -0,0 +1,187 @@
++//! Result buckets kept separate from file bodies and raw directory entries.
++
++use super::metrics::CacheMetrics;
++use super::wrapper::{ancestor_scopes, normalize_path, stable_hash};
++use crate::cache_runtime::{CacheRuntime, Expiration, SetOptions, SetResult};
++use crate::core::Result;
++use bytes::Bytes;
++use serde::{de::DeserializeOwned, Deserialize, Serialize};
++use serde_json::Value;
++use std::collections::{BTreeMap, BTreeSet};
++use std::future::Future;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++use tokio::sync::RwLock;
++
++#[derive(Default)]
++struct State {
++    revision: u64,
++    paths: BTreeSet<String>,
++    disabled: bool,
++}
++
++#[derive(Serialize, Deserialize)]
++struct Bucket {
++    path: String,
++    queries: BTreeMap<String, Value>,
++}
++
++pub(super) struct QueryCache {
++    prefix: String,
++    runtime: Arc<CacheRuntime>,
++    metrics: Arc<CacheMetrics>,
++    state: RwLock<State>,
++}
++
++impl QueryCache {
++    pub(super) fn new(
++        namespace: &str,
++        epoch: u64,
++        runtime: Arc<CacheRuntime>,
++        metrics: Arc<CacheMetrics>,
++    ) -> Self {
++        Self {
++            // The path index belongs to this wrapper. A new wrapper must never
++            // read buckets whose invalidation index was lost with its owner.
++            prefix: format!("ragfs:v1:{namespace}:query:{epoch:016x}"),
++            runtime,
++            metrics,
++            state: RwLock::new(State::default()),
++        }
++    }
++
++    fn key(&self, path: &str) -> String {
++        format!("{}:{:016x}", self.prefix, stable_hash(path.as_bytes()))
++    }
++
++    async fn bucket(&self, path: &str) -> Option<Bucket> {
++        let started = Instant::now();
++        let result = self.runtime.get(&self.key(path)).await;
++        self.metrics.get(started.elapsed());
++        match result {
++            Ok(Some(bytes)) => match serde_json::from_slice::<Bucket>(&bytes) {
++                Ok(bucket) if bucket.path == path => Some(bucket),
++                _ => {
++                    self.metrics.error();
++                    None
++                }
++            },
++            Ok(None) => None,
++            Err(_) => {
++                self.metrics.error();
++                None
++            }
++        }
++    }
++
++    pub(super) async fn get_or_load<T, F>(
++        &self,
++        path: &str,
++        op: &str,
++        params: Value,
++        load: F,
++    ) -> Result<T>
++    where
++        T: Serialize + DeserializeOwned + Send + Sync,
++        F: Future<Output = Result<T>> + Send,
++    {
++        let path = normalize_path(path);
++        // Store the complete request as the field, avoiding query-hash collisions.
++        let request = serde_json::json!([op, params]).to_string();
++        let revision = {
++            let state = self.state.read().await;
++            if state.disabled {
++                drop(state);
++                return load.await;
++            }
++            if let Some(bucket) = self.bucket(&path).await {
++                if let Some(value) = bucket.queries.get(&request) {
++                    if let Ok(payload) = serde_json::from_value(value.clone()) {
++                        return Ok(payload);
++                    }
++                    self.metrics.error();
++                }
++            }
++            state.revision
++        };
++
++        // Never hold the query lock across a backend/traversal call: cached
++        // traversal can recursively issue read_dir queries through this wrapper.
++        let result = load.await;
++        if let Ok(payload) = &result {
++            let mut state = self.state.write().await;
++            if !state.disabled && state.revision == revision {
++                state.paths.insert(path.clone());
++                if let Ok(value) = serde_json::to_value(payload) {
++                    let mut bucket = self.bucket(&path).await.unwrap_or_else(|| Bucket {
++                        path: path.clone(),
++                        queries: BTreeMap::new(),
++                    });
++                    bucket.queries.insert(request, value);
++                    if let Ok(bytes) = serde_json::to_vec(&bucket) {
++                        let started = Instant::now();
++                        let stored = self
++                            .runtime
++                            .set(
++                                &self.key(&path),
++                                Bytes::from(bytes),
++                                SetOptions {
++                                    // Reclaim buckets after their owning wrapper exits.
++                                    expiration: Some(Expiration::After(Duration::from_secs(300))),
++                                    ..SetOptions::default()
++                                },
++                            )
++                            .await;
++                        self.metrics.put(started.elapsed());
++                        if !matches!(stored, Ok(SetResult::Applied)) {
++                            self.metrics.error();
++                            state.disabled = true;
++                        }
++                    }
++                }
++            }
++        }
++        result
++    }
++
++    pub(super) async fn invalidate(&self, path: &str) {
++        let path = normalize_path(path);
++        let mut state = self.state.write().await;
++        state.revision = state.revision.wrapping_add(1);
++        let mut affected = ancestor_scopes(&path);
++        let prefix = if path == "/" {
++            path
++        } else {
++            format!("{path}/")
++        };
++        affected.extend(
++            state
++                .paths
++                .range(prefix.clone()..)
++                .take_while(|candidate| candidate.starts_with(&prefix))
++                .cloned(),
++        );
++        let keys: Vec<_> = affected
++            .into_iter()
++            .filter(|scope| state.paths.remove(scope))
++            .map(|scope| self.key(&scope))
++            .collect();
++        if keys.is_empty() {
++            return;
++        }
++        let started = Instant::now();
++        let result = self.runtime.del(&keys).await;
++        self.metrics.delete(started.elapsed());
++        if result.is_err() {
++            // Failed deletion must not expose stale results. Body caching has
++            // its own failure handling and is deliberately unaffected here.
++            self.metrics.error();
++            state.disabled = true;
++        } else {
++            self.metrics.invalidation();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/ragfs/src/cache/query/tests.rs b/crates/ragfs/src/cache/query/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b4cb467b17699c0d7438a3a917df2be3d3e7c3f
+--- /dev/null
++++ b/crates/ragfs/src/cache/query/tests.rs
+@@ -0,0 +1,390 @@
++use super::*;
++use crate::cache::{CacheNamespace, CachePolicy, CacheTraversalMode, CachedFileSystem};
++use crate::cache_runtime::MemoryMockProvider;
++use crate::core::{FileSystem, GrepOptions, ListSortBy, SortOrder, WriteFlag};
++use crate::plugins::memfs::MemFileSystem;
++use serde_json::json;
++use tokio::sync::oneshot;
++
++fn fixture() -> (Arc<QueryCache>, Arc<CacheRuntime>, Arc<MemoryMockProvider>) {
++    let provider = Arc::new(MemoryMockProvider::new());
++    let runtime = CacheRuntime::memory_with_provider(provider.clone());
++    let cache = Arc::new(QueryCache::new(
++        "queries",
++        1,
++        runtime.clone(),
++        Arc::new(CacheMetrics::default()),
++    ));
++    (cache, runtime, provider)
++}
++
++async fn query(cache: &QueryCache, path: &str, value: usize) -> usize {
++    cache
++        .get_or_load(path, "stat", json!([]), async { Ok(value) })
++        .await
++        .unwrap()
++}
++
++#[tokio::test]
++async fn buckets_keep_operations_and_complete_parameters_separate() {
++    let (cache, _, _) = fixture();
++    for op in ["stat", "tree_directory", "glob_directory", "grep"] {
++        for params in [json!([]), json!([null]), json!([0]), json!([1, "a"])] {
++            let expected = format!("{op}:{params}");
++            let first = cache
++                .get_or_load("/docs", op, params.clone(), async { Ok(expected.clone()) })
++                .await
++                .unwrap();
++            let hit: String = cache
++                .get_or_load("docs/", op, params, async { panic!("cache miss") })
++                .await
++                .unwrap();
++            assert_eq!(first, expected);
++            assert_eq!(hit, expected);
++        }
++    }
++}
++
++#[tokio::test]
++async fn invalidation_deletes_ancestors_and_descendants_but_preserves_bodies_and_siblings() {
++    let (cache, runtime, provider) = fixture();
++    let paths = [
++        "/",
++        "/docs",
++        "/docs/a",
++        "/docs/a/child",
++        "/docs/ab",
++        "/other",
++    ];
++    for path in paths {
++        assert_eq!(query(&cache, path, 1).await, 1);
++    }
++    let body_key = "ragfs:v1:queries:file:body";
++    runtime
++        .set(body_key, Bytes::from_static(b"body"), SetOptions::default())
++        .await
++        .unwrap();
++    cache.invalidate("/docs/a").await;
++    assert_eq!(runtime.get(body_key).await.unwrap().unwrap(), b"body"[..]);
++    let keys = provider.keys().await;
++    for path in ["/", "/docs", "/docs/a", "/docs/a/child"] {
++        assert!(!keys.contains(&cache.key(path)));
++        assert_eq!(query(&cache, path, 2).await, 2);
++    }
++    for path in ["/docs/ab", "/other"] {
++        assert_eq!(query(&cache, path, 2).await, 1);
++    }
++    cache.invalidate("/").await;
++    for path in paths {
++        assert_eq!(query(&cache, path, 3).await, 3);
++    }
++    assert_eq!(runtime.get(body_key).await.unwrap().unwrap(), b"body"[..]);
++}
++
++#[tokio::test]
++async fn invalidation_prevents_inflight_query_from_refilling_old_results() {
++    let (cache, _, _) = fixture();
++    let (started_tx, started_rx) = oneshot::channel();
++    let (resume_tx, resume_rx) = oneshot::channel();
++    let worker = cache.clone();
++    let task = tokio::spawn(async move {
++        worker
++            .get_or_load("/docs/a", "stat", json!([]), async {
++                started_tx.send(()).unwrap();
++                resume_rx.await.unwrap();
++                Ok(1usize)
++            })
++            .await
++            .unwrap()
++    });
++    started_rx.await.unwrap();
++    cache.invalidate("/docs").await;
++    resume_tx.send(()).unwrap();
++    assert_eq!(task.await.unwrap(), 1);
++    assert_eq!(query(&cache, "/docs/a", 2).await, 2);
++    assert_eq!(query(&cache, "/docs/a", 3).await, 2);
++}
++
++#[tokio::test]
++async fn concurrent_parameter_variants_do_not_overwrite_each_other() {
++    let (cache, _, _) = fixture();
++    let barrier = Arc::new(tokio::sync::Barrier::new(2));
++    let mut tasks = Vec::new();
++    for variant in [1usize, 2] {
++        let worker = cache.clone();
++        let barrier = barrier.clone();
++        tasks.push(tokio::spawn(async move {
++            worker
++                .get_or_load("/docs", "glob_directory", json!([variant]), async {
++                    barrier.wait().await;
++                    Ok(variant)
++                })
++                .await
++                .unwrap()
++        }));
++    }
++    for task in tasks {
++        task.await.unwrap();
++    }
++    for variant in [1usize, 2] {
++        let hit: usize = cache
++            .get_or_load("/docs", "glob_directory", json!([variant]), async {
++                panic!("concurrent fill lost a query variant")
++            })
++            .await
++            .unwrap();
++        assert_eq!(hit, variant);
++    }
++}
++
++#[tokio::test]
++async fn failed_delete_bypasses_stale_queries_without_touching_body_cache() {
++    let (cache, runtime, provider) = fixture();
++    assert_eq!(query(&cache, "/docs", 1).await, 1);
++    runtime
++        .set("body", Bytes::from_static(b"kept"), SetOptions::default())
++        .await
++        .unwrap();
++    provider.set_delete_failure(true);
++    cache.invalidate("/docs").await;
++    provider.set_delete_failure(false);
++    assert_eq!(query(&cache, "/docs", 2).await, 2);
++    assert_eq!(query(&cache, "/docs", 3).await, 3);
++    assert_eq!(runtime.get("body").await.unwrap().unwrap(), b"kept"[..]);
++}
++
++#[tokio::test]
++async fn corrupt_buckets_and_provider_errors_fall_back_to_backend() {
++    let (cache, runtime, provider) = fixture();
++    runtime
++        .set(
++            &cache.key("/docs"),
++            Bytes::from_static(b"invalid"),
++            SetOptions::default(),
++        )
++        .await
++        .unwrap();
++    assert_eq!(query(&cache, "/docs", 1).await, 1);
++    assert_eq!(query(&cache, "/docs", 2).await, 1);
++    provider.set_unavailable(true);
++    assert_eq!(query(&cache, "/docs", 3).await, 3);
++    provider.set_unavailable(false);
++    // A failed fill disables query reads, including any old provider values.
++    assert_eq!(query(&cache, "/docs", 4).await, 4);
++}
++
++fn filesystem(mode: CacheTraversalMode) -> CachedFileSystem {
++    CachedFileSystem::with_runtime(
++        Box::new(MemFileSystem::new()),
++        CacheRuntime::memory(),
++        CacheNamespace::new("integration"),
++        CachePolicy::default().with_traversal_mode(mode),
++    )
++}
++
++async fn seed(fs: &CachedFileSystem) {
++    fs.mkdir("/docs", 0o755).await.unwrap();
++    fs.mkdir("/docs/sub", 0o755).await.unwrap();
++    fs.write(
++        "/docs/a.txt",
++        b"before\nneedle\nafter\n",
++        0,
++        WriteFlag::Create,
++    )
++    .await
++    .unwrap();
++    fs.write("/docs/sub/b.txt", b"NEEDLE\n", 0, WriteFlag::Create)
++        .await
++        .unwrap();
++}
++
++#[tokio::test]
++async fn query_apis_serve_cached_results_and_parameter_variants() {
++    let fs = filesystem(CacheTraversalMode::Backend);
++    seed(&fs).await;
++    let stat = fs.stat("/docs/a.txt").await.unwrap();
++    let dirs = fs
++        .read_dir(
++            "/docs",
++            None,
++            None,
++            Some(ListSortBy::Name),
++            Some(SortOrder::Asc),
++        )
++        .await
++        .unwrap();
++    assert_eq!(dirs.len(), 2);
++    let page = fs
++        .read_dir(
++            "/docs",
++            Some(1),
++            Some(1),
++            Some(ListSortBy::Name),
++            Some(SortOrder::Asc),
++        )
++        .await
++        .unwrap();
++    assert_eq!(page.len(), 1);
++    assert_eq!(page[0].name, dirs[1].name);
++    let tree = fs
++        .tree_directory("/docs", false, None, None, None, None, None, false)
++        .await
++        .unwrap();
++    let only_dirs = fs
++        .tree_directory("/docs", false, None, None, None, None, None, true)
++        .await
++        .unwrap();
++    assert!(tree.len() > only_dirs.len());
++    assert!(only_dirs.iter().all(|entry| entry.info.is_dir));
++    let glob = fs
++        .glob_directory("/docs", "**/*.txt", false, None, None, None)
++        .await
++        .unwrap();
++    let unmatched = fs
++        .glob_directory("/docs", "**/*.md", false, None, None, None)
++        .await
++        .unwrap();
++    assert!(!glob.entries.is_empty());
++    assert!(unmatched.entries.is_empty());
++    let options = GrepOptions {
++        recursive: true,
++        ..Default::default()
++    };
++    let grep = fs.grep("/docs", "needle", options).await.unwrap();
++    let insensitive = fs
++        .grep(
++            "/docs",
++            "needle",
++            GrepOptions {
++                case_insensitive: true,
++                ..options
++            },
++        )
++        .await
++        .unwrap();
++    assert!(insensitive.matches.len() > grep.matches.len());
++    let context = fs
++        .grep(
++            "/docs",
++            "needle",
++            GrepOptions {
++                before_context: 1,
++                after_context: 1,
++                ..options
++            },
++        )
++        .await
++        .unwrap();
++    assert_eq!(context.matches[0].before_context.as_ref().unwrap().len(), 1);
++    assert_eq!(context.matches[0].after_context.as_ref().unwrap().len(), 1);
++
++    // Removing the backend data directly makes any unexpected miss observable.
++    fs.inner_fs().remove_all("/docs").await.unwrap();
++    assert_eq!(fs.stat("/docs/a.txt").await.unwrap().size, stat.size);
++    assert_eq!(
++        fs.read_dir(
++            "/docs",
++            None,
++            None,
++            Some(ListSortBy::Name),
++            Some(SortOrder::Asc)
++        )
++        .await
++        .unwrap()
++        .len(),
++        dirs.len()
++    );
++    assert_eq!(
++        fs.tree_directory("/docs", false, None, None, None, None, None, false)
++            .await
++            .unwrap()
++            .len(),
++        tree.len()
++    );
++    assert_eq!(
++        fs.glob_directory("/docs", "**/*.txt", false, None, None, None)
++            .await
++            .unwrap()
++            .entries
++            .len(),
++        glob.entries.len()
++    );
++    assert_eq!(
++        fs.grep("/docs", "needle", options)
++            .await
++            .unwrap()
++            .matches
++            .len(),
++        grep.matches.len()
++    );
++}
++
++#[tokio::test]
++async fn writes_rename_and_recursive_remove_refresh_queries_in_both_traversal_modes() {
++    for mode in [
++        CacheTraversalMode::Backend,
++        CacheTraversalMode::CachedTraversal,
++    ] {
++        let fs = filesystem(mode);
++        seed(&fs).await;
++        fs.stat("/docs/a.txt").await.unwrap();
++        fs.stat("/docs/sub/b.txt").await.unwrap();
++        fs.read_dir("/docs", None, None, None, None).await.unwrap();
++        fs.tree_directory("/docs", false, None, None, None, None, None, false)
++            .await
++            .unwrap();
++        fs.glob_directory("/docs", "**/*.txt", false, None, None, None)
++            .await
++            .unwrap();
++        let options = GrepOptions {
++            recursive: true,
++            ..Default::default()
++        };
++        fs.grep("/docs", "needle", options).await.unwrap();
++        fs.write("/docs/a.txt", b"changed", 0, WriteFlag::Truncate)
++            .await
++            .unwrap();
++        assert_eq!(fs.stat("/docs/a.txt").await.unwrap().size, 7);
++        assert!(fs
++            .grep("/docs", "needle", options)
++            .await
++            .unwrap()
++            .matches
++            .is_empty());
++        fs.rename("/docs/sub", "/docs/moved").await.unwrap();
++        assert!(fs.stat("/docs/sub/b.txt").await.is_err());
++        assert!(fs.stat("/docs/moved/b.txt").await.is_ok());
++        let tree = fs
++            .tree_directory("/docs", false, None, None, None, None, None, false)
++            .await
++            .unwrap();
++        assert!(tree.iter().any(|entry| entry.path.contains("moved")));
++        assert!(!tree.iter().any(|entry| entry.path.contains("/sub")));
++        fs.remove_all("/docs/moved").await.unwrap();
++        assert!(fs.stat("/docs/moved/b.txt").await.is_err());
++        assert_eq!(
++            fs.read_dir("/docs", None, None, None, None)
++                .await
++                .unwrap()
++                .len(),
++            1
++        );
++        assert_eq!(
++            fs.glob_directory("/docs", "**/*.txt", false, None, None, None)
++                .await
++                .unwrap()
++                .entries
++                .len(),
++            1
++        );
++    }
++}
++
++#[tokio::test]
++async fn internal_directory_scans_bypass_cached_public_listing() {
++    let fs = filesystem(CacheTraversalMode::Backend);
++    seed(&fs).await;
++    fs.read_dir("/docs", None, None, None, None).await.unwrap();
++    fs.inner_fs().create("/docs/new.txt").await.unwrap();
++    assert_eq!(fs.read_internal_dir("/docs").await.unwrap().len(), 3);
++}
+diff --git a/crates/ragfs/src/cache/wrapper.rs b/crates/ragfs/src/cache/wrapper.rs
+index b6ee65198200af23b71ee440980fcdb469fff6bd..b3162d0316fbdce6c2dd44180be79852074ce7a0 100644
+--- a/crates/ragfs/src/cache/wrapper.rs
++++ b/crates/ragfs/src/cache/wrapper.rs
+@@ -1,6 +1,7 @@
+ //! A transparent [`FileSystem`](crate::FileSystem) cache wrapper.
+ 
+ use super::envelope::{CacheEnvelope, CacheObjectKind, GenerationSnapshot};
++use super::query::QueryCache;
+ use super::{CacheMetrics, CachePolicy, CacheTraversalMode};
+ use crate::cache_runtime::{CacheError, CacheResult, CacheRuntime, SetOptions, SetResult};
+ use crate::core::filesystem::{
+@@ -17,15 +18,24 @@ use async_trait::async_trait;
+ use bytes::Bytes;
+ use futures::stream::{self, StreamExt};
+ use regex::Regex;
+-use std::collections::HashMap;
++use serde::{de::DeserializeOwned, Serialize};
++use serde_json::{json, Value};
++use std::collections::{HashMap, HashSet};
++use std::future::Future;
+ use std::sync::Arc;
+ use std::time::Instant;
+ use tokio::sync::{Mutex, RwLock};
+ use uuid::Uuid;
+ 
+-const GREP_CACHE_FILE_CONCURRENCY: usize = 8;
++const GREP_CACHE_FETCH_BATCH_SIZE: usize = 256;
+ const GENERATION_PUT_CONCURRENCY: usize = 8;
+ 
++fn grep_cache_file_concurrency() -> usize {
++    std::thread::available_parallelism()
++        .map(|n| (n.get() * 2).clamp(16, 100))
++        .unwrap_or(16)
++}
++
+ /// Namespace prepended to every provider key owned by one wrapper.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct CacheNamespace {
+@@ -61,6 +71,7 @@ pub struct CachedFileSystem {
+     bypass_scopes: RwLock<Vec<String>>,
+     generation_epoch: u64,
+     generations: RwLock<HashMap<String, u64>>,
++    queries: QueryCache,
+ }
+ 
+ impl CachedFileSystem {
+@@ -80,17 +91,26 @@ impl CachedFileSystem {
+         namespace: CacheNamespace,
+         policy: CachePolicy,
+     ) -> Self {
++        let metrics = Arc::new(CacheMetrics::default());
++        let generation_epoch = nonzero_random_u64();
++        let queries = QueryCache::new(
++            namespace.as_str(),
++            generation_epoch,
++            Arc::clone(&runtime),
++            Arc::clone(&metrics),
++        );
+         Self {
+             backend,
+             runtime,
+             namespace,
+             policy,
+-            metrics: Arc::new(CacheMetrics::default()),
++            metrics,
+             operation_lock: RwLock::new(()),
+             inflight: Mutex::new(HashMap::new()),
+             bypass_scopes: RwLock::new(Vec::new()),
+-            generation_epoch: nonzero_random_u64(),
++            generation_epoch,
+             generations: RwLock::new(HashMap::new()),
++            queries,
+         }
+     }
+ 
+@@ -138,6 +158,7 @@ impl CachedFileSystem {
+ 
+         let base_path = normalize_prefix_path(path);
+         let mut result = Vec::new();
++        let generation_cache = Mutex::new(HashMap::new());
+         let mut stack = vec![TreeTask::VisitDir(base_path.clone())];
+         let traversal_limit = node_limit.map(|limit| offset.unwrap_or(0).saturating_add(limit));
+ 
+@@ -157,8 +178,9 @@ impl CachedFileSystem {
+                     }
+ 
+                     let entries = self
+-                        .read_dir(&current_path, None, None, sort_by, sort_order)
++                        .read_dir_with_generation_cache(&current_path, &generation_cache)
+                         .await?;
++                    let entries = apply_read_dir_options(entries, None, None, sort_by, sort_order);
+                     for entry in entries.into_iter().rev() {
+                         let is_hidden_file = !entry.is_dir && entry.name.starts_with('.');
+                         if is_hidden_file && !show_hidden {
+@@ -291,7 +313,7 @@ impl CachedFileSystem {
+                 }
+ 
+                 file_batch.push(current_path);
+-                if file_batch.len() >= GREP_CACHE_FILE_CONCURRENCY {
++                if file_batch.len() >= GREP_CACHE_FETCH_BATCH_SIZE {
+                     self.flush_grep_file_batch(
+                         &mut file_batch,
+                         &base_path,
+@@ -341,22 +363,31 @@ impl CachedFileSystem {
+             .map(|limit| limit.saturating_sub(result.count))
+             .unwrap_or(usize::MAX);
+         let files = std::mem::take(file_batch);
+-        let mut indexed = stream::iter(files.into_iter().enumerate())
+-            .map(|(index, path)| async move {
+-                let matches = self
+-                    .grep_cached_file(
+-                        &path,
+-                        base_path,
+-                        re,
+-                        remaining_limit,
+-                        options.before_context,
+-                        options.after_context,
+-                        generation_cache,
+-                    )
+-                    .await;
++        let cached = self.probe_grep_file_batch(&files, generation_cache).await;
++        let mut indexed = stream::iter(files.into_iter().zip(cached).enumerate())
++            .map(|(index, (path, cached))| async move {
++                let content = match cached {
++                    Some(content) => content,
++                    None => match self
++                        .read_with_generation_cache(&path, 0, 0, generation_cache)
++                        .await
++                    {
++                        Ok(content) => Bytes::from(content),
++                        Err(error) => return (index, Err(error)),
++                    },
++                };
++                let matches = Self::grep_content(
++                    &content,
++                    &path,
++                    base_path,
++                    re,
++                    remaining_limit,
++                    options.before_context,
++                    options.after_context,
++                );
+                 (index, matches)
+             })
+-            .buffer_unordered(GREP_CACHE_FILE_CONCURRENCY)
++            .buffer_unordered(grep_cache_file_concurrency())
+             .collect::<Vec<_>>()
+             .await;
+ 
+@@ -377,20 +408,16 @@ impl CachedFileSystem {
+         Ok(())
+     }
+ 
+-    async fn grep_cached_file(
+-        &self,
++    fn grep_content(
++        content: &[u8],
+         path: &str,
+         base_path: &str,
+         re: &Regex,
+         remaining_limit: usize,
+         before_context: usize,
+         after_context: usize,
+-        generation_cache: &Mutex<HashMap<String, u64>>,
+     ) -> Result<Vec<GrepMatch>> {
+-        let content = self
+-            .read_with_generation_cache(path, 0, 0, generation_cache)
+-            .await?;
+-        let content_str = String::from_utf8_lossy(&content);
++        let content_str = String::from_utf8_lossy(content);
+         let rel_file = relative_match_file(base_path, path);
+         let mut result = GrepResult {
+             matches: Vec::with_capacity(remaining_limit.min(64)),
+@@ -422,6 +449,116 @@ impl CachedFileSystem {
+         Ok(result.matches)
+     }
+ 
++    async fn probe_grep_file_batch(
++        &self,
++        paths: &[String],
++        generation_cache: &Mutex<HashMap<String, u64>>,
++    ) -> Vec<Option<Bytes>> {
++        let mut result = vec![None; paths.len()];
++        // As with single-file probes, serialize validation against local writes.
++        let _operation_guard = self.operation_lock.read().await;
++        let mut eligible = Vec::new();
++        for (index, path) in paths.iter().enumerate() {
++            if self.policy.cache_file(path, 0) && !self.is_runtime_bypassed(path).await {
++                let path = normalize_path(path);
++                eligible.push((index, self.file_key(&path), path));
++            }
++        }
++        let keys = eligible
++            .iter()
++            .map(|(_, key, _)| key.clone())
++            .collect::<Vec<_>>();
++        if keys.is_empty() {
++            return result;
++        }
++        let values = match self.cache_batch_get(&keys).await {
++            Ok(values) => values,
++            Err(_) => {
++                self.metrics.error();
++                for (_, _, path) in eligible {
++                    self.mark_bypass(&path).await;
++                }
++                return result;
++            }
++        };
++
++        // Decode the whole batch in one blocking task. File payloads remain
++        // slices of the provider's Bytes buffers instead of being copied.
++        let decoded = tokio::task::spawn_blocking(move || {
++            eligible
++                .into_iter()
++                .zip(values)
++                .filter_map(|((index, key, path), value)| {
++                    value.map(|value| (index, key, path, CacheEnvelope::decode(value)))
++                })
++                .collect::<Vec<_>>()
++        })
++        .await;
++        let decoded = match decoded {
++            Ok(decoded) => decoded,
++            Err(_) => {
++                self.metrics.error();
++                return result;
++            }
++        };
++        let mut candidates = Vec::new();
++        let mut generation_keys = Vec::new();
++        let mut seen = HashSet::new();
++        for (index, key, path, envelope) in decoded {
++            match envelope {
++                Ok(envelope) if envelope.matches(CacheObjectKind::File, &path) => {
++                    for snapshot in envelope.generations() {
++                        if seen.insert(snapshot.key.clone()) {
++                            generation_keys.push(snapshot.key.clone());
++                        }
++                    }
++                    candidates.push((index, key, path, envelope));
++                }
++                _ => {
++                    self.metrics.error();
++                    self.cache_delete(&key, &path).await;
++                }
++            }
++        }
++        let generations = match self
++            .current_generations_memoized(&generation_keys, generation_cache)
++            .await
++        {
++            Ok(values) => generation_keys
++                .into_iter()
++                .zip(values)
++                .collect::<HashMap<_, _>>(),
++            Err(_) => {
++                self.metrics.error();
++                for (_, _, path, _) in candidates {
++                    self.mark_bypass(&path).await;
++                }
++                return result;
++            }
++        };
++        for (index, key, path, envelope) in candidates {
++            if !envelope
++                .generations()
++                .iter()
++                .all(|snapshot| generations.get(&snapshot.key) == Some(&snapshot.value))
++            {
++                self.cache_delete(&key, &path).await;
++                continue;
++            }
++            match envelope.into_file() {
++                Ok(data) => {
++                    self.metrics.file_hit(data.len());
++                    result[index] = Some(data);
++                }
++                Err(_) => {
++                    self.metrics.error();
++                    self.cache_delete(&key, &path).await;
++                }
++            }
++        }
++        result
++    }
++
+     async fn cache_get(&self, key: &str) -> CacheResult<Option<Bytes>> {
+         let started = Instant::now();
+         let result = self.runtime.get(key).await;
+@@ -696,7 +833,7 @@ impl CachedFileSystem {
+             }
+         };
+ 
+-        let envelope = match CacheEnvelope::decode(&value) {
++        let envelope = match CacheEnvelope::decode(value) {
+             Ok(envelope) if envelope.matches(CacheObjectKind::File, path) => envelope,
+             _ => {
+                 self.metrics.error();
+@@ -714,7 +851,7 @@ impl CachedFileSystem {
+                     if record_hit {
+                         self.metrics.file_hit(data.len());
+                     }
+-                    Some(data)
++                    Some(data.to_vec())
+                 }
+                 Err(_) => {
+                     self.metrics.error();
+@@ -760,7 +897,7 @@ impl CachedFileSystem {
+             }
+         };
+ 
+-        let envelope = match CacheEnvelope::decode(&value) {
++        let envelope = match CacheEnvelope::decode(value) {
+             Ok(envelope) if envelope.matches(CacheObjectKind::Directory, path) => envelope,
+             _ => {
+                 self.metrics.error();
+@@ -984,12 +1121,24 @@ impl CachedFileSystem {
+         }
+     }
+ 
++    async fn cached_query<T, F>(&self, path: &str, op: &str, params: Value, load: F) -> Result<T>
++    where
++        T: Serialize + DeserializeOwned + Send + Sync,
++        F: Future<Output = Result<T>> + Send,
++    {
++        if !self.policy.cache_directory(path) || self.is_runtime_bypassed(path).await {
++            return load.await;
++        }
++        self.queries.get_or_load(path, op, params, load).await
++    }
++
+     async fn invalidate_path_objects(&self, path: &str) {
+         self.cache_delete(&self.file_key(path), path).await;
+         self.cache_delete(&self.directory_key(path), path).await;
+     }
+ 
+     async fn invalidate_parent_directory(&self, path: &str) {
++        self.queries.invalidate(path).await;
+         let parent = parent_path(path);
+         self.cache_delete(&self.directory_key(&parent), &parent)
+             .await;
+@@ -1010,7 +1159,7 @@ impl CachedFileSystem {
+     fn object_key(&self, kind: &str, path: &str) -> String {
+         let normalized = normalize_path(path);
+         format!(
+-            "ragfs:v1:{}:{}:{:016x}",
++            "ragfs:v2:{}:{}:{:016x}",
+             self.namespace.as_str(),
+             kind,
+             stable_hash(normalized.as_bytes())
+@@ -1191,8 +1340,13 @@ impl FileSystem for CachedFileSystem {
+         entries.map(|entries| apply_read_dir_options(entries, offset, limit, sort_by, sort_order))
+     }
+ 
++    async fn read_internal_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
++        self.backend.read_internal_dir(path).await
++    }
++
+     async fn stat(&self, path: &str) -> Result<FileInfo> {
+-        self.backend.stat(path).await
++        self.cached_query(path, "stat", json!([]), self.backend.stat(path))
++            .await
+     }
+ 
+     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+@@ -1242,6 +1396,7 @@ impl FileSystem for CachedFileSystem {
+     async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> Result<()> {
+         let _guard = self.operation_lock.write().await;
+         self.backend.ensure_parent_dirs(path, mode).await?;
++        self.queries.invalidate(&parent_path(path)).await;
+         for scope in ancestor_scopes(&parent_path(path)) {
+             self.cache_delete(&self.directory_key(&scope), &scope).await;
+         }
+@@ -1254,13 +1409,30 @@ impl FileSystem for CachedFileSystem {
+         pattern: &str,
+         options: GrepOptions<'_>,
+     ) -> Result<GrepResult> {
+-        if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
+-            && !self.wraps_multiwrite()
+-        {
+-            return self.grep_via_cache(path, pattern, options).await;
+-        }
++        self.cached_query(
++            path,
++            "grep",
++            json!([
++                pattern,
++                options.recursive,
++                options.case_insensitive,
++                options.node_limit,
++                options.exclude_path,
++                options.level_limit,
++                options.before_context,
++                options.after_context
++            ]),
++            async {
++                if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
++                    && !self.wraps_multiwrite()
++                {
++                    return self.grep_via_cache(path, pattern, options).await;
++                }
+ 
+-        self.backend.grep(path, pattern, options).await
++                self.backend.grep(path, pattern, options).await
++            },
++        )
++        .await
+     }
+ 
+     async fn tree_directory(
+@@ -1274,35 +1446,51 @@ impl FileSystem for CachedFileSystem {
+         sort_order: Option<SortOrder>,
+         directories_only: bool,
+     ) -> Result<Vec<TreeEntry>> {
+-        if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
+-            && !self.wraps_multiwrite()
+-        {
+-            return self
+-                .tree_directory_via_cache(
+-                    path,
+-                    show_hidden,
+-                    node_limit,
+-                    level_limit,
+-                    offset,
+-                    sort_by,
+-                    sort_order,
+-                    directories_only,
+-                )
+-                .await;
+-        }
+-
+-        self.backend
+-            .tree_directory(
+-                path,
++        self.cached_query(
++            path,
++            "tree_directory",
++            json!([
+                 show_hidden,
+                 node_limit,
+                 level_limit,
+                 offset,
+                 sort_by,
+                 sort_order,
+-                directories_only,
+-            )
+-            .await
++                directories_only
++            ]),
++            async {
++                if self.policy.traversal_mode() == CacheTraversalMode::CachedTraversal
++                    && !self.wraps_multiwrite()
++                {
++                    return self
++                        .tree_directory_via_cache(
++                            path,
++                            show_hidden,
++                            node_limit,
++                            level_limit,
++                            offset,
++                            sort_by,
++                            sort_order,
++                            directories_only,
++                        )
++                        .await;
++                }
++
++                self.backend
++                    .tree_directory(
++                        path,
++                        show_hidden,
++                        node_limit,
++                        level_limit,
++                        offset,
++                        sort_by,
++                        sort_order,
++                        directories_only,
++                    )
++                    .await
++            },
++        )
++        .await
+     }
+ 
+     async fn glob_directory(
+@@ -1314,20 +1502,34 @@ impl FileSystem for CachedFileSystem {
+         level_limit: Option<usize>,
+         continuation_token: Option<String>,
+     ) -> Result<GlobPage> {
+-        self.backend
+-            .glob_directory(
+-                path,
++        self.cached_query(
++            path,
++            "glob_directory",
++            json!([
+                 pattern,
+                 show_hidden,
+                 page_size,
+                 level_limit,
+-                continuation_token,
+-            )
+-            .await
++                continuation_token
++            ]),
++            async {
++                self.backend
++                    .glob_directory(
++                        path,
++                        pattern,
++                        show_hidden,
++                        page_size,
++                        level_limit,
++                        continuation_token,
++                    )
++                    .await
++            },
++        )
++        .await
+     }
+ }
+ 
+-fn normalize_path(path: &str) -> String {
++pub(super) fn normalize_path(path: &str) -> String {
+     if path.is_empty() || path == "/" {
+         "/".to_string()
+     } else {
+@@ -1352,7 +1554,7 @@ fn parent_path(path: &str) -> String {
+         .unwrap_or_else(|| "/".to_string())
+ }
+ 
+-fn ancestor_scopes(path: &str) -> Vec<String> {
++pub(super) fn ancestor_scopes(path: &str) -> Vec<String> {
+     let normalized = normalize_path(path);
+     if normalized == "/" {
+         return vec!["/".to_string()];
+@@ -1376,7 +1578,7 @@ fn is_same_or_descendant(path: &str, scope: &str) -> bool {
+             .is_some_and(|suffix| suffix.starts_with('/'))
+ }
+ 
+-fn stable_hash(bytes: &[u8]) -> u64 {
++pub(super) fn stable_hash(bytes: &[u8]) -> u64 {
+     let mut hash = 0xcbf29ce484222325_u64;
+     for byte in bytes {
+         hash ^= u64::from(*byte);
+@@ -1393,3 +1595,6 @@ fn nonzero_random_u64() -> u64 {
+         value
+     }
+ }
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/ragfs/src/cache/wrapper/tests.rs b/crates/ragfs/src/cache/wrapper/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..528f6a819e066ee68ed9566f768d38a0491f8807
+--- /dev/null
++++ b/crates/ragfs/src/cache/wrapper/tests.rs
+@@ -0,0 +1,439 @@
++use super::*;
++use crate::cache_runtime::MemoryMockProvider;
++use crate::plugins::MemFileSystem;
++
++fn options() -> GrepOptions<'static> {
++    GrepOptions {
++        recursive: true,
++        before_context: 1,
++        after_context: 1,
++        ..Default::default()
++    }
++}
++
++async fn fixture(count: usize) -> (CachedFileSystem, Arc<MemoryMockProvider>, Vec<String>) {
++    let backend = MemFileSystem::new();
++    backend.mkdir("/docs", 0o755).await.unwrap();
++    let mut paths = Vec::new();
++    for index in 0..count {
++        let path = format!("/docs/{index:04}.txt");
++        backend
++            .write(&path, b"before\nNeedle\nafter\n", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++        paths.push(path);
++    }
++    let provider = Arc::new(MemoryMockProvider::new());
++    let fs = CachedFileSystem::with_runtime(
++        Box::new(backend),
++        CacheRuntime::memory_with_provider(provider.clone()),
++        CacheNamespace::new("grep-batches"),
++        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
++    );
++    // Warm only bodies and directory entries, leaving the query bucket cold.
++    for path in &paths {
++        fs.read(path, 0, 0).await.unwrap();
++    }
++    fs.read_dir("/docs", None, None, None, None).await.unwrap();
++    provider.reset_observed_reads();
++    (fs, provider, paths)
++}
++
++async fn assert_matches_backend(fs: &CachedFileSystem, pattern: &str, options: GrepOptions<'_>) {
++    let expected = fs.backend.grep("/docs", pattern, options).await.unwrap();
++    let actual = fs.grep("/docs", pattern, options).await.unwrap();
++    assert_eq!(
++        serde_json::to_value(actual).unwrap(),
++        serde_json::to_value(expected).unwrap()
++    );
++}
++
++#[tokio::test]
++async fn grep_fetches_payloads_in_256_key_batches_and_preserves_query_hits() {
++    let (fs, provider, _) = fixture(513).await;
++    assert_matches_backend(&fs, "Needle", options()).await;
++    let payload_batches = provider
++        .observed_read_batches()
++        .into_iter()
++        .filter(|keys| keys.iter().any(|key| key.contains(":file:")))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        payload_batches.iter().map(Vec::len).collect::<Vec<_>>(),
++        [256, 256]
++    );
++    let reads = provider.observed_read_keys();
++    assert_eq!(
++        reads.iter().filter(|key| key.contains(":file:")).count(),
++        513
++    );
++    let generations = reads
++        .iter()
++        .filter(|key| key.contains(":subtree:"))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        generations.len(),
++        generations.iter().collect::<HashSet<_>>().len()
++    );
++
++    provider.reset_observed_reads();
++    assert_matches_backend(&fs, "Needle", options()).await;
++    assert!(!provider
++        .observed_read_keys()
++        .iter()
++        .any(|key| key.contains(":file:")));
++}
++
++#[tokio::test]
++async fn grep_small_limits_keep_256_key_fetches_and_stop_after_the_matching_batch() {
++    let (fs, provider, _) = fixture(260).await;
++    for limit in [1, 10] {
++        provider.reset_observed_reads();
++        let hits_before = fs.metrics().snapshot().file_hits;
++        assert_matches_backend(
++            &fs,
++            "Needle",
++            GrepOptions {
++                node_limit: Some(limit),
++                ..options()
++            },
++        )
++        .await;
++        let batches = provider
++            .observed_read_batches()
++            .into_iter()
++            .filter(|keys| keys.iter().any(|key| key.contains(":file:")))
++            .map(|keys| keys.len())
++            .collect::<Vec<_>>();
++        assert_eq!(batches, [256]);
++        assert_eq!(fs.metrics().snapshot().file_hits - hits_before, 256);
++    }
++}
++
++#[tokio::test]
++async fn grep_small_limit_without_matches_scans_all_files_in_256_key_batches() {
++    let (fs, provider, _) = fixture(513).await;
++    assert_matches_backend(
++        &fs,
++        "absent",
++        GrepOptions {
++            node_limit: Some(10),
++            ..options()
++        },
++    )
++    .await;
++    let batches = provider
++        .observed_read_batches()
++        .into_iter()
++        .filter(|keys| keys.iter().any(|key| key.contains(":file:")))
++        .map(|keys| keys.len())
++        .collect::<Vec<_>>();
++    assert_eq!(batches, [256, 256]);
++    assert_eq!(fs.metrics().snapshot().file_hits, 513);
++}
++
++#[tokio::test]
++async fn grep_batch_falls_back_for_missing_corrupt_wrong_path_and_stale_payloads() {
++    let (fs, _, paths) = fixture(5).await;
++    let before = fs.metrics().snapshot().backend_fallbacks;
++    fs.runtime.del(&[fs.file_key(&paths[0])]).await.unwrap();
++    fs.runtime
++        .set(
++            &fs.file_key(&paths[1]),
++            Bytes::from_static(b"invalid"),
++            SetOptions::default(),
++        )
++        .await
++        .unwrap();
++    let wrong = CacheEnvelope::file("/wrong".to_string(), b"wrong".to_vec(), Vec::new())
++        .encode()
++        .unwrap();
++    fs.runtime
++        .set(&fs.file_key(&paths[2]), wrong, SetOptions::default())
++        .await
++        .unwrap();
++    // Leave the old body intact, as after an ancestor generation invalidation.
++    fs.backend
++        .write(
++            &paths[3],
++            b"changed\nNeedle\nnew context\n",
++            0,
++            WriteFlag::Truncate,
++        )
++        .await
++        .unwrap();
++    fs.bump_generation(&paths[3]).await;
++    assert_matches_backend(&fs, "Needle", options()).await;
++    assert_eq!(fs.metrics().snapshot().backend_fallbacks - before, 4);
++}
++
++#[tokio::test]
++async fn grep_batch_preserves_policy_bypass_and_provider_failure_fallback() {
++    let (mut fs, provider, paths) = fixture(4).await;
++    fs.policy = fs.policy.with_bypass_prefix(&paths[0]);
++    fs.backend
++        .write(
++            &paths[0],
++            b"updated\nNeedle\nfresh\n",
++            0,
++            WriteFlag::Truncate,
++        )
++        .await
++        .unwrap();
++    assert_matches_backend(&fs, "Needle", options()).await;
++    assert!(!provider
++        .observed_read_keys()
++        .contains(&fs.file_key(&paths[0])));
++    provider.set_unavailable(true);
++    assert_matches_backend(&fs, "(?i)needle", options()).await;
++}
++
++#[tokio::test]
++async fn failed_payload_mget_bypasses_each_file_and_reads_backend_after_recovery() {
++    let (fs, provider, paths) = fixture(3).await;
++    provider.set_unavailable(true);
++    let cached = fs
++        .probe_grep_file_batch(&paths, &Mutex::new(HashMap::new()))
++        .await;
++    assert!(cached.iter().all(Option::is_none));
++    provider.set_unavailable(false);
++    for path in paths {
++        assert!(fs.is_runtime_bypassed(&path).await);
++        assert_eq!(
++            fs.read_with_generation_cache(&path, 0, 0, &Mutex::new(HashMap::new()))
++                .await
++                .unwrap(),
++            fs.backend.read(&path, 0, 0).await.unwrap()
++        );
++    }
++}
++
++#[tokio::test]
++async fn grep_batch_keeps_limits_filters_and_context_semantics() {
++    let (fs, _, paths) = fixture(260).await;
++    for limit in [0, 1, 257, 300] {
++        assert_matches_backend(
++            &fs,
++            "needle",
++            GrepOptions {
++                node_limit: Some(limit),
++                case_insensitive: true,
++                exclude_path: Some(&paths[0]),
++                ..options()
++            },
++        )
++        .await;
++    }
++    fs.mkdir("/docs/sub", 0o755).await.unwrap();
++    fs.write(
++        "/docs/sub/nested.txt",
++        b"before\nNeedle\nafter\n",
++        0,
++        WriteFlag::Create,
++    )
++    .await
++    .unwrap();
++    for level_limit in [Some(1), Some(2), None] {
++        for recursive in [false, true] {
++            assert_matches_backend(
++                &fs,
++                "Needle",
++                GrepOptions {
++                    recursive,
++                    level_limit,
++                    ..options()
++                },
++            )
++            .await;
++        }
++    }
++}
++
++#[tokio::test]
++async fn grep_batch_observes_writes_renames_and_removals() {
++    let (fs, _, paths) = fixture(3).await;
++    assert_matches_backend(&fs, "Needle", options()).await;
++    fs.write(&paths[0], b"no match", 0, WriteFlag::Truncate)
++        .await
++        .unwrap();
++    assert_matches_backend(&fs, "Needle", options()).await;
++    fs.rename(&paths[1], "/docs/renamed.txt").await.unwrap();
++    assert_matches_backend(&fs, "Needle", options()).await;
++    fs.remove(&paths[2]).await.unwrap();
++    assert_matches_backend(&fs, "Needle", options()).await;
++}
++
++#[tokio::test]
++async fn grep_payloads_share_the_provider_buffer_and_accept_empty_files() {
++    let (fs, _, paths) = fixture(2).await;
++    fs.write(&paths[1], b"", 0, WriteFlag::Truncate)
++        .await
++        .unwrap();
++    let encoded = fs
++        .runtime
++        .get(&fs.file_key(&paths[0]))
++        .await
++        .unwrap()
++        .unwrap();
++    let cached = fs
++        .probe_grep_file_batch(&paths, &Mutex::new(HashMap::new()))
++        .await;
++    let payload = cached[0].as_ref().unwrap();
++    assert_eq!(payload.as_ref(), b"before\nNeedle\nafter\n");
++    assert_eq!(
++        payload.as_ptr(),
++        encoded[encoded.len() - payload.len()..].as_ptr()
++    );
++    assert!(cached[1].as_ref().unwrap().is_empty());
++    assert_matches_backend(&fs, "Needle", options()).await;
++}
++
++#[tokio::test]
++async fn binary_cache_keys_leave_legacy_bodies_untouched_and_refill_from_backend() {
++    let (fs, _, paths) = fixture(1).await;
++    let key = fs.file_key(&paths[0]);
++    assert!(key.starts_with("ragfs:v2:"));
++    let old_key = key.replacen("ragfs:v2:", "ragfs:v1:", 1);
++    let old = Bytes::from_static(br#"{"version":1,"kind":"File","path":"/docs/0000.txt","generations":[],"payload":{"File":[1]}}"#);
++    fs.runtime
++        .set(&old_key, old.clone(), SetOptions::default())
++        .await
++        .unwrap();
++    fs.runtime.del(&[key.clone()]).await.unwrap();
++    let before = fs.metrics().snapshot().backend_fallbacks;
++    assert_eq!(
++        fs.read(&paths[0], 0, 0).await.unwrap(),
++        b"before\nNeedle\nafter\n"
++    );
++    assert_eq!(fs.metrics().snapshot().backend_fallbacks - before, 1);
++    assert_eq!(fs.runtime.get(&old_key).await.unwrap(), Some(old.clone()));
++    assert!(fs
++        .runtime
++        .get(&key)
++        .await
++        .unwrap()
++        .unwrap()
++        .starts_with(b"RGFC\x02"));
++
++    // A legacy or corrupt value accidentally stored under a v2 key is a miss too.
++    fs.runtime
++        .set(&key, old, SetOptions::default())
++        .await
++        .unwrap();
++    let before = fs.metrics().snapshot().backend_fallbacks;
++    assert_eq!(
++        fs.read(&paths[0], 0, 0).await.unwrap(),
++        b"before\nNeedle\nafter\n"
++    );
++    assert_eq!(fs.metrics().snapshot().backend_fallbacks - before, 1);
++    assert!(fs
++        .runtime
++        .get(&key)
++        .await
++        .unwrap()
++        .unwrap()
++        .starts_with(b"RGFC\x02"));
++}
++
++#[tokio::test]
++async fn cached_tree_reuses_generations_and_preserves_sorting_pagination_and_invalidation() {
++    let (fs, provider, _) = fixture(2).await;
++    for path in ["/docs/a", "/docs/a/deep", "/docs/b"] {
++        fs.mkdir(path, 0o755).await.unwrap();
++    }
++    for path in [
++        "/docs/a/deep/nested.txt",
++        "/docs/b/last.txt",
++        "/docs/.hidden",
++    ] {
++        fs.write(path, b"Needle", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++    }
++    for path in ["/docs", "/docs/a", "/docs/a/deep", "/docs/b"] {
++        fs.read_dir(path, None, None, None, None).await.unwrap();
++    }
++    for (node_limit, level_limit, offset, sort_by, sort_order, directories_only) in [
++        (None, None, None, None, None, false),
++        (
++            Some(3),
++            None,
++            Some(1),
++            Some(ListSortBy::Name),
++            Some(SortOrder::Desc),
++            false,
++        ),
++        (
++            None,
++            Some(1),
++            None,
++            Some(ListSortBy::Mtime),
++            Some(SortOrder::Asc),
++            false,
++        ),
++        (
++            Some(2),
++            None,
++            None,
++            Some(ListSortBy::Name),
++            Some(SortOrder::Asc),
++            true,
++        ),
++    ] {
++        provider.reset_observed_reads();
++        let expected = fs
++            .backend
++            .tree_directory(
++                "/docs",
++                false,
++                node_limit,
++                level_limit,
++                offset,
++                sort_by,
++                sort_order,
++                directories_only,
++            )
++            .await
++            .unwrap();
++        let actual = fs
++            .tree_directory(
++                "/docs",
++                false,
++                node_limit,
++                level_limit,
++                offset,
++                sort_by,
++                sort_order,
++                directories_only,
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            serde_json::to_value(actual).unwrap(),
++            serde_json::to_value(expected).unwrap()
++        );
++        let reads = provider.observed_read_keys();
++        let generations = reads
++            .iter()
++            .filter(|key| key.contains(":subtree:"))
++            .collect::<Vec<_>>();
++        assert!(!generations.is_empty());
++        assert_eq!(
++            generations.len(),
++            generations.iter().collect::<HashSet<_>>().len()
++        );
++    }
++    fs.remove_all("/docs/a").await.unwrap();
++    let expected = fs
++        .backend
++        .tree_directory("/docs", false, None, None, None, None, None, false)
++        .await
++        .unwrap();
++    let actual = fs
++        .tree_directory("/docs", false, None, None, None, None, None, false)
++        .await
++        .unwrap();
++    assert_eq!(
++        serde_json::to_value(actual).unwrap(),
++        serde_json::to_value(expected).unwrap()
++    );
++}
+diff --git a/crates/ragfs/src/cache_runtime/memory.rs b/crates/ragfs/src/cache_runtime/memory.rs
+index dbe9f4eb5c8224c2b1f3153fa1b3b5c42f300dfe..2440e3a99344eb8c0e4b5455eb166b1a01238220 100644
+--- a/crates/ragfs/src/cache_runtime/memory.rs
++++ b/crates/ragfs/src/cache_runtime/memory.rs
+@@ -150,6 +150,11 @@ impl MemoryMockProvider {
+         keys
+     }
+ 
++    /// Return the keys of each observed MGET for batch-boundary assertions.
++    pub fn observed_read_batches(&self) -> Vec<Vec<String>> {
++        self.seen_batch_get_keys.lock().unwrap().clone()
++    }
++
+     /// Return the maximum number of concurrent get calls since the last reset.
+     pub fn max_concurrent_gets(&self) -> u64 {
+         self.max_active_gets.load(Ordering::Relaxed)
+diff --git a/crates/ragfs/src/core/mountable.rs b/crates/ragfs/src/core/mountable.rs
+index 2b7f625ab20be7f2e16e7a90fe322dce2ea65707..442caec293a5c49b09d44e4cd8e1ee8cd37c523d 100644
+--- a/crates/ragfs/src/core/mountable.rs
++++ b/crates/ragfs/src/core/mountable.rs
+@@ -662,7 +662,10 @@ impl MountableFS {
+     pub async fn write_raw(&self, path: &str, data: &[u8], flags: WriteFlag) -> Result<u64> {
+         let (mount_info, rel_path) = self.find_mount(path).await?;
+         let raw = Self::raw_backend_for_mount(&mount_info, "write_raw")?;
+-        raw.write(&rel_path, data, 0, flags).await
++        let written = raw.write(&rel_path, data, 0, flags).await?;
++        #[cfg(feature = "cache")]
++        Self::invalidate_cache_after_raw_write(&mount_info, &rel_path).await;
++        Ok(written)
+     }
+ 
+     /// Copy one file within the same mounted filesystem while preserving raw bytes when possible.
+@@ -716,15 +719,16 @@ impl MountableFS {
+             )
+             .await
+             {
+-                Ok(()) => {
+-                    #[cfg(feature = "cache")]
+-                    Self::invalidate_cache_after_raw_write(&dst_mount, &dst_rel_path).await;
+-                    Ok(true)
+-                }
++                Ok(()) => Ok(true),
+                 Err(error) => Err(error),
+             }
+         };
+ 
++        #[cfg(feature = "cache")]
++        if matches!(result, Ok(true)) {
++            Self::invalidate_cache_after_raw_write(&dst_mount, &dst_rel_path).await;
++        }
++
+         let release = match auto_lease {
+             Some(lease) => manager.release(&lease).await,
+             None => Ok(()),
+@@ -891,6 +895,61 @@ impl FileSystem for ArcFileSystem {
+     async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+         self.0.chmod(path, mode).await
+     }
++
++    async fn grep(
++        &self,
++        path: &str,
++        pattern: &str,
++        options: GrepOptions<'_>,
++    ) -> Result<GrepResult> {
++        self.0.grep(path, pattern, options).await
++    }
++
++    async fn tree_directory(
++        &self,
++        path: &str,
++        show_hidden: bool,
++        node_limit: Option<usize>,
++        level_limit: Option<usize>,
++        offset: Option<usize>,
++        sort_by: Option<crate::core::ListSortBy>,
++        sort_order: Option<crate::core::SortOrder>,
++        directories_only: bool,
++    ) -> Result<Vec<TreeEntry>> {
++        self.0
++            .tree_directory(
++                path,
++                show_hidden,
++                node_limit,
++                level_limit,
++                offset,
++                sort_by,
++                sort_order,
++                directories_only,
++            )
++            .await
++    }
++
++    async fn glob_directory(
++        &self,
++        path: &str,
++        pattern: &str,
++        show_hidden: bool,
++        page_size: Option<usize>,
++        level_limit: Option<usize>,
++        continuation_token: Option<String>,
++    ) -> Result<GlobPage> {
++        self.0
++            .glob_directory(
++                path,
++                pattern,
++                show_hidden,
++                page_size,
++                level_limit,
++                continuation_token,
++            )
++            .await
++    }
+ }
+ 
+ #[cfg(feature = "cache")]
+@@ -1588,6 +1647,196 @@ mod tests {
+         mfs
+     }
+ 
++    #[cfg(feature = "cache")]
++    async fn query_snapshot(mfs: &MountableFS) -> Value {
++        let stat = mfs.stat("/local/docs/a.txt").await.ok();
++        let tree = mfs
++            .tree_directory("/local/docs", false, None, None, None, None, None, false)
++            .await
++            .unwrap();
++        let glob = mfs
++            .glob_directory("/local/docs", "**/*.txt", false, None, None, None)
++            .await
++            .unwrap();
++        let grep = mfs
++            .grep(
++                "/local/docs",
++                "needle",
++                GrepOptions {
++                    recursive: true,
++                    ..Default::default()
++                },
++            )
++            .await
++            .unwrap();
++        serde_json::json!([stat, tree, glob, grep])
++    }
++
++    #[cfg(feature = "cache")]
++    #[tokio::test]
++    async fn mounted_queries_hit_cache_before_backend_and_read_dir_uses_only_directory_cache() {
++        use crate::cache_runtime::MemoryMockProvider;
++        use crate::plugins::MemFSPlugin;
++        let provider = Arc::new(MemoryMockProvider::new());
++        let runtime = CacheRuntime::memory_with_provider(provider.clone());
++        let mfs = MountableFS::with_cache_runtime(
++            runtime.clone(),
++            CacheNamespace::new("query-routing"),
++            CachePolicy::default(),
++        );
++        mfs.register_plugin(MemFSPlugin).await;
++        mfs.mount(test_config("memfs", "/local")).await.unwrap();
++        mfs.mkdir("/local/docs", 0o755).await.unwrap();
++        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++        mfs.read_dir("/local/docs", None, None, None, None)
++            .await
++            .unwrap();
++        assert!(
++            !provider
++                .keys()
++                .await
++                .iter()
++                .any(|key| key.contains(":query:")),
++            "read_dir must not populate a second query cache"
++        );
++        assert!(
++            provider
++                .keys()
++                .await
++                .iter()
++                .any(|key| key.contains(":dir:")),
++            "read_dir must retain the existing directory cache"
++        );
++        let expected = query_snapshot(&mfs).await;
++        assert_eq!(expected[3]["count"], 1);
++        let keys = provider.keys().await;
++        assert!(keys.iter().any(|key| key.contains(":query:")));
++        for key in keys.iter().filter(|key| key.contains(":query:")) {
++            let bucket: Value =
++                serde_json::from_slice(&runtime.get(key).await.unwrap().unwrap()).unwrap();
++            assert!(bucket["queries"]
++                .as_object()
++                .unwrap()
++                .keys()
++                .all(|request| !request.contains("read_dir")));
++        }
++        // Deliberately bypass invalidation to prove the RAGFS entry points hit
++        // query results rather than re-running backend searches.
++        let (mount, _) = mfs.find_mount("/local/docs").await.unwrap();
++        mount.raw_fs.unwrap().remove_all("/docs").await.unwrap();
++        assert_eq!(query_snapshot(&mfs).await, expected);
++        mfs.mkdir("/local/docs", 0o755).await.unwrap();
++        let refreshed = query_snapshot(&mfs).await;
++        assert!(refreshed[0].is_null());
++        assert_eq!(refreshed[1].as_array().unwrap().len(), 0);
++        assert_eq!(refreshed[2]["entries"].as_array().unwrap().len(), 0);
++        assert_eq!(refreshed[3]["count"], 0);
++    }
++
++    #[cfg(feature = "cache")]
++    #[tokio::test]
++    async fn mounted_query_misses_preserve_plugin_search_implementations() {
++        let mfs = MountableFS::with_cache_runtime(
++            CacheRuntime::memory(),
++            CacheNamespace::new("query-plugin"),
++            CachePolicy::default(),
++        );
++        let entry = TreeEntry {
++            path: "/sentinel.txt".into(),
++            rel_path: "sentinel.txt".into(),
++            info: FileInfo::new_file("sentinel.txt".into(), 1, 0o644),
++            extra: HashMap::new(),
++        };
++        mfs.register_plugin(MockPlugin::with_tree_entries("query-plugin", vec![entry]))
++            .await;
++        mfs.mount(test_config("query-plugin", "/local"))
++            .await
++            .unwrap();
++        // MockFS.grep returns the pattern verbatim; its read() never contains it.
++        let grep = mfs
++            .grep("/local/a.txt", "unique-pattern", GrepOptions::default())
++            .await
++            .unwrap();
++        assert_eq!(grep.matches[0].content, "unique-pattern");
++        let tree = mfs
++            .tree_directory("/local", false, None, None, None, None, None, false)
++            .await
++            .unwrap();
++        assert_eq!(tree[0].path, "/local/sentinel.txt");
++        let glob = mfs
++            .glob_directory("/local", "*.txt", false, None, None, None)
++            .await
++            .unwrap();
++        assert_eq!(glob.entries[0].path, "/local/sentinel.txt");
++    }
++
++    #[cfg(feature = "cache")]
++    #[tokio::test]
++    async fn mounted_mutations_invalidate_query_results_including_raw_writes() {
++        let mfs = mounted_cached_memfs("query-mutations", "/local").await;
++        mfs.mkdir("/local/docs", 0o755).await.unwrap();
++        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++        let initial = query_snapshot(&mfs).await;
++        assert_eq!(initial[3]["count"], 1);
++        mfs.write_raw("/local/docs/a.txt", b"replacement", WriteFlag::Truncate)
++            .await
++            .unwrap();
++        let raw_updated = query_snapshot(&mfs).await;
++        assert_eq!(raw_updated[0]["size"], 11);
++        assert_eq!(raw_updated[3]["count"], 0);
++        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Truncate)
++            .await
++            .unwrap();
++        assert_eq!(query_snapshot(&mfs).await[3]["count"], 1);
++        mfs.truncate("/local/docs/a.txt", 2).await.unwrap();
++        assert_eq!(query_snapshot(&mfs).await[3]["count"], 0);
++        mfs.chmod("/local/docs/a.txt", 0o600).await.unwrap();
++        assert_eq!(query_snapshot(&mfs).await[0]["mode"], 0o600);
++        assert!(mfs
++            .compare_and_write("/local/docs/a.txt", b"ne", b"needle")
++            .await
++            .unwrap());
++        assert_eq!(query_snapshot(&mfs).await[3]["count"], 1);
++        assert!(mfs
++            .compare_and_remove("/local/docs/a.txt", b"needle")
++            .await
++            .unwrap());
++        assert!(query_snapshot(&mfs).await[0].is_null());
++        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++        query_snapshot(&mfs).await;
++        mfs.rename("/local/docs/a.txt", "/local/docs/b.txt")
++            .await
++            .unwrap();
++        let renamed = query_snapshot(&mfs).await;
++        assert!(renamed[0].is_null());
++        assert_eq!(renamed[2]["entries"][0]["name"], "b.txt");
++        mfs.write("/local/docs/a.txt", b"old", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++        query_snapshot(&mfs).await;
++        mfs.replace("/local/docs/b.txt", "/local/docs/a.txt")
++            .await
++            .unwrap();
++        let replaced = query_snapshot(&mfs).await;
++        assert_eq!(replaced[0]["size"], 6);
++        assert_eq!(replaced[2]["entries"].as_array().unwrap().len(), 1);
++        mfs.remove("/local/docs/a.txt").await.unwrap();
++        assert_eq!(query_snapshot(&mfs).await[3]["count"], 0);
++        mfs.mkdir("/local/docs/sub", 0o755).await.unwrap();
++        mfs.write("/local/docs/sub/b.txt", b"needle", 0, WriteFlag::Create)
++            .await
++            .unwrap();
++        assert_eq!(query_snapshot(&mfs).await[3]["count"], 1);
++        mfs.remove_all("/local/docs/sub").await.unwrap();
++        assert_eq!(query_snapshot(&mfs).await[3]["count"], 0);
++    }
++
+     /// Create a MountableFS with two mounted mock plugins.
+     async fn mounted_two_mocks() -> MountableFS {
+         let mfs = MountableFS::new();
+@@ -1936,17 +2185,20 @@ mod tests {
+             .await
+             .unwrap()
+             .expect("file cache object should exist");
+-        let envelope: Value = serde_json::from_slice(&encoded).unwrap();
+-        let payload = envelope["payload"]["File"]
+-            .as_array()
+-            .expect("file payload should be a byte array")
+-            .iter()
+-            .map(|value| value.as_u64().unwrap() as u8)
+-            .collect::<Vec<_>>();
+         assert!(
+-            payload.starts_with(b"OVE1"),
++            encoded.starts_with(b"RGFC\x02"),
++            "cache file objects should use the v2 binary envelope"
++        );
++        assert!(
++            encoded.windows(4).any(|window| window == b"OVE1"),
+             "shared cache providers must store encrypted file envelopes"
+         );
++        assert!(
++            !encoded
++                .windows(b"tenant-a-secret".len())
++                .any(|window| window == b"tenant-a-secret"),
++            "shared cache providers must not store plaintext file contents"
++        );
+     }
+ 
+     #[cfg(feature = "cache")]
+@@ -2028,10 +2280,30 @@ mod tests {
+                     .await
+                     .unwrap();
+ 
++                mfs.write("/local/docs/dst.md", b"old", 0, WriteFlag::Create)
++                    .await
++                    .unwrap();
++                assert_eq!(mfs.stat("/local/docs/dst.md").await.unwrap().size, 3);
++                assert_eq!(
++                    mfs.grep("/local/docs/dst.md", "copied", GrepOptions::default())
++                        .await
++                        .unwrap()
++                        .count,
++                    0
++                );
++
+                 assert!(mfs
+                     .copy_within_mount("/local/docs/src.md", "/local/docs/dst.md")
+                     .await
+                     .unwrap());
++                assert_eq!(mfs.stat("/local/docs/dst.md").await.unwrap().size, 6);
++                assert_eq!(
++                    mfs.grep("/local/docs/dst.md", "copied", GrepOptions::default())
++                        .await
++                        .unwrap()
++                        .count,
++                    1
++                );
+                 assert_eq!(
+                     mfs.read("/local/docs/dst.md", 0, 0).await.unwrap(),
+                     b"copied"
