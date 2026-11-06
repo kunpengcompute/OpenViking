@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
+from openviking.models.embedder.query_cache import query_embed_cache_var
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_input import (
     resolve_embedding_max_input_tokens,
@@ -90,6 +91,18 @@ async def embed_compat(
 
     stage = "embed_query" if is_query else "embed_resource"
     embedding_input = embedder.prepare_embedding_input(content)
+    cache = query_embed_cache_var.get() if is_query else None
+    if cache is not None:
+        key = (
+            id(embedder),
+            embedding_input if isinstance(embedding_input, str) else repr(embedding_input),
+        )
+
+        async def compute():
+            with bind_telemetry_stage(stage):
+                return await embedder.embed_async(embedding_input, is_query=True)
+
+        return await cache.run(key, compute)
     with bind_telemetry_stage(stage):
         return await embedder.embed_async(embedding_input, is_query=is_query)
 

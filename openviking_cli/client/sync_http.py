@@ -422,6 +422,7 @@ class SyncHTTPClient:
         telemetry: TelemetryRequest = False,
         *,
         identity: OVIdentity | None = None,
+        **context_options: Any,
     ):
         """Semantic search with optional session context."""
         return run_async(
@@ -437,6 +438,7 @@ class SyncHTTPClient:
                 context_type=context_type,
                 telemetry=telemetry,
                 **_identity_arguments(identity),
+                **context_options,
             )
         )
 

@@ -380,6 +380,7 @@ class AsyncOpenViking:
         until: Optional[str] = None,
         time_field: Optional[str] = None,
         level: Optional[List[int]] = None,
+        **context_options: Any,
     ):
         """
         Complex search with session context.
@@ -410,6 +411,7 @@ class AsyncOpenViking:
             until=until,
             time_field=time_field,
             level=level,
+            **context_options,
         )
 
     async def find(

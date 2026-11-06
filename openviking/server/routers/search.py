@@ -25,6 +25,7 @@ from openviking.utils.search_filters import (
     merge_search_filter,
 )
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.retrieve.context import ContextSearchOptions
 
 
 def _sanitize_floats(obj: Any) -> Any:
@@ -120,7 +121,7 @@ class FindRequest(BaseModel):
         return self
 
 
-class SearchRequest(BaseModel):
+class SearchRequest(ContextSearchOptions):
     """Request model for search with session."""
 
     model_config = ConfigDict(extra="forbid")
@@ -233,7 +234,7 @@ async def search(
 
     async def _search():
         session = None
-        if request.session_id:
+        if request.session_id and request.mode == "list":
             session = service.sessions.session(ctx, request.session_id)
             await session.load()
         return await service.search.search(
@@ -245,6 +246,7 @@ async def search(
             score_threshold=request.score_threshold,
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
+            **request.context_kwargs(),
         )
 
     execution = await run_operation(

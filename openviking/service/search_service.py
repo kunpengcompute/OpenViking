@@ -12,6 +12,7 @@ from openviking.core.uri_validation import validate_optional_viking_uris
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InvalidArgumentError, NotInitializedError
+from openviking_cli.retrieve.context import ContextSearchOptions
 from openviking_cli.utils import get_logger
 
 if TYPE_CHECKING:
@@ -51,8 +52,10 @@ class SearchService:
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
+        mode: str = "list",
+        **context_options: Any,
     ) -> Any:
-        """Complex search with session context.
+        """Return ranked hits, or deterministic context without session planning.
 
         Args:
             query: Query string
@@ -64,11 +67,33 @@ class SearchService:
             level: Filter by level (0=abstract, 1=overview, 2=file)
 
         Returns:
-            FindResult
+            FindResult for list mode; ContextSearchResult for context mode.
         """
         _ensure_non_empty_query(query)
         target_uri = validate_optional_viking_uris(target_uri, field_name="target_uri")
         viking_fs = self._ensure_initialized()
+
+        try:
+            options = ContextSearchOptions(mode=mode, **context_options)
+        except ValueError as exc:
+            raise InvalidArgumentError(str(exc)) from exc
+        if options.mode == "context":
+            from openviking.retrieve.context_assembler.pipeline import assemble_context
+
+            # Return before consulting the session or entering VikingFS.search:
+            # recall never invokes a query planner or an intent model.
+            return await assemble_context(
+                service=self,
+                viking_fs=viking_fs,
+                query=query,
+                ctx=ctx,
+                options=options,
+                target_uri=target_uri,
+                limit=limit,
+                score_threshold=score_threshold,
+                filter=filter,
+                level=level,
+            )
 
         session_info = None
         if session:
