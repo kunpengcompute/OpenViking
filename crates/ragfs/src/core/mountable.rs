@@ -662,7 +662,10 @@ impl MountableFS {
     pub async fn write_raw(&self, path: &str, data: &[u8], flags: WriteFlag) -> Result<u64> {
         let (mount_info, rel_path) = self.find_mount(path).await?;
         let raw = Self::raw_backend_for_mount(&mount_info, "write_raw")?;
-        raw.write(&rel_path, data, 0, flags).await
+        let written = raw.write(&rel_path, data, 0, flags).await?;
+        #[cfg(feature = "cache")]
+        Self::invalidate_cache_after_raw_write(&mount_info, &rel_path).await;
+        Ok(written)
     }
 
     /// Copy one file within the same mounted filesystem while preserving raw bytes when possible.
@@ -716,14 +719,15 @@ impl MountableFS {
             )
             .await
             {
-                Ok(()) => {
-                    #[cfg(feature = "cache")]
-                    Self::invalidate_cache_after_raw_write(&dst_mount, &dst_rel_path).await;
-                    Ok(true)
-                }
+                Ok(()) => Ok(true),
                 Err(error) => Err(error),
             }
         };
+
+        #[cfg(feature = "cache")]
+        if matches!(result, Ok(true)) {
+            Self::invalidate_cache_after_raw_write(&dst_mount, &dst_rel_path).await;
+        }
 
         let release = match auto_lease {
             Some(lease) => manager.release(&lease).await,
@@ -890,6 +894,61 @@ impl FileSystem for ArcFileSystem {
 
     async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
         self.0.chmod(path, mode).await
+    }
+
+    async fn grep(
+        &self,
+        path: &str,
+        pattern: &str,
+        options: GrepOptions<'_>,
+    ) -> Result<GrepResult> {
+        self.0.grep(path, pattern, options).await
+    }
+
+    async fn tree_directory(
+        &self,
+        path: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
+        directories_only: bool,
+    ) -> Result<Vec<TreeEntry>> {
+        self.0
+            .tree_directory(
+                path,
+                show_hidden,
+                node_limit,
+                level_limit,
+                offset,
+                sort_by,
+                sort_order,
+                directories_only,
+            )
+            .await
+    }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<GlobPage> {
+        self.0
+            .glob_directory(
+                path,
+                pattern,
+                show_hidden,
+                page_size,
+                level_limit,
+                continuation_token,
+            )
+            .await
     }
 }
 
@@ -1588,6 +1647,196 @@ mod tests {
         mfs
     }
 
+    #[cfg(feature = "cache")]
+    async fn query_snapshot(mfs: &MountableFS) -> Value {
+        let stat = mfs.stat("/local/docs/a.txt").await.ok();
+        let tree = mfs
+            .tree_directory("/local/docs", false, None, None, None, None, None, false)
+            .await
+            .unwrap();
+        let glob = mfs
+            .glob_directory("/local/docs", "**/*.txt", false, None, None, None)
+            .await
+            .unwrap();
+        let grep = mfs
+            .grep(
+                "/local/docs",
+                "needle",
+                GrepOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        serde_json::json!([stat, tree, glob, grep])
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn mounted_queries_hit_cache_before_backend_and_read_dir_uses_only_directory_cache() {
+        use crate::cache_runtime::MemoryMockProvider;
+        use crate::plugins::MemFSPlugin;
+        let provider = Arc::new(MemoryMockProvider::new());
+        let runtime = CacheRuntime::memory_with_provider(provider.clone());
+        let mfs = MountableFS::with_cache_runtime(
+            runtime.clone(),
+            CacheNamespace::new("query-routing"),
+            CachePolicy::default(),
+        );
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.mkdir("/local/docs", 0o755).await.unwrap();
+        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        mfs.read_dir("/local/docs", None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !provider
+                .keys()
+                .await
+                .iter()
+                .any(|key| key.contains(":query:")),
+            "read_dir must not populate a second query cache"
+        );
+        assert!(
+            provider
+                .keys()
+                .await
+                .iter()
+                .any(|key| key.contains(":dir:")),
+            "read_dir must retain the existing directory cache"
+        );
+        let expected = query_snapshot(&mfs).await;
+        assert_eq!(expected[3]["count"], 1);
+        let keys = provider.keys().await;
+        assert!(keys.iter().any(|key| key.contains(":query:")));
+        for key in keys.iter().filter(|key| key.contains(":query:")) {
+            let bucket: Value =
+                serde_json::from_slice(&runtime.get(key).await.unwrap().unwrap()).unwrap();
+            assert!(bucket["queries"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|request| !request.contains("read_dir")));
+        }
+        // Deliberately bypass invalidation to prove the RAGFS entry points hit
+        // query results rather than re-running backend searches.
+        let (mount, _) = mfs.find_mount("/local/docs").await.unwrap();
+        mount.raw_fs.unwrap().remove_all("/docs").await.unwrap();
+        assert_eq!(query_snapshot(&mfs).await, expected);
+        mfs.mkdir("/local/docs", 0o755).await.unwrap();
+        let refreshed = query_snapshot(&mfs).await;
+        assert!(refreshed[0].is_null());
+        assert_eq!(refreshed[1].as_array().unwrap().len(), 0);
+        assert_eq!(refreshed[2]["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(refreshed[3]["count"], 0);
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn mounted_query_misses_preserve_plugin_search_implementations() {
+        let mfs = MountableFS::with_cache_runtime(
+            CacheRuntime::memory(),
+            CacheNamespace::new("query-plugin"),
+            CachePolicy::default(),
+        );
+        let entry = TreeEntry {
+            path: "/sentinel.txt".into(),
+            rel_path: "sentinel.txt".into(),
+            info: FileInfo::new_file("sentinel.txt".into(), 1, 0o644),
+            extra: HashMap::new(),
+        };
+        mfs.register_plugin(MockPlugin::with_tree_entries("query-plugin", vec![entry]))
+            .await;
+        mfs.mount(test_config("query-plugin", "/local"))
+            .await
+            .unwrap();
+        // MockFS.grep returns the pattern verbatim; its read() never contains it.
+        let grep = mfs
+            .grep("/local/a.txt", "unique-pattern", GrepOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(grep.matches[0].content, "unique-pattern");
+        let tree = mfs
+            .tree_directory("/local", false, None, None, None, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(tree[0].path, "/local/sentinel.txt");
+        let glob = mfs
+            .glob_directory("/local", "*.txt", false, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(glob.entries[0].path, "/local/sentinel.txt");
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn mounted_mutations_invalidate_query_results_including_raw_writes() {
+        let mfs = mounted_cached_memfs("query-mutations", "/local").await;
+        mfs.mkdir("/local/docs", 0o755).await.unwrap();
+        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        let initial = query_snapshot(&mfs).await;
+        assert_eq!(initial[3]["count"], 1);
+        mfs.write_raw("/local/docs/a.txt", b"replacement", WriteFlag::Truncate)
+            .await
+            .unwrap();
+        let raw_updated = query_snapshot(&mfs).await;
+        assert_eq!(raw_updated[0]["size"], 11);
+        assert_eq!(raw_updated[3]["count"], 0);
+        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Truncate)
+            .await
+            .unwrap();
+        assert_eq!(query_snapshot(&mfs).await[3]["count"], 1);
+        mfs.truncate("/local/docs/a.txt", 2).await.unwrap();
+        assert_eq!(query_snapshot(&mfs).await[3]["count"], 0);
+        mfs.chmod("/local/docs/a.txt", 0o600).await.unwrap();
+        assert_eq!(query_snapshot(&mfs).await[0]["mode"], 0o600);
+        assert!(mfs
+            .compare_and_write("/local/docs/a.txt", b"ne", b"needle")
+            .await
+            .unwrap());
+        assert_eq!(query_snapshot(&mfs).await[3]["count"], 1);
+        assert!(mfs
+            .compare_and_remove("/local/docs/a.txt", b"needle")
+            .await
+            .unwrap());
+        assert!(query_snapshot(&mfs).await[0].is_null());
+        mfs.write("/local/docs/a.txt", b"needle", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        query_snapshot(&mfs).await;
+        mfs.rename("/local/docs/a.txt", "/local/docs/b.txt")
+            .await
+            .unwrap();
+        let renamed = query_snapshot(&mfs).await;
+        assert!(renamed[0].is_null());
+        assert_eq!(renamed[2]["entries"][0]["name"], "b.txt");
+        mfs.write("/local/docs/a.txt", b"old", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        query_snapshot(&mfs).await;
+        mfs.replace("/local/docs/b.txt", "/local/docs/a.txt")
+            .await
+            .unwrap();
+        let replaced = query_snapshot(&mfs).await;
+        assert_eq!(replaced[0]["size"], 6);
+        assert_eq!(replaced[2]["entries"].as_array().unwrap().len(), 1);
+        mfs.remove("/local/docs/a.txt").await.unwrap();
+        assert_eq!(query_snapshot(&mfs).await[3]["count"], 0);
+        mfs.mkdir("/local/docs/sub", 0o755).await.unwrap();
+        mfs.write("/local/docs/sub/b.txt", b"needle", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        assert_eq!(query_snapshot(&mfs).await[3]["count"], 1);
+        mfs.remove_all("/local/docs/sub").await.unwrap();
+        assert_eq!(query_snapshot(&mfs).await[3]["count"], 0);
+    }
+
     /// Create a MountableFS with two mounted mock plugins.
     async fn mounted_two_mocks() -> MountableFS {
         let mfs = MountableFS::new();
@@ -1936,16 +2185,19 @@ mod tests {
             .await
             .unwrap()
             .expect("file cache object should exist");
-        let envelope: Value = serde_json::from_slice(&encoded).unwrap();
-        let payload = envelope["payload"]["File"]
-            .as_array()
-            .expect("file payload should be a byte array")
-            .iter()
-            .map(|value| value.as_u64().unwrap() as u8)
-            .collect::<Vec<_>>();
         assert!(
-            payload.starts_with(b"OVE1"),
+            encoded.starts_with(b"RGFC\x02"),
+            "cache file objects should use the v2 binary envelope"
+        );
+        assert!(
+            encoded.windows(4).any(|window| window == b"OVE1"),
             "shared cache providers must store encrypted file envelopes"
+        );
+        assert!(
+            !encoded
+                .windows(b"tenant-a-secret".len())
+                .any(|window| window == b"tenant-a-secret"),
+            "shared cache providers must not store plaintext file contents"
         );
     }
 
@@ -2028,10 +2280,30 @@ mod tests {
                     .await
                     .unwrap();
 
+                mfs.write("/local/docs/dst.md", b"old", 0, WriteFlag::Create)
+                    .await
+                    .unwrap();
+                assert_eq!(mfs.stat("/local/docs/dst.md").await.unwrap().size, 3);
+                assert_eq!(
+                    mfs.grep("/local/docs/dst.md", "copied", GrepOptions::default())
+                        .await
+                        .unwrap()
+                        .count,
+                    0
+                );
+
                 assert!(mfs
                     .copy_within_mount("/local/docs/src.md", "/local/docs/dst.md")
                     .await
                     .unwrap());
+                assert_eq!(mfs.stat("/local/docs/dst.md").await.unwrap().size, 6);
+                assert_eq!(
+                    mfs.grep("/local/docs/dst.md", "copied", GrepOptions::default())
+                        .await
+                        .unwrap()
+                        .count,
+                    1
+                );
                 assert_eq!(
                     mfs.read("/local/docs/dst.md", 0, 0).await.unwrap(),
                     b"copied"
