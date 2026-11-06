@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-// SPDX-License-Identifier: AGPL-3.0
-
 //! Result buckets kept separate from file bodies and raw directory entries.
 
 use super::metrics::CacheMetrics;

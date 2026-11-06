@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-// SPDX-License-Identifier: AGPL-3.0
-
 //! In-process provider used by Runtime tests and smoke validation.
 
 use super::provider::{CacheOperation, CacheProvider};

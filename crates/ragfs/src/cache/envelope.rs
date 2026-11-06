@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-// SPDX-License-Identifier: AGPL-3.0
-
 //! Stable values stored behind the provider contract.
 
 use crate::cache_runtime::{CacheError, CacheResult};

@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-// SPDX-License-Identifier: AGPL-3.0
-
 //! MountableFS - A filesystem that routes operations to mounted plugins
 //!
 //! This module implements the core MountableFS which acts as a router,

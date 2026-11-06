@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-// SPDX-License-Identifier: AGPL-3.0
-
 //! A transparent [`FileSystem`](crate::FileSystem) cache wrapper.
 
 use super::envelope::{CacheEnvelope, CacheObjectKind, GenerationSnapshot};

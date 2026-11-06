@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-// SPDX-License-Identifier: AGPL-3.0
-
 //! Optional provider-independent caching for RAGFS filesystems.
 //!
 //! This module is intentionally not installed by [`crate::MountableFS`] by
