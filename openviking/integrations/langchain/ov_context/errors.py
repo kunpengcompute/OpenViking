@@ -6,6 +6,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from openviking.integrations._context_contracts import (
+    ContextHistoryBudgetError as ContextHistoryBudgetError,
+)
+from openviking.integrations._context_contracts import ContextReadError as ContextReadError
+
 if TYPE_CHECKING:
     from .writer import WriteResult
 
@@ -20,14 +25,6 @@ class ContextBudgetExceeded(ValueError):
 
 class AmbiguousWriteError(RuntimeError):
     """The server may have stored the batch. Automatic retry is unsafe."""
-
-
-class ContextReadError(RuntimeError):
-    """No verified snapshot was produced; the caller must retain its old cache."""
-
-
-class ContextHistoryBudgetError(ContextReadError):
-    """The complete session summary cannot fit the supplied history budget."""
 
 
 class IncompleteWriteError(AmbiguousWriteError):
