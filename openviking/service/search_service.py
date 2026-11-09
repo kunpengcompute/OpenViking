@@ -6,6 +6,9 @@ Search Service for OpenViking.
 Provides search operations: search, find.
 """
 
+import asyncio
+import re
+
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.retrieval_types import SearchType
@@ -251,3 +254,158 @@ class SearchService:
             search_type=search_type,
         )
         return FindResult(memories=[], resources=[], skills=result.matched_contexts)
+
+    async def find_evidence(
+        self,
+        query: str,
+        ctx: RequestContext,
+        user_uri: str = "",
+        top_k: int = 15,
+        epi_window: int = 4,
+        propagate: bool = True,
+        use_semantic: bool = False,
+        sem_anchor_top: int = 3,
+        closure_radius: int = 1,
+        strategy: str = "legacy",
+        candidate_limit: int = 50,
+        max_supplementary_queries: int = 2,
+        use_memories: bool = False,
+        use_events: bool = False,
+        event_top_k: int = 2,
+        use_graph: bool = False,
+        use_time: bool = False,
+    ) -> Dict[str, Any]:
+        """Zero-Mem/EdgeMem style evidence retrieval over archived raw turns.
+        Reads the user-space evidence index (``{user_uri}/.index/evidence.json``)
+        built incrementally at session commit, and returns ranked raw turns
+        (episode/turn/speaker/text/date/uri) so the caller can assemble an
+        answer prompt without a second read. Deterministic, zero LLM.
+        A missing index yields an empty evidence list. Storage, authorization
+        and parsing errors propagate rather than masquerading as an empty index.
+        """
+        if (use_memories or use_events or use_graph or use_time) and strategy != "coverage":
+            raise InvalidArgumentError("Auxiliary evidence channels require strategy=coverage")
+        if not 1 <= event_top_k <= 20:
+            raise InvalidArgumentError("event_top_k must be between 1 and 20")
+        _ensure_non_empty_query(query)
+        if not (
+            1 <= top_k <= 50
+            and 1 <= candidate_limit <= 50
+            and 0 <= max_supplementary_queries <= 3
+            and 0 <= epi_window <= 50
+            and 1 <= sem_anchor_top <= 20
+            and 0 <= closure_radius <= 20
+        ):
+            raise InvalidArgumentError("Invalid evidence retrieval limits")
+        viking_fs = self._ensure_initialized()
+        user_uri = (user_uri or f"viking://user/{ctx.user.user_id}").rstrip("/")
+        from openviking.core.uri_validation import validate_request_viking_uri
+
+        user_uri = validate_request_viking_uri(user_uri, ctx)
+        if not re.fullmatch(r"viking://user/[^/]+", user_uri):
+            raise InvalidArgumentError("Evidence target must be a user root URI")
+        index_uri = f"{user_uri}/.index/evidence.json"
+        if strategy == "coverage":
+            from openviking.retrieve.evidence_retriever import load_index
+            from openviking.retrieve.evidence_strategy import retrieve_coverage
+
+            # Re-read through the filesystem's current request authorization.
+            index = await load_index(viking_fs, index_uri, ctx)
+
+            async def embed(query_text):
+                if not use_semantic:
+                    return None
+                embedder = viking_fs._get_embedder(ctx)
+                if embedder is None:
+                    return None
+                return await asyncio.to_thread(self._embed_query, embedder, query_text)
+
+            sources = None
+            event_cap = 1.0
+            if use_memories or use_events:
+                from openviking.retrieve.memory_sources import load_memory_sources, MemorySources
+                from openviking.retrieve.evidence_strategy import configured_event_cap
+
+                if use_events:
+                    event_cap = configured_event_cap()
+                try:
+                    sources = await asyncio.wait_for(
+                        load_memory_sources(
+                            viking_fs,
+                            index,
+                            user_uri,
+                            ctx,
+                            use_memories=use_memories,
+                            use_events=use_events,
+                        ),
+                        timeout=20.0,
+                    )
+                except (TimeoutError, asyncio.TimeoutError):
+                    sources = MemorySources()
+                    sources.diagnostics["errors"].append(
+                        dict(stage="memory_sources", error_type="TimeoutError")
+                    )
+
+            evidence, diagnostics = await retrieve_coverage(
+                index,
+                query,
+                embed=embed,
+                top_k=top_k,
+                candidate_limit=candidate_limit,
+                max_supplementary_queries=max_supplementary_queries,
+                memory_sources=sources,
+                event_top_k=event_top_k,
+                event_cap=event_cap,
+                use_graph=use_graph,
+                use_time=use_time,
+            )
+            return dict(
+                query=query,
+                index_uri=index_uri,
+                n_evidence=len(evidence),
+                evidence=evidence,
+                facts=sources.selected_facts if sources is not None else [],
+                diagnostics=diagnostics,
+            )
+        if strategy != "legacy":
+            raise InvalidArgumentError(f"Unknown evidence strategy: {strategy}")
+        from openviking.retrieve.evidence_retriever import load_index
+
+        index = await load_index(viking_fs, index_uri, ctx)
+        q_vec: Optional[List[float]] = None
+        if use_semantic:
+            try:
+                embedder = viking_fs._get_embedder(ctx)
+                if embedder is not None:
+                    q_vec = await asyncio.to_thread(self._embed_query, embedder, query)
+            except Exception as exc:  # pragma: no cover - fail-open
+                logger.warning("[evidence] semantic query embed failed: %s", exc)
+                q_vec = None
+        evidence = await asyncio.to_thread(
+            index.retrieve,
+            query=query,
+            top_k=top_k,
+            epi_window=epi_window,
+            propagate=propagate,
+            use_semantic=use_semantic,
+            q_vec=q_vec,
+            sem_anchor_top=sem_anchor_top,
+            closure_radius=closure_radius,
+        )
+        return {
+            "query": query,
+            "index_uri": index_uri,
+            "n_evidence": len(evidence),
+            "evidence": [{k: v for k, v in turn.items() if k != "emb"} for turn in evidence],
+        }
+
+    @staticmethod
+    def _embed_query(embedder: Any, text: str) -> Optional[List[float]]:
+        """Synchronous query embedding -> dense vector list (fail-open)."""
+        try:
+            result = embedder.embed(text, is_query=True)
+            vec = getattr(result, "dense_vector", None)
+            return list(vec) if vec else None
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[evidence] embedder.embed failed: %s", exc)
+        return None
