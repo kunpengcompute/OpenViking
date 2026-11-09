@@ -18,14 +18,14 @@ from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
 
 @lru_cache(maxsize=1024)
-def _regenerated_facts(text, speaker, source_id, date):
+def _regenerated_facts(text, speaker, source_id, date, role):
     """Cache immutable extraction results by complete input, never by URI alone."""
     from openviking.session.memory.deterministic_rules import _resolve_dates_in_text
 
     ts = datetime.fromisoformat(date.replace("Z", "+00:00")) if date else None
     return frozenset(
         json.dumps(f, sort_keys=True, ensure_ascii=False)
-        for f in make_fact_records(text, speaker, source_id, ts, _resolve_dates_in_text)
+        for f in make_fact_records(text, speaker, source_id, ts, _resolve_dates_in_text, role=role)
     )
 
 
@@ -44,7 +44,11 @@ def verify_fact(fact, index: EvidenceIndex, cache=None) -> bool:
             turn = turns[0]
             try:
                 regenerated = _regenerated_facts(
-                    turn["text"], turn["speaker"], ids[0], turn.get("date")
+                    turn["text"],
+                    turn["speaker"],
+                    ids[0],
+                    turn.get("date"),
+                    turn.get("role") or None,
                 )
             except (ValueError, TypeError):
                 return False
@@ -94,7 +98,9 @@ class MemorySources:
             if not _valid_fact_shape(fact):
                 self.diagnostics["rejected_facts"] += 1
                 continue
-            if fact.get("speaker") != requested_speaker:
+            sources = index.resolve_sources(fact["source_turn_ids"])
+            source_role = sources[0].get("role") if len(sources) == 1 else None
+            if (source_role or fact.get("speaker")) != requested_speaker:
                 continue
             if assistant_question and fact["id"] not in self.metadata_by_id:
                 continue

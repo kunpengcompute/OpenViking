@@ -85,6 +85,9 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    evidence_graph_write_enabled: bool = Field(
+        default=False, description="Build deterministic entity/time graph windows at archive commit."
+    )
     deterministic_extract_enabled: bool | None = Field(
         default=None,
         description=(

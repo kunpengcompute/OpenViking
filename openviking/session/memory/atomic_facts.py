@@ -141,7 +141,9 @@ def select_user_facts(
     from openviking.session.memory.deterministic_rules import _resolve_dates_in_text
 
     selected = []
-    for fact in make_fact_records(text, speaker, source_id, recorded_at, _resolve_dates_in_text):
+    for fact in make_fact_records(
+        text, speaker, source_id, recorded_at, _resolve_dates_in_text, role="user"
+    ):
         quote = fact["source_quotes"][source_id]
         if not _PERSONAL.search(quote) or fact["assertion_type"] in {
             "question",
@@ -185,7 +187,7 @@ def select_user_facts(
                 "quantity": quantity,
                 "scope": _scope(quote),
                 "time_expression": time.group(0) if time else None,
-                "speaker": speaker,
+                "speaker": "user",
                 "content": quote,
                 "context": context,
             }
@@ -194,7 +196,11 @@ def select_user_facts(
 
 
 def select_assistant_facts(
-    text: str, previous_user_text: str, source_id: str, recorded_at: datetime | None
+    text: str,
+    previous_user_text: str,
+    source_id: str,
+    recorded_at: datetime | None,
+    speaker: str = "assistant",
 ) -> list[dict]:
     """Keep compact, source-backed suggestions and named examples from replies."""
     if not (
@@ -204,7 +210,9 @@ def select_assistant_facts(
         return []
     from openviking.session.memory.deterministic_rules import _resolve_dates_in_text
 
-    facts = make_fact_records(text, "assistant", source_id, recorded_at, _resolve_dates_in_text)
+    facts = make_fact_records(
+        text, speaker, source_id, recorded_at, _resolve_dates_in_text, role="assistant"
+    )
     rows = []
     for line in text.splitlines():
         match = _LIST_ITEM.match(line)

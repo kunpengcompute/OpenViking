@@ -6,6 +6,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import re
@@ -45,6 +46,7 @@ from openviking.session.extraction_batch import (
     resolve_extraction_batch_limits,
 )
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
+from openviking.session.memory.memory_updater import MemoryUpdateError
 from openviking.session.memory.utils.language import resolve_output_language_from_conversation
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.session.retention import (
@@ -68,6 +70,7 @@ from openviking.utils.model_retry import is_retryable_api_error, retry_async
 from openviking.utils.time_utils import get_current_timestamp
 from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.exceptions import (
+    InternalError,
     NotFoundError,
 )
 from openviking_cli.session.user_id import UserIdentifier
@@ -86,6 +89,29 @@ MemoryPolicyData = Optional[Dict[str, Any]]
 MemoryPolicyProvider = Callable[[], Awaitable[MemoryPolicyData]]
 
 logger = get_logger(__name__)
+
+_EVIDENCE_SPEAKER_RE = re.compile(r"^\[([^\]]+)\]:\s*(.*)$", re.DOTALL)
+
+def _embed_turn_texts(
+    embedder: Any,
+    texts: List[str],
+) -> List[Optional[List[float]]]:
+    """Embed one text per turn for the ALG-A semantic channel (run in a thread).
+    Fail-open per text: a failing or missing vector yields None and that turn
+    simply joins the four-channel path.
+    """
+    out: List[Optional[List[float]]] = []
+    for text in texts:
+        try:
+            result = embedder.embed(text, is_query=False)
+            vec = getattr(result, "dense_vector", None)
+            out.append(list(vec) if vec else None)
+        except Exception as exc: # pragma: no cover - defensive
+            logger.warning("[evidence] turn embed failed: %s", exc)
+            out.append(None)
+    return out
+
+
 
 _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
 _MEMORY_EXTRACTION_MAX_RETRIES = 3
@@ -1042,6 +1068,7 @@ class Session:
         agent_evolution_enabled: bool = True,
         agent_memory_skip_reason: Optional[str] = None,
         lease_ref: Optional[Any] = None,
+        retry_fingerprint: Optional[str] = None,
     ) -> None:
         """Persist the Phase 1 intent before any destructive root rewrite."""
         payload = {
@@ -1058,6 +1085,8 @@ class Session:
             "retained_message_token_budget": retained_message_token_budget,
             "min_raw_tail_steps": min_raw_tail_steps,
         }
+        if retry_fingerprint is not None:
+            payload["retry_fingerprint"] = retry_fingerprint
         await self._merge_archive_meta(
             archive_uri,
             {
@@ -1069,6 +1098,45 @@ class Session:
             },
             lease_ref=lease_ref,
         )
+
+    async def _can_reuse_evidence_archive(
+        self,
+        archive_uri: str,
+        retry_fingerprint: str,
+        messages: List[Message],
+    ) -> bool:
+        """Match an unpublished Phase 1 intent while holding the Session lock."""
+        if await self._viking_fs.exists(f"{archive_uri}/.done", ctx=self.ctx):
+            return False
+        try:
+            meta = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.meta.json", ctx=self.ctx)
+            )
+        except Exception as exc:
+            if _is_storage_not_found(exc):
+                return False
+            raise
+        phase1 = meta.get("phase1", {})
+        if phase1.get("status") != "preparing" or phase1.get("retry_fingerprint") != retry_fingerprint:
+            return False
+        try:
+            failed = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.failed.json", ctx=self.ctx)
+            )
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                raise
+            # A crash may precede the failure marker or follow its removal.
+            # A matching preparing intent has never published Phase 2 work.
+            failed = None
+        if failed is not None and (
+            not isinstance(failed, dict) or failed.get("stage") != "evidence_index"
+        ):
+            return False
+        archived = await self._archives.read_messages(archive_uri)
+        return [message.to_dict() for message in archived] == [
+            message.to_dict() for message in messages
+        ]
 
     async def _write_phase1_ready_marker(
         self,
@@ -1233,6 +1301,70 @@ class Session:
                 min_raw_tail_steps=min_raw_tail_steps,
             )
         )
+
+    async def _append_to_evidence_index(self, messages: List[Message], archive_uri: str) -> None:
+        """Write-time incremental append of archived turns to the evidence index.
+        Zero-Mem/EdgeMem style lexical + entity index pointing back at the
+        archived raw turns. Index read/write failures abort Phase 1 before
+        rewriting live messages. Encoded imports retain their
+        episode numbering; ordinary sessions append by stable message ID.
+        """
+        if not self._viking_fs or not messages:
+            return
+        from openviking.retrieve.evidence_retriever import evidence_index_lock, load_index
+
+        user_space = self._session_uri.rsplit("/sessions/", 1)[0]
+        uri = f"{user_space}/.index/evidence.json"
+        try:
+            turns = []
+            for m in messages:
+                text = "\n".join(part.text for part in m.parts if isinstance(part, TextPart))
+                if not text:
+                    continue
+                sm = _EVIDENCE_SPEAKER_RE.match(text)
+                turns.append(
+                    {
+                        "id": m.id,
+                        "role": m.role,
+                        "speaker": sm.group(1).strip() if sm else (m.peer_id or m.role or ""),
+                        "text": text,
+                        "date": m.created_at or "",
+                    }
+                )
+            # ALG-A semantic channel: embed each turn text once at write
+            # time (bge dense vectors; zero LLM / zero token). Fail-open:
+            # no embedder or failed embed -> None entries, retrieval
+            # degrades to the four-channel path.
+            embeddings: Optional[List[Optional[List[float]]]] = None
+            if turns:
+                try:
+                    embedder = self._viking_fs._get_embedder(self.ctx)
+                    if embedder is not None:
+                        embeddings = await asyncio.to_thread(
+                            _embed_turn_texts,
+                            embedder,
+                            [t["text"] for t in turns],
+                        )
+                except Exception as exc:  # pragma: no cover - fail-open
+                    logger.warning("[evidence] embedder unavailable: %s", exc)
+            graph_enabled = get_openviking_config().memory.evidence_graph_write_enabled
+            # commit_async retains the session lease throughout this hook.
+            # Keep model I/O outside the shared user index lease so unrelated
+            # sessions can append while this session waits for embeddings.
+            async with evidence_index_lock(self._viking_fs, uri, self.ctx) as lease:
+                index = await load_index(self._viking_fs, uri, self.ctx)
+                if index.append_chunk(
+                    self.session_id,
+                    turns,
+                    user_space,
+                    embeddings,
+                    archive_uri=archive_uri,
+                    graph_enabled=graph_enabled,
+                ):
+                    await index.save(self._viking_fs, uri, self.ctx, lease_ref=lease)
+        except Exception:
+            logger.exception("[evidence] index append failed")
+            raise
 
     @tracer("session.commit.phase1")
     async def commit_async(
@@ -1510,10 +1642,28 @@ class Session:
                     "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
                 }
 
+            retry_fingerprint = hashlib.sha256(json.dumps({
+                "messages": [m.to_dict() for m in self._messages],
+                "archived_ids": [m.id for m in messages_to_archive],
+                "retained_ids": [m.id for m in retained_messages],
+                "memory_policy": effective_memory_policy, "event_tags": effective_event_tags,
+                "keep_recent_count": keep_recent_count, "stored_keep_recent_count": stored_keep_recent_count,
+                "retention_mode": retention_mode, "keep_turns": effective_keep_turns,
+                "token_budget": effective_token_budget, "min_tail": effective_min_tail,
+                "reset_context": reset_context, "agent_evolution_enabled": agent_evolution_enabled,
+            }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+            previous_index = self._compression.compression_index
             self._compression.compression_index += 1
-            archive_uri = (
-                f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-            )
+            archive_uri = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+            reuse_archive = False
+            # A failed evidence append has no published extraction task. Reuse
+            # only an exact matching intent; preserve any different archived raw.
+            while await self._viking_fs.exists(archive_uri, ctx=self.ctx):
+                if await self._can_reuse_evidence_archive(archive_uri, retry_fingerprint, messages_to_archive):
+                    reuse_archive = True
+                    break
+                self._compression.compression_index += 1
+                archive_uri = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
             original_messages = list(self._messages)
             task_id = str(uuid4())
             queue_msg = SessionCommitMsg(
@@ -1533,6 +1683,7 @@ class Session:
                     self._write_phase1_marker(
                         archive_uri,
                         queue_message=queue_msg.to_dict(),
+                        retry_fingerprint=retry_fingerprint,
                         original_messages=original_messages,
                         archived_messages=messages_to_archive,
                         retained_messages=retained_messages,
@@ -1573,6 +1724,11 @@ class Session:
                             )
                         },
                     )
+
+                phase1_stage = "evidence_index"
+                await self._append_to_evidence_index(messages_to_archive, archive_uri)
+                if reuse_archive:
+                    await self._viking_fs.rm(f"{archive_uri}/.failed.json", ctx=self.ctx)
 
                 phase1_stage = "queue_enqueue"
                 await get_queue_manager().enqueue(
@@ -1630,7 +1786,13 @@ class Session:
                         archive_uri,
                     )
                 self._messages = original_messages
-                self._compression.compression_index -= 1
+                self._compression.compression_index = previous_index
+                if phase1_stage == "evidence_index":
+                    from openviking.server.error_mapping import map_exception
+                    error = map_exception(e) or InternalError("Evidence index update failed")
+                    error.details.update(stage="evidence_index", archive_uri=archive_uri,
+                                         archive_persisted=True, archived=False, live_messages_preserved=True)
+                    raise error from e
                 raise
             if reset_context:
                 await self._append_context_reset_archive()
@@ -2130,7 +2292,9 @@ class Session:
                             max_retries=_MEMORY_EXTRACTION_MAX_RETRIES,
                             base_delay=_MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS,
                             max_delay=_MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS,
-                            is_retryable=is_retryable_api_error,
+                            is_retryable=lambda error: (
+                                not isinstance(error, MemoryUpdateError) and is_retryable_api_error(error)
+                            ),
                             logger=logger,
                             operation_name=operation_name,
                         )

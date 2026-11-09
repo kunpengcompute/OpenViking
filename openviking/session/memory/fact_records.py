@@ -352,7 +352,7 @@ def _roles(sentence, speaker, action, antecedent):
     return roles, resolutions
 
 
-def make_fact_records(text, speaker, source_id, recorded_at, resolve_dates):
+def make_fact_records(text, speaker, source_id, recorded_at, resolve_dates, *, role=None):
     """Keep every sentence. Ambiguous relations remain attributed reports.
 
     Time may be unknown; message time must not silently become event time.
@@ -450,7 +450,7 @@ def make_fact_records(text, speaker, source_id, recorded_at, resolve_dates):
                 version=FACT_VERSION,
                 subject=subject,
                 predicate=predicate,
-                speaker=speaker,
+                speaker=role or speaker,
                 roles=roles,
                 resolution_evidence=resolutions,
                 object=obj,

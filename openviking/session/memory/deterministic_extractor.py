@@ -251,7 +251,9 @@ class DeterministicMemoryExtractor:
                 )
                 rows = rows[:4]
             else:
-                rows = select_assistant_facts(msg.text, previous_user, msg.source_id, msg.ts)
+                rows = select_assistant_facts(
+                    msg.text, previous_user, msg.source_id, msg.ts, msg.speaker
+                )
                 rows = rows[:6]
             for row in rows:
                 fact = row["fact"]
@@ -539,7 +541,7 @@ class DeterministicMemoryExtractor:
     ) -> None:
         for msg in extracted:
             facts = make_fact_records(
-                msg.text, msg.speaker, msg.source_id, msg.ts, _resolve_dates_in_text
+                msg.text, msg.speaker, msg.source_id, msg.ts, _resolve_dates_in_text, role=msg.role
             )
             for fact in facts:
                 quote = fact["source_quotes"][msg.source_id]
@@ -594,7 +596,7 @@ class DeterministicMemoryExtractor:
         for msg in extracted:
             per_message: List[_EventRecord] = []
             facts = make_fact_records(
-                msg.text, msg.speaker, msg.source_id, msg.ts, _resolve_dates_in_text
+                msg.text, msg.speaker, msg.source_id, msg.ts, _resolve_dates_in_text, role=msg.role
             )
             for fact in facts:
                 for event_type in _EVENT_VERB_PATTERNS:

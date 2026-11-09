@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Set
 
 from openviking.retrieve.evidence_features import EventNode, extract_keys, parse_episode_key
@@ -138,6 +139,7 @@ class EvidenceIndex(EvidenceRanking):
                 "episode": episode_key,
                 "turn": turn_no,
                 "speaker": speaker,
+                "role": m.get("role", ""),
                 "text": text,
                 "date": date,
                 "uri": self._chunk_uri(user_space, session_id),
@@ -568,6 +570,7 @@ class EvidenceIndex(EvidenceRanking):
     # -- retrieval -------------------------------------------------------
 
 
+@asynccontextmanager
 async def evidence_index_lock(viking_fs: Any, uri: str, ctx: Any):
     """Serialize the entire read/modify/write across workers and accounts."""
     path = viking_fs._uri_to_path(uri, ctx=ctx)
