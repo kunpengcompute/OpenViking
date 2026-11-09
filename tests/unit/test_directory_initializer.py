@@ -28,6 +28,10 @@ class _FakeVikingDB:
 class _FakeVikingFS:
     def __init__(self):
         self.contexts = {}
+        self._async_agfs = AsyncMock()
+
+    def _uri_to_path(self, uri, ctx=None):
+        return uri
 
     async def read_file(self, uri, ctx):
         directory, filename = uri.rsplit("/", 1)
@@ -36,7 +40,7 @@ class _FakeVikingFS:
             raise FileNotFoundError(uri)
         return self.contexts[directory][name]
 
-    async def write_context(self, uri, abstract="", overview="", is_leaf=False, ctx=None):
+    async def write_context(self, uri, abstract="", overview="", is_leaf=False, ctx=None, lease_ref=None):
         if ctx.actor_peer_id and may_include_hidden_actor_peers(uri, ctx):
             raise PermissionError(f"actor peer cannot mutate {uri}")
         context = self.contexts.setdefault(uri, {})
