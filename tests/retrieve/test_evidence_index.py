@@ -113,3 +113,13 @@ async def test_failed_save_preserves_dirty_snapshot_for_retry():
     await index.save(fs, "index", None, lease_ref="lease")
     assert not index._dirty
     assert fs.write_file.call_args.kwargs["lease_ref"] == "lease"
+
+
+def test_legacy_semantic_closure_respects_budget_when_wider_than_episode_window():
+    index = EvidenceIndex()
+    append(index, ids=("m1", "m2", "m3"))
+    index._turn_by_id["ordinary:0"]["emb"] = [1.0, 0.0]
+    hits = index.retrieve(
+        "alpha", top_k=1, epi_window=0, use_semantic=True, q_vec=[1.0, 0.0], closure_radius=5
+    )
+    assert len(hits) <= 1

@@ -1051,3 +1051,30 @@ async def test_glob_uses_path_to_uri_for_non_legacy_namespace(monkeypatch, fs):
     )
 
     assert result == {"matches": ["viking://resources/actual-root/demo.md"], "count": 1}
+
+
+@pytest.mark.asyncio
+async def test_source_maintenance_can_force_authoritative_filesystem_listing(monkeypatch, fs):
+    from unittest.mock import AsyncMock
+
+    remote = AsyncMock(return_value={"matches": [], "count": 0})
+    monkeypatch.setattr(fs, "_try_glob_vikingdb", remote)
+    monkeypatch.setattr(
+        fs._async_agfs,
+        "glob_directory",
+        AsyncMock(
+            return_value={
+                "entries": [
+                    {
+                        "path": "/local/test_account/resources/unindexed.md",
+                        "name": "unindexed.md",
+                        "is_dir": False,
+                    }
+                ],
+                "next_token": None,
+            }
+        ),
+    )
+    result = await fs.glob("**/*.md", uri="viking://resources", ctx=_default_ctx(), force_fs=True)
+    assert result["matches"] == ["viking://resources/unindexed.md"]
+    remote.assert_not_awaited()

@@ -8,7 +8,6 @@ Provides search operations: search, find.
 
 import asyncio
 import re
-
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.retrieval_types import SearchType
@@ -318,13 +317,13 @@ class SearchService:
                 embedder = viking_fs._get_embedder(ctx)
                 if embedder is None:
                     return None
-                return await asyncio.to_thread(self._embed_query, embedder, query_text)
+                return await self._embed_query(embedder, query_text)
 
             sources = None
             event_cap = 1.0
             if use_memories or use_events:
-                from openviking.retrieve.memory_sources import load_memory_sources, MemorySources
                 from openviking.retrieve.evidence_strategy import configured_event_cap
+                from openviking.retrieve.memory_sources import MemorySources, load_memory_sources
 
                 if use_events:
                     event_cap = configured_event_cap()
@@ -343,7 +342,7 @@ class SearchService:
                 except (TimeoutError, asyncio.TimeoutError):
                     sources = MemorySources()
                     sources.diagnostics["errors"].append(
-                        dict(stage="memory_sources", error_type="TimeoutError")
+                        {"stage": "memory_sources", "error_type": "TimeoutError"}
                     )
 
             evidence, diagnostics = await retrieve_coverage(
@@ -359,14 +358,14 @@ class SearchService:
                 use_graph=use_graph,
                 use_time=use_time,
             )
-            return dict(
-                query=query,
-                index_uri=index_uri,
-                n_evidence=len(evidence),
-                evidence=evidence,
-                facts=sources.selected_facts if sources is not None else [],
-                diagnostics=diagnostics,
-            )
+            return {
+                "query": query,
+                "index_uri": index_uri,
+                "n_evidence": len(evidence),
+                "evidence": evidence,
+                "facts": sources.selected_facts if sources is not None else [],
+                "diagnostics": diagnostics,
+            }
         if strategy != "legacy":
             raise InvalidArgumentError(f"Unknown evidence strategy: {strategy}")
         from openviking.retrieve.evidence_retriever import load_index
@@ -377,7 +376,7 @@ class SearchService:
             try:
                 embedder = viking_fs._get_embedder(ctx)
                 if embedder is not None:
-                    q_vec = await asyncio.to_thread(self._embed_query, embedder, query)
+                    q_vec = await self._embed_query(embedder, query)
             except Exception as exc:  # pragma: no cover - fail-open
                 logger.warning("[evidence] semantic query embed failed: %s", exc)
                 q_vec = None
@@ -400,10 +399,12 @@ class SearchService:
         }
 
     @staticmethod
-    def _embed_query(embedder: Any, text: str) -> Optional[List[float]]:
-        """Synchronous query embedding -> dense vector list (fail-open)."""
+    async def _embed_query(embedder: Any, text: str) -> Optional[List[float]]:
+        """Query embedding through the account-bound compatibility API (fail-open)."""
         try:
-            result = embedder.embed(text, is_query=True)
+            from openviking.models.embedder.base import embed_compat
+
+            result = await embed_compat(embedder, text, is_query=True)
             vec = getattr(result, "dense_vector", None)
             return list(vec) if vec else None
         except Exception as exc:  # pragma: no cover - defensive

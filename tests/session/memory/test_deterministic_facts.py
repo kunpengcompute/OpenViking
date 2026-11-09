@@ -47,7 +47,10 @@ def test_assertion_scope(text, expected):
 
 def test_source_identity_and_verbatim_quotes_without_nlp(monkeypatch):
     monkeypatch.setattr(fact_records, "_parse", lambda text: None)
-    resolve = lambda text, ts: (text, [])
+
+    def resolve(text, ts):
+        return text, []
+
     ts = datetime(2023, 5, 8)
     text = "[Caroline]: 我昨天去了北京。我的儿子叫小明。"
     rows = make_fact_records(text, "Caroline", "D1:3", ts, resolve)

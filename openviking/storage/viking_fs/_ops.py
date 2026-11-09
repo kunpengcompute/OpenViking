@@ -1189,6 +1189,7 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
         extra_fields: Optional[List[str]] = None,
         tag_filter: Optional[Dict[str, Any]] = None,
+        force_fs: bool = False,
     ) -> Dict:
         """File pattern matching, supports **/*.md recursive.
 
@@ -1196,6 +1197,7 @@ class _OpsMixin:
         When extra_fields is a list (possibly empty), returns entry dicts; entries in the list
         request additional augmentation (locked, id, count). An empty list still returns dicts
         (with name/uri/size/mode/mtime/isDir populated from stat) for CLI table rendering.
+        force_fs bypasses vector-index matching for authoritative source maintenance.
         """
         _ensure_non_empty_search_query(pattern)
         await self._ensure_access(uri, ctx)
@@ -1215,17 +1217,18 @@ class _OpsMixin:
                 return {"matches": [], "count": 0}
             raise NotFoundError(uri, "directory")
 
-        remote_result = await self._try_glob_vikingdb(
-            pattern=pattern,
-            uri=uri,
-            node_limit=node_limit,
-            return_entries=return_entries,
-            extra_fields=aug_fields,
-            tag_filter=tag_filter,
-            ctx=real_ctx,
-        )
-        if remote_result is not None:
-            return remote_result
+        if not force_fs:
+            remote_result = await self._try_glob_vikingdb(
+                pattern=pattern,
+                uri=uri,
+                node_limit=node_limit,
+                return_entries=return_entries,
+                extra_fields=aug_fields,
+                tag_filter=tag_filter,
+                ctx=real_ctx,
+            )
+            if remote_result is not None:
+                return remote_result
 
         # Tag filtering happens in FSService on the local fallback path. Fetch
         # all matches so an early filesystem limit cannot discard later tagged

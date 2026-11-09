@@ -158,7 +158,7 @@ _EPISODE_RE = re.compile(r"^sample(?P<sid>[0-9_]+)_s(?P<sess>\d+)_c(?P<chunk>\d+
 def parse_episode_key(session_id: str) -> Optional[Tuple[str, str, int]]:
     """Parse a chunk session_id into (episode_key, session_label, chunk_idx).
     Accepts ``sample{sid}_s{sess}_c{chunk}`` encoded by import_to_ov.py.
-    Returns None for any non-encoded session id (fail-open: skip indexing).
+    Returns None for ordinary session IDs, which append using stable message identities.
     """
     m = _EPISODE_RE.match(session_id or "")
     if not m:

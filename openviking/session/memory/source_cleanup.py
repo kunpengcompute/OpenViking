@@ -238,8 +238,16 @@ async def cleanup_source_memories(
                 roots.add(peers + "/" + name + "/memories")
     for uri in index.pending_memory_cleanup:
         root = uri.split("/memories/", 1)[0] + "/memories"
-        if root not in roots:
+        peer_parts = root.removeprefix(peers + "/").split("/")
+        is_peer_root = (
+            root.startswith(peers + "/")
+            and len(peer_parts) == 2
+            and peer_parts[0] not in ("", ".", "..")
+            and peer_parts[1] == "memories"
+        )
+        if root != user_root + "/memories" and not is_peer_root:
             raise ValueError("Cleanup journal contains an out-of-scope memory URI")
+        roots.add(root)
     result = {"updated": 0, "deleted": 0}
     for root in sorted(roots):
         counts = await _cleanup_memory_root(

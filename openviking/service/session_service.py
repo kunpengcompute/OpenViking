@@ -503,7 +503,7 @@ class SessionService:
 
                 embedder = fs._get_embedder(ctx)
                 if embedder is not None:
-                    embedding = (await asyncio.to_thread(_embed_turn_texts, embedder, [content]))[0]
+                    embedding = (await _embed_turn_texts(embedder, [content]))[0]
             index_uri = session_uri.rsplit("/sessions/", 1)[0] + "/.index/evidence.json"
             stage = "evidence_index"
             async with evidence_index_lock(fs, index_uri, ctx) as index_lease:

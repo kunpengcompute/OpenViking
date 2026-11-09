@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 _CODE = re.compile(
     r"(?<![\w.])(?:[\w./-]+\.(?:py|ts|tsx|js|jsx|md|json|yaml|yml|sh|toml|rs|go)"
     r"|[A-Za-z_][\w-]*(?:/[A-Za-z_][\w-]*)+|https?://[^\s\"'<>]+)"
-    r"(?![\w.])",
+    r"(?!\w|\.\w)",
     re.I,
 )
 _TITLE = re.compile(

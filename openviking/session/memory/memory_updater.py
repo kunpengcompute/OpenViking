@@ -2137,7 +2137,7 @@ class MemoryUpdater:
             )
             from openviking.utils.embedding_utils import vectorize_directory_meta
 
-            await vectorize_directory_meta(
+            enqueued_levels = await vectorize_directory_meta(
                 uri=directory,
                 abstract="",
                 overview=rendered,
@@ -2152,6 +2152,12 @@ class MemoryUpdater:
                     }
                 },
             )
+            if (
+                self._strict_index_errors
+                and self._vikingdb is not None
+                and int(ContextLevel.OVERVIEW.value) not in enqueued_levels
+            ):
+                raise RuntimeError("Memory overview embedding was not enqueued")
             return True
         except Exception as e:
             tracer.error(f"Failed to write overview {overview_path}: {e}")

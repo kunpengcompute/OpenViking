@@ -107,3 +107,45 @@ async def test_fresh_read_failure_does_not_overwrite_prefetched_memory(monkeypat
             operation, RequestContext(UserIdentifier("tenant", "alice"), Role.USER)
         )
     fs.write_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_recovers_journal_for_a_disappeared_peer(monkeypatch):
+    from openviking.session.memory import source_cleanup
+
+    cleanup = AsyncMock(return_value={"updated": 0, "deleted": 0})
+    monkeypatch.setattr(source_cleanup, "_cleanup_memory_root", cleanup)
+    fs = SimpleNamespace(exists=AsyncMock(return_value=False))
+    index = EvidenceIndex()
+    index.pending_memory_cleanup = ["viking://user/alice/peers/bob/memories/facts/old.md"]
+    await source_cleanup.cleanup_source_memories(
+        fs, index, "viking://user/alice/.index/evidence.json", "lease", [], "ctx"
+    )
+    assert "viking://user/alice/peers/bob/memories" in {
+        call.kwargs["root"] for call in cleanup.await_args_list
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("levels, expected", [(set(), False), ({1}, True)])
+async def test_cleanup_overview_requires_successful_embedding_enqueue(
+    monkeypatch, levels, expected
+):
+    from openviking.session.memory.memory_updater import MemoryUpdater
+
+    registry = SimpleNamespace(
+        get=lambda _: SimpleNamespace(overview_template="{{ items[0].file_name }}")
+    )
+    uri = "viking://user/alice/memories/entities"
+    fs = SimpleNamespace(
+        ls=AsyncMock(return_value=[{"name": "alice.md"}]),
+        read_file=AsyncMock(return_value="A surviving source."),
+        write_file=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "openviking.utils.embedding_utils.vectorize_directory_meta",
+        AsyncMock(return_value=levels),
+    )
+    updater = MemoryUpdater(registry=registry, vikingdb=object(), strict_index_errors=True)
+    updater._viking_fs = fs
+    assert await updater.generate_overview("entities", uri, object()) is expected

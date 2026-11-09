@@ -255,7 +255,7 @@ def _local_antecedent(sentence):
             and any(t.pos_ == "ADJ" for t in description)
             and all(t.pos_ in {"ADJ", "ADV", "PUNCT", "SPACE"} for t in description)
         ):
-            return dict(name=contraction[1], quote=sentence)
+            return {"name": contraction[1], "quote": sentence}
     names = {_proper_name(t) for t in doc if t.pos_ == "PROPN" and t.dep_ != "compound"} - {None}
     if len(names) != 1:
         return None
@@ -271,19 +271,19 @@ def _local_antecedent(sentence):
     if not any(t.dep_ == "nsubj" and _proper_name(t) == name for t in doc):
         if not (doc[:].root.pos_ == "ADJ" and re.match(re.escape(name) + r"['’]s\s", body)):
             return None
-    return dict(name=name, quote=sentence)
+    return {"name": name, "quote": sentence}
 
 
 def _roles(sentence, speaker, action, antecedent):
     body, addressees = _without_vocative(sentence)
-    roles = dict(
-        actor=action[0] if action else None,
-        patient=None,
-        patient_owner=None,
-        location=None,
-        location_owner=None,
-        addressees=addressees,
-    )
+    roles = {
+        "actor": action[0] if action else None,
+        "patient": None,
+        "patient_owner": None,
+        "location": None,
+        "location_owner": None,
+        "addressees": addressees,
+    }
     resolutions = []
     doc = _parse(body)
     if doc is None or not action:
@@ -292,11 +292,11 @@ def _roles(sentence, speaker, action, antecedent):
     subjects = [t for t in root.children if t.dep_ == "nsubj"]
     if antecedent and any(t.lower_ in {"he", "she", "it"} for t in subjects):
         resolutions.append(
-            dict(
-                mention=subjects[0].text,
-                resolved_to=action[0],
-                antecedent_quote=antecedent["quote"],
-            )
+            {
+                "mention": subjects[0].text,
+                "resolved_to": action[0],
+                "antecedent_quote": antecedent["quote"],
+            }
         )
 
     def nominal(token):
@@ -321,11 +321,11 @@ def _roles(sentence, speaker, action, antecedent):
                 if compatible and len(candidates) == 1:
                     owner = next(iter(candidates))
                     resolutions.append(
-                        dict(
-                            mention=poss.text,
-                            resolved_to=owner,
-                            antecedent_quote=antecedent["quote"] if antecedent else sentence,
-                        )
+                        {
+                            "mention": poss.text,
+                            "resolved_to": owner,
+                            "antecedent_quote": antecedent["quote"] if antecedent else sentence,
+                        }
                     )
             else:
                 owner = _proper_name(poss)
@@ -446,21 +446,21 @@ def make_fact_records(text, speaker, source_id, recorded_at, resolve_dates, *, r
                     location_owner=None,
                 )
                 resolutions = []
-            record = dict(
-                version=FACT_VERSION,
-                subject=subject,
-                predicate=predicate,
-                speaker=role or speaker,
-                roles=roles,
-                resolution_evidence=resolutions,
-                object=obj,
-                time=time,
-                time_precision=precision,
-                assertion_type=kind,
-                recorded_at=recorded_at.isoformat() if recorded_at else None,
-                source_turn_ids=[source_id],
-                source_quotes={source_id: quote},
-            )
+            record = {
+                "version": FACT_VERSION,
+                "subject": subject,
+                "predicate": predicate,
+                "speaker": role or speaker,
+                "roles": roles,
+                "resolution_evidence": resolutions,
+                "object": obj,
+                "time": time,
+                "time_precision": precision,
+                "assertion_type": kind,
+                "recorded_at": recorded_at.isoformat() if recorded_at else None,
+                "source_turn_ids": [source_id],
+                "source_quotes": {source_id: quote},
+            }
             record["id"] = hashlib.sha256(
                 json.dumps(record, sort_keys=True, ensure_ascii=False).encode()
             ).hexdigest()[:24]

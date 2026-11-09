@@ -30,7 +30,7 @@ async def test_memory_embedding_guard_checks_revision_and_holds_lease(
     if content is None:
         fs.read_file.side_effect = FileNotFoundError()
     module = importlib.import_module("openviking.storage.viking_fs")
-    monkeypatch.setattr(module._wrapped, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(module._wrapped, "get_viking_fs", lambda: fs, raising=False)
     async with TextEmbeddingHandler._memory_write_guard("card", revision, "ctx", 2) as valid:
         assert valid is current
         fs._async_agfs.pathlock_release.assert_not_awaited()
@@ -45,7 +45,7 @@ async def test_overview_revision_reads_its_sidecar_and_propagates_storage_failur
         read_file=AsyncMock(side_effect=PermissionError("denied")),
     )
     module = importlib.import_module("openviking.storage.viking_fs")
-    monkeypatch.setattr(module._wrapped, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(module._wrapped, "get_viking_fs", lambda: fs, raising=False)
     with pytest.raises(PermissionError):
         async with TextEmbeddingHandler._memory_write_guard("directory", "revision", "ctx", 1):
             pytest.fail("storage errors must not publish stale vectors")

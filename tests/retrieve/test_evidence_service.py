@@ -68,3 +68,21 @@ def test_request_budget_and_auxiliary_validation():
     with pytest.raises(ValidationError):
         FindEvidenceRequest(use_events=True)
     assert FindEvidenceRequest(strategy="coverage", use_events=True).use_events
+
+
+@pytest.mark.asyncio
+async def test_evidence_embeddings_use_account_bound_async_api(setup):
+    from openviking.config.embedding import AccountBoundEmbedder
+    from openviking.session.session import _embed_turn_texts
+
+    service, fs, ctx = setup
+    provider = SimpleNamespace(
+        embed=AsyncMock(return_value=SimpleNamespace(dense_vector=[1.0, 0.0])),
+        query_cache_key=AsyncMock(return_value=("tenant", "query")),
+    )
+    embedder = AccountBoundEmbedder(provider, ctx.account_id)
+    fs._get_embedder.return_value = embedder
+    await service.find_evidence("query", ctx, strategy="coverage", use_semantic=True)
+    provider.embed.assert_awaited_once_with("tenant", "query", is_query=True)
+    assert await _embed_turn_texts(embedder, ["first", "second"]) == [[1.0, 0.0], [1.0, 0.0]]
+    assert provider.embed.await_count == 3

@@ -92,18 +92,20 @@ logger = get_logger(__name__)
 
 _EVIDENCE_SPEAKER_RE = re.compile(r"^\[([^\]]+)\]:\s*(.*)$", re.DOTALL)
 
-def _embed_turn_texts(
+async def _embed_turn_texts(
     embedder: Any,
     texts: List[str],
 ) -> List[Optional[List[float]]]:
-    """Embed one text per turn for the ALG-A semantic channel (run in a thread).
+    """Embed turn texts through the account-bound embedding compatibility API.
     Fail-open per text: a failing or missing vector yields None and that turn
     simply joins the four-channel path.
     """
     out: List[Optional[List[float]]] = []
     for text in texts:
         try:
-            result = embedder.embed(text, is_query=False)
+            from openviking.models.embedder.base import embed_compat
+
+            result = await embed_compat(embedder, text, is_query=False)
             vec = getattr(result, "dense_vector", None)
             out.append(list(vec) if vec else None)
         except Exception as exc: # pragma: no cover - defensive
@@ -1331,8 +1333,8 @@ class Session:
                         "date": m.created_at or "",
                     }
                 )
-            # ALG-A semantic channel: embed each turn text once at write
-            # time (bge dense vectors; zero LLM / zero token). Fail-open:
+            # Semantic channel: embed each turn text once at write time
+            # using the current account's provider. Fail-open:
             # no embedder or failed embed -> None entries, retrieval
             # degrades to the four-channel path.
             embeddings: Optional[List[Optional[List[float]]]] = None
@@ -1340,11 +1342,7 @@ class Session:
                 try:
                     embedder = self._viking_fs._get_embedder(self.ctx)
                     if embedder is not None:
-                        embeddings = await asyncio.to_thread(
-                            _embed_turn_texts,
-                            embedder,
-                            [t["text"] for t in turns],
-                        )
+                        embeddings = await _embed_turn_texts(embedder, [t["text"] for t in turns])
                 except Exception as exc:  # pragma: no cover - fail-open
                     logger.warning("[evidence] embedder unavailable: %s", exc)
             graph_enabled = get_openviking_config().memory.evidence_graph_write_enabled

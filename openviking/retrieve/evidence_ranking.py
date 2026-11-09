@@ -87,8 +87,8 @@ class EvidenceRanking:
         # Primary evidence: top-3 across distinct episodes (deterministic).
         primary = []
         seen_ep = set()
-        for tid in sorted(score, key=lambda t: -score[t]):
-            ep = tid.split(":")[0]
+        for tid in sorted(score, key=lambda t: (-score.get(t, 0.0), t)):
+            ep = tid.rsplit(":", 1)[0]
             if ep in seen_ep:
                 continue
             seen_ep.add(ep)
@@ -102,7 +102,7 @@ class EvidenceRanking:
             sem_anchors = self._sem_anchors(q_vec, sem_anchor_top)
         sem_active = bool(sem_anchors)
         anchors = list(dict.fromkeys(primary + sem_anchors))
-        lex_ch = sorted(score, key=lambda t: -score[t])[:top_k]
+        lex_ch = sorted(score, key=lambda t: (-score.get(t, 0.0), t))[:top_k]
         lex_set = set(lex_ch)
         # Episode window expansion: neighbors of the anchor turns. The ALG-A
         # path applies the bonus directly (validated on the pilot harness);
@@ -200,7 +200,7 @@ class EvidenceRanking:
                         # Non-date matches only boost turns that already carry
                         # a signal; never inject cold member turns.
                         score[tid] = max(score[tid], boost)
-        ranked_ids = sorted(score, key=lambda t: -score[t])[:top_k]
+        ranked_ids = sorted(score, key=lambda t: (-score.get(t, 0.0), t))[:top_k]
         # ALG-A closure: force-include semantic anchors + their ±radius
         # neighbors, displacing the lowest-ranked non-closure members.
         if sem_active and closure_radius >= 0:
@@ -212,27 +212,27 @@ class EvidenceRanking:
                     oid = self._turn_id(ep, j)
                     if oid in self._turn_by_id:
                         closure.add(oid)
-            for tid in closure:
+            for tid in sorted(closure):
                 if tid not in ranked_ids:
                     for cand in reversed(ranked_ids):
                         if cand not in closure:
                             ranked_ids.remove(cand)
                             break
                     ranked_ids.append(tid)
-            ranked_ids = sorted(ranked_ids, key=lambda t: -score[t])
+            ranked_ids = sorted(ranked_ids, key=lambda t: (-score.get(t, 0.0), t))
         # Event hyperedge closure: date-matched event members are
         # force-included (inclusion, not scoring; mirrors the semantic closure).
         if event_anchors:
             eclosure = set(event_anchors)
-            for tid in eclosure:
+            for tid in sorted(eclosure):
                 if tid not in ranked_ids:
                     for cand in reversed(ranked_ids):
                         if cand not in eclosure:
                             ranked_ids.remove(cand)
                             break
                     ranked_ids.append(tid)
-            ranked_ids = sorted(ranked_ids, key=lambda t: -score[t])
-        return [self._turn_by_id[tid] for tid in ranked_ids]
+            ranked_ids = sorted(ranked_ids, key=lambda t: (-score.get(t, 0.0), t))
+        return [self._turn_by_id[tid] for tid in ranked_ids[:top_k]]
 
     def get_turns(self, turn_ids: List[str]) -> List[Dict[str, Any]]:
         """Read evidence from this index only, without exposing stored vectors."""
