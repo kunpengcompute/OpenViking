@@ -5,7 +5,7 @@ Tests for MemoryUpdater.
 """
 
 from copy import deepcopy
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -426,6 +426,7 @@ class TestMemoryUpdater:
             context_type="memory",
             ctx=ctx,
             include_abstract=False,
+            scalar_overrides={1: {"_memory_revision": ANY}},
         )
 
         document = parse_abstract_overview(viking_fs.store[overview_uri])

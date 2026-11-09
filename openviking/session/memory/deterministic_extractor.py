@@ -168,6 +168,8 @@ class DeterministicMemoryExtractor:
                 operation.uris = self._isolation_handler.calculate_memory_uris(
                     self._registry.get(operation.memory_type), operation, extract_context
                 )
+        for operation in upserts:
+            operation.memory_fields["extraction_method"] = "deterministic"
         return ResolvedOperations(
             upsert_operations=upserts,
             delete_file_contents=[],
