@@ -26,6 +26,23 @@ _STOP = set(
 )
 _ENTITY_LABELS = {"PERSON", "ORG", "GPE", "LOC", "DATE", "TIME", "NORP", "WORK_OF_ART"}
 _KEEP_POS = {"NOUN", "PROPN", "VERB", "ADJ", "NUM"}
+
+
+def name_in_text(name: str, text: str) -> bool:
+    return bool(name and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.I))
+
+
+def query_speakers(question: str, turns) -> set[str]:
+    """Resolve explicit people against this authorized snapshot, not chat roles."""
+    return {
+        t["speaker"].casefold()
+        for t in turns
+        if t.get("speaker")
+        and t["speaker"].casefold() not in {"user", "assistant", "system", "tool"}
+        and name_in_text(t["speaker"], question)
+    }
+
+
 # Event hyperedge helpers ------------------------------------------------------
 # Deterministic event-card date normalization (probe phase, zero LLM).
 _MONTHS = {

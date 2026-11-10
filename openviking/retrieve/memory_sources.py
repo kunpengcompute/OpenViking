@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 
+from openviking.retrieve.evidence_features import name_in_text, query_speakers
 from openviking.retrieve.evidence_retriever import EventNode, EvidenceIndex, extract_keys
 from openviking.session.memory.fact_records import make_fact_records
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
@@ -91,6 +92,7 @@ class MemorySources:
             )
         )
         requested_speaker = "assistant" if assistant_question else "user"
+        actors = query_speakers(question, index._turn_by_id.values())
         ranked = []
         # Reuse source lexical features: do not reparse the entire fact corpus
         # with NLP on every query. Explicit subjects supply resolved pronouns.
@@ -99,8 +101,23 @@ class MemorySources:
                 self.diagnostics["rejected_facts"] += 1
                 continue
             sources = index.resolve_sources(fact["source_turn_ids"])
-            source_role = sources[0].get("role") if len(sources) == 1 else None
-            if (source_role or fact.get("speaker")) != requested_speaker:
+            if len(sources) != 1:
+                continue
+            source = sources[0]
+            source_role = source.get("role") or fact.get("speaker")
+            if actors and not assistant_question:
+                # A name used only as a greeting is not the assertion's subject.
+                if not any(name_in_text(actor, fact["subject"]) for actor in actors):
+                    continue
+                # Named transcript participants may use either transport role.
+                # Unnamed AI output does not become a person's own experience.
+                if (
+                    source_role == "assistant"
+                    and source.get("speaker", "").casefold()
+                    in {"", "user", "assistant", "system", "tool"}
+                ):
+                    continue
+            elif source_role != requested_speaker:
                 continue
             if assistant_question and fact["id"] not in self.metadata_by_id:
                 continue
@@ -124,6 +141,7 @@ class MemorySources:
             if not verify_fact(fact, index, cache):
                 self.diagnostics["rejected_facts"] += 1
                 continue
+            source = index.resolve_sources(fact["source_turn_ids"])[0]
             verified += 1
             if len(self.selected_facts) < 12:
                 metadata = self.metadata_by_id.get(fact["id"], {})
@@ -139,6 +157,8 @@ class MemorySources:
                         "event_time": fact.get("time"),
                         "recorded_at": fact.get("recorded_at"),
                         "speaker": fact.get("speaker"),
+                        "source_speaker": source.get("speaker"),
+                        "source_role": source.get("role"),
                         "source_turn_ids": fact["source_turn_ids"],
                     }
                 )
