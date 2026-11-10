@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1110" viewBox="0 0 1240 1110" role="img" aria-labelledby="title desc">
+  <title id="title">SDK 请求级身份传递</title>
+  <desc id="desc">请求 A 与请求 B 分别从 Runtime.context.identity 传入 RunIdentity。OpenVikingContextMiddleware 校验 owner 并提取 OVIdentity，Writer、Reader 和 SessionEngine 会话操作将本次 identity 显式传给 AsyncHTTPClient。SDK 与 OV Server 使用 trusted 模式，每次请求携带统一服务凭据和独立的 account、user、actor peer 身份头。session_id 作为业务操作参数传递，run_id 用于应用执行关联。</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#416c9b"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#458671"/></marker>
+  </defs>
+  <style>
+    text {font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;fill:#20364b}
+    .title {font-size:28px;font-weight:650}
+    .name {font-size:22px;font-weight:650}
+    .body {font-size:18px;fill:#435a6c}
+    .small {font-size:17px;fill:#607689}
+    .code {font-family:'SFMono-Regular',Menlo,Consolas,monospace;font-size:17px;fill:#245778}
+    .flow-a {fill:none;stroke:#416c9b;stroke-width:2;marker-end:url(#a)}
+    .flow-b {fill:none;stroke:#458671;stroke-width:2;marker-end:url(#b)}
+  </style>
+  <rect width="1240" height="1110" fill="white"/>
+  <text x="40" y="52" class="title">SDK 请求级身份传递</text>
+  <text x="40" y="84" class="small">身份随本次调用显式传递，SDK 为每个请求生成独立 headers。</text>
+
+  <rect x="40" y="116" width="550" height="132" rx="12" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="64" y="151" class="name">请求 A · Runtime.context.identity</text>
+  <text x="64" y="183" class="code">RunIdentity(account-a, user-a, mail-peer,</text>
+  <text x="64" y="210" class="code">            session-a, run-a)</text>
+  <text x="64" y="235" class="small">DeepAgents 本次 invoke 传入</text>
+  <rect x="650" y="116" width="550" height="132" rx="12" fill="#edf7f4" stroke="#9fcdbf"/>
+  <text x="674" y="151" class="name">请求 B · Runtime.context.identity</text>
+  <text x="674" y="183" class="code">RunIdentity(account-b, user-b, doc-peer,</text>
+  <text x="674" y="210" class="code">            session-b, run-b)</text>
+  <text x="674" y="235" class="small">DeepAgents 本次 invoke 传入</text>
+
+  <path d="M315 248 V294" class="flow-a"/>
+  <path d="M925 248 V294" class="flow-b"/>
+  <rect x="40" y="294" width="550" height="116" rx="12" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="64" y="329" class="name">OpenVikingContextMiddleware</text>
+  <text x="64" y="360" class="body">解析身份并校验 OVContext.owner</text>
+  <text x="64" y="390" class="code">sdk_identity → OVIdentity A</text>
+  <rect x="650" y="294" width="550" height="116" rx="12" fill="#edf7f4" stroke="#9fcdbf"/>
+  <text x="674" y="329" class="name">OpenVikingContextMiddleware</text>
+  <text x="674" y="360" class="body">解析身份并校验 OVContext.owner</text>
+  <text x="674" y="390" class="code">sdk_identity → OVIdentity B</text>
+
+  <path d="M315 410 V458" class="flow-a"/>
+  <path d="M925 410 V458" class="flow-b"/>
+  <rect x="40" y="458" width="550" height="126" rx="12" fill="#f6f9fd" stroke="#9bb6d5"/>
+  <text x="64" y="491" class="code">OVMessageWriter / OVContextReader</text>
+  <text x="64" y="520" class="code">SessionEngine 会话操作</text>
+  <text x="64" y="553" class="body">调用 SDK 时显式传入 identity A</text>
+  <rect x="650" y="458" width="550" height="126" rx="12" fill="#f4faf7" stroke="#9fcdbf"/>
+  <text x="674" y="491" class="code">OVMessageWriter / OVContextReader</text>
+  <text x="674" y="520" class="code">SessionEngine 会话操作</text>
+  <text x="674" y="553" class="body">调用 SDK 时显式传入 identity B</text>
+
+  <path d="M315 584 V631" class="flow-a"/>
+  <path d="M925 584 V631" class="flow-b"/>
+  <rect x="40" y="633" width="1160" height="271" rx="12" fill="#f8fafc" stroke="#bac8d5"/>
+  <text x="64" y="669" class="name">AsyncHTTPClient：auth_mode = trusted</text>
+  <text x="64" y="696" class="small">每次请求携带统一服务凭据，并按本次 identity 生成独立的身份头。</text>
+  <rect x="64" y="724" width="502" height="151" rx="10" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="84" y="756" class="name">请求 A 的 headers</text>
+  <text x="84" y="789" class="code">X-API-Key: 服务凭据</text>
+  <text x="84" y="814" class="code">X-OpenViking-Account: account-a</text>
+  <text x="84" y="839" class="code">X-OpenViking-User: user-a</text>
+  <text x="84" y="864" class="code">X-OpenViking-Actor-Peer: mail-peer</text>
+  <rect x="674" y="724" width="502" height="151" rx="10" fill="#edf7f4" stroke="#9fcdbf"/>
+  <text x="694" y="756" class="name">请求 B 的 headers</text>
+  <text x="694" y="789" class="code">X-API-Key: 服务凭据</text>
+  <text x="694" y="814" class="code">X-OpenViking-Account: account-b</text>
+  <text x="694" y="839" class="code">X-OpenViking-User: user-b</text>
+  <text x="694" y="864" class="code">X-OpenViking-Actor-Peer: doc-peer</text>
+
+  <path d="M315 904 V964" class="flow-a"/>
+  <path d="M925 904 V964" class="flow-b"/>
+  <rect x="40" y="964" width="1160" height="88" rx="12" fill="#f4f7fb" stroke="#bac8d5"/>
+  <text x="64" y="999" class="name">OV Server</text>
+  <text x="64" y="1031" class="body">请求 A 使用身份 A 访问对应数据；请求 B 使用身份 B 访问对应数据。</text>
+  <text x="40" y="1088" class="small">OV Server 验证服务凭据并解析身份头；session_id 随会话操作传入，run_id 用于应用执行关联。</text>
+</svg>

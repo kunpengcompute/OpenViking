@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="990" viewBox="0 0 1440 990" role="img" aria-labelledby="title desc">
+<title id="title">工具短视图与原生消息的匹配机制</title>
+<desc id="desc">两个连续 ToolMessage A、B 合并为一个写入 spec，分别处于 messages[0] 的 parts[0] 和 parts[1]。OV 仅返回 B 的短视图，携带 message_index=0、part_index=1 和 tool_id=call-B。Writer 用本批临时位置映射定位原消息 B，校验工具 ID 与引用归属后复制 B 并替换正文。A 沿用原对象，返回增量保持原顺序，原始图消息保持原样。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#55769a"/></marker>
+<marker id="green-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#148268"/></marker>
+<marker id="gray-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#8996a5"/></marker>
+</defs>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;fill:#243b53}
+.title{font-size:29px;font-weight:650}.heading{font-size:22px;font-weight:650}.body{font-size:19px}.small{font-size:17px;fill:#63758a}.mono{font-family:Menlo,Consolas,'PingFang SC',monospace;font-size:18px}.green{fill:#086c54}.muted{fill:#6b798b}.bold{font-weight:650}
+.line{fill:none;stroke:#55769a;stroke-width:2.2;marker-end:url(#arrow)}.active{fill:none;stroke:#148268;stroke-width:2.5;marker-end:url(#green-arrow)}.unchanged{fill:none;stroke:#8996a5;stroke-width:2;stroke-dasharray:6 5;marker-end:url(#gray-arrow)}
+</style>
+<rect width="1440" height="990" fill="#ffffff"/>
+
+<text x="40" y="45" class="title">工具短视图与原消息的匹配</text>
+<text x="40" y="77" class="small">工具 A、B 已由框架汇合；本例 OV 仅返回 B 的短视图。颜色相同的条目表示同一个工具结果。</text>
+<rect x="40" y="108" width="380" height="322" rx="12" fill="#f7f9fc" stroke="#cbd6e2" stroke-width="1.5"/>
+<text x="60" y="145" class="heading">① 原始 LangChain 消息</text>
+<rect x="520" y="108" width="380" height="322" rx="12" fill="#f7f9fc" stroke="#cbd6e2" stroke-width="1.5"/>
+<text x="540" y="145" class="heading">② 发给 OV 的本批消息</text>
+<rect x="1000" y="108" width="400" height="322" rx="12" fill="#f7f9fc" stroke="#cbd6e2" stroke-width="1.5"/>
+<text x="1020" y="145" class="heading">③ OV 返回的短视图</text>
+<text x="60" y="176" class="mono muted">model_messages</text>
+<rect x="60" y="192" width="340" height="86" rx="8" fill="#f0f3f7" stroke="#d4dce5" stroke-width="1.5"/>
+<text x="78" y="221" class="mono bold">[0]  ToolMessage A</text>
+<text x="78" y="253" class="mono muted">tool_call_id = call-A</text>
+<rect x="60" y="302" width="340" height="102" rx="8" fill="#eaf7f2" stroke="#70b49f" stroke-width="1.5"/>
+<text x="78" y="334" class="mono green bold">[1]  ToolMessage B</text>
+<text x="78" y="366" class="mono green">tool_call_id = call-B</text>
+<text x="78" y="391" class="small green">content = B 的长结果</text>
+<text x="540" y="176" class="mono">messages[0] · role=user</text>
+<rect x="540" y="192" width="340" height="86" rx="8" fill="#f0f3f7" stroke="#d4dce5" stroke-width="1.5"/>
+<text x="558" y="221" class="mono bold">parts[0]  工具结果 A</text>
+<text x="558" y="253" class="mono muted">tool_id = call-A</text>
+<rect x="540" y="302" width="340" height="102" rx="8" fill="#eaf7f2" stroke="#70b49f" stroke-width="1.5"/>
+<text x="558" y="334" class="mono green bold">parts[1]  工具结果 B</text>
+<text x="558" y="366" class="mono green">tool_id = call-B</text>
+<text x="558" y="391" class="small green">tool_output = B 的长结果</text>
+<path d="M414 265 H506" class="line"/>
+<text x="424" y="246" class="small">合并写入</text>
+<path d="M914 265 H986" class="line"/>
+<text x="918" y="246" class="small">写入结果</text>
+<text x="1020" y="176" class="mono green">tool_views：仅包含 B</text>
+<rect x="1020" y="192" width="360" height="212" rx="8" fill="#eaf7f2" stroke="#70b49f" stroke-width="1.5"/>
+<text x="1040" y="230" class="mono green bold">message_index = 0</text>
+<text x="1040" y="265" class="mono green bold">part_index    = 1</text>
+<text x="1040" y="300" class="mono green">tool_id = call-B</text>
+<text x="1040" y="337" class="body green">tool_output = B 的短视图</text>
+<text x="1040" y="375" class="small green">ref → 当前 Session 的工具原文</text>
+<rect x="40" y="501" width="1360" height="169" rx="12" fill="#ffffff" stroke="#b8cadd" stroke-width="1.5"/>
+<text x="64" y="537" class="heading">Writer 本批临时位置映射</text>
+<text x="410" y="536" class="small">(message_index, part_index) → 原生消息位置</text>
+<rect x="60" y="556" width="630" height="92" rx="8" fill="#f0f3f7" stroke="#d4dce5" stroke-width="1.5"/>
+<text x="82" y="591" class="mono bold">(0, 0) → model_messages[0]</text>
+<text x="82" y="625" class="body muted">原消息 A · tool_call_id = call-A</text>
+<rect x="750" y="556" width="630" height="92" rx="8" fill="#eaf7f2" stroke="#70b49f" stroke-width="1.5"/>
+<text x="772" y="591" class="mono green bold">(0, 1) → model_messages[1]</text>
+<text x="772" y="625" class="body green">原消息 B · tool_call_id = call-B</text>
+<path d="M1200 430 V488 H1330 V556" class="active"/>
+<rect x="1009" y="451" width="296" height="30" rx="0" fill="#ffffff" stroke="#ffffff" stroke-width="1.5"/>
+<text x="1020" y="473" class="small green">按返回位置 (0, 1) 查找</text>
+<path d="M375 648 V766" class="unchanged"/>
+<text x="130" y="716" class="small">A 沿用原对象</text>
+<path d="M1065 648 V766" class="active"/>
+<text x="777" y="708" class="small green">核对 tool_id 与 ref 的 Session 归属</text>
+<text x="853" y="737" class="small green">复制 B，仅替换 content</text>
+<rect x="40" y="766" width="650" height="151" rx="12" fill="#f7f9fc" stroke="#cbd6e2" stroke-width="1.5"/>
+<text x="64" y="805" class="heading">返回位置 [0] · 原 ToolMessage A</text>
+<text x="64" y="842" class="body">content：原正文</text>
+<text x="64" y="878" class="small">沿用原对象、工具调用关联及元数据。</text>
+<rect x="750" y="766" width="650" height="151" rx="12" fill="#eaf7f2" stroke="#70b49f" stroke-width="1.5"/>
+<text x="774" y="805" class="heading green">返回位置 [1] · ToolMessage B 副本</text>
+<text x="774" y="842" class="body green">content：B 的短视图</text>
+<text x="774" y="878" class="small green">id、tool_call_id 及元数据沿用原消息 B。</text>
+<text x="40" y="957" class="body">本次返回：[原消息 A，B 的正文替换副本]。原始图消息保持原样，返回增量沿用原顺序。</text>
+</svg>

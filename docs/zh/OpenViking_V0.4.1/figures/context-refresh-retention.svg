@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1040" viewBox="0 0 1240 1040" role="img" aria-labelledby="title desc">
+  <title id="title">refresh：归档范围、任务续接与模型缓存替换</title>
+  <desc id="desc">刷新前的消息包括既有历史、本轮用户、本轮较早交互和近期完整交互。组装器独立保存当前用户副本，按工具组确定近期保护段；Commit 归档保护段之前的原始消息，Reader 读取新概要。新缓存由新概要、当前用户副本与近期保护段组成，完整输入通过预算校验后替换缓存及归档版本。系统提示词与工具 Schema 随本次请求保留。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#416c9b"/></marker>
+  </defs>
+  <style>
+    text {font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;fill:#20364b}
+    .title {font-size:28px;font-weight:650}
+    .name {font-size:22px;font-weight:650}
+    .body {font-size:19px;fill:#435a6c}
+    .small {font-size:17px;fill:#607689}
+    .center {text-anchor:middle}
+    .flow {fill:none;stroke:#416c9b;stroke-width:2;marker-end:url(#arrow)}
+    .rule {fill:none;stroke:#b8c9d6;stroke-width:1.5}
+  </style>
+  <rect width="1240" height="1040" fill="white"/>
+  <text x="40" y="52" class="title">refresh：较早交互转入概要，近期交互保持原生消息</text>
+  <text x="40" y="87" class="body">系统提示词 · Skill 索引 · 工具 Schema：沿用本次请求，参与完整输入预算。</text>
+
+  <rect x="28" y="112" width="1184" height="246" rx="14" fill="#f8fafc" stroke="#c7d5df"/>
+  <text x="48" y="149" class="name">刷新前 · OVContext.messages</text>
+  <rect x="48" y="174" width="240" height="104" rx="10" fill="#fff4e7" stroke="#d9b57e"/>
+  <text x="168" y="212" class="name center">既有历史</text>
+  <text x="168" y="249" class="body center">之前 Run 的原始交互</text>
+  <rect x="306" y="174" width="274" height="104" rx="10" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="443" y="212" class="name center">本轮用户消息</text>
+  <text x="443" y="249" class="body center">原文与召回 · 独立留副本</text>
+  <rect x="598" y="174" width="270" height="104" rx="10" fill="#fff4e7" stroke="#d9b57e"/>
+  <text x="733" y="212" class="name center">本轮较早交互</text>
+  <text x="733" y="249" class="body center">已完成的助手 / 工具组</text>
+  <rect x="886" y="174" width="304" height="104" rx="10" fill="#edf7f4" stroke="#92c5b5"/>
+  <text x="1038" y="212" class="name center">近期保护段</text>
+  <text x="1038" y="249" class="body center">按条数选择，工具组成组</text>
+  <path d="M48 290 V303 H868 V290" class="rule"/>
+  <text x="458" y="334" class="small center">原始记录进入归档；本轮用户的模型副本继续保留</text>
+  <path d="M886 290 V303 H1190 V290" class="rule"/>
+  <text x="1038" y="334" class="small center">保留原生对象、ID 与元数据</text>
+
+  <rect x="28" y="382" width="1184" height="211" rx="14" fill="#f5f8fd" stroke="#b4c8dc"/>
+  <text x="48" y="420" class="name">达到触发点 · 同步完成本次归档与刷新</text>
+  <rect x="48" y="440" width="334" height="91" rx="10" fill="white" stroke="#9bb6d5"/>
+  <text x="215" y="473" class="name center">ContextAssembler</text>
+  <text x="215" y="507" class="body center">确定近期段与实际保留数</text>
+  <path d="M382 484 H426" class="flow"/>
+  <rect x="426" y="440" width="360" height="91" rx="10" fill="white" stroke="#9bb6d5"/>
+  <text x="606" y="473" class="name center">OpenVikingCommitPolicy</text>
+  <text x="606" y="507" class="body center">按本次保留数提交，返回任务</text>
+  <path d="M786 484 H830" class="flow"/>
+  <rect x="830" y="440" width="360" height="91" rx="10" fill="white" stroke="#9bb6d5"/>
+  <text x="1010" y="473" class="name center">OVContextReader</text>
+  <text x="1010" y="507" class="body center">读取新概要与同一归档边界</text>
+  <text x="48" y="568" class="small">SessionEngine 等待归档完成后读取快照；ContextAssembler 用概要与保留计划构造候选缓存。</text>
+
+  <rect x="28" y="617" width="1184" height="194" rx="14" fill="#f6faf8" stroke="#a5cdbf"/>
+  <text x="48" y="655" class="name">刷新后 · 新概要 ＋ 本轮任务锚点 ＋ 近期交互</text>
+  <rect x="48" y="679" width="276" height="96" rx="10" fill="#fff4e7" stroke="#d9b57e"/>
+  <text x="186" y="716" class="name center">新概要</text>
+  <text x="186" y="751" class="body center">承接已经归档的交互</text>
+  <text x="351" y="734" class="title center">＋</text>
+  <rect x="378" y="679" width="384" height="96" rx="10" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="570" y="716" class="name center">当前用户副本</text>
+  <text x="570" y="751" class="body center">本轮原文与召回保持一份</text>
+  <text x="789" y="734" class="title center">＋</text>
+  <rect x="816" y="679" width="374" height="96" rx="10" fill="#edf7f4" stroke="#92c5b5"/>
+  <text x="1003" y="716" class="name center">近期保护段</text>
+  <text x="1003" y="751" class="body center">保留完整工具调用与结果组</text>
+  <text x="48" y="799" class="small">图示为用户原始记录已归档的情况；仍在近期段时，用户副本沿用原位置。</text>
+
+  <path d="M620 811 V843" class="flow"/>
+  <rect x="230" y="843" width="780" height="92" rx="12" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="620" y="879" class="name center">完整输入复核 → 替换 messages 与 archive_id</text>
+  <text x="620" y="913" class="body center">满足 input_limit 后调用模型；压缩、刷新或预算失败返回预算异常</text>
+  <text x="40" y="979" class="body">write_index 继续指向原始图消息；Run、owner 与召回尝试状态沿用当前值。</text>
+  <text x="40" y="1012" class="small">一次模型调用最多一轮容量修复；同一归档版本复用缓存。</text>
+</svg>
