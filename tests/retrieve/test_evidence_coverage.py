@@ -188,6 +188,18 @@ def test_counter_question_keeps_both_answers_and_stops_at_topic_change(index):
     assert select_evidence_groups(groups, top_k=2) == []
 
 
+def test_shared_question_words_do_not_link_unrelated_followup(index):
+    hit = append_story(
+        index,
+        [
+            ("Milo", "What book did you buy?"),
+            ("Aria", "It was Atlas. What music do you like?"),
+            ("Milo", "Jazz."),
+        ],
+    )
+    assert build_evidence_groups(index, [hit])[0]["turn_ids"] == ["story:0", "story:1"]
+
+
 @pytest.mark.parametrize("question", ["What did you learn from it?", "For walking or running?"])
 def test_followup_question_and_answer_are_kept_together(index, question):
     hit = append_story(

@@ -111,11 +111,13 @@ class MemorySources:
                     continue
                 # Named transcript participants may use either transport role.
                 # Unnamed AI output does not become a person's own experience.
-                if (
-                    source_role == "assistant"
-                    and source.get("speaker", "").casefold()
-                    in {"", "user", "assistant", "system", "tool"}
-                ):
+                if source_role == "assistant" and source.get("speaker", "").casefold() in {
+                    "",
+                    "user",
+                    "assistant",
+                    "system",
+                    "tool",
+                }:
                     continue
             elif source_role != requested_speaker:
                 continue

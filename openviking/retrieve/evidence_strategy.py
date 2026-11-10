@@ -109,16 +109,41 @@ def build_evidence_groups(
     def question(turn):
         return bool(re.search(r"[?？]", _body(turn)))
 
+    def question_text(turn):
+        return re.findall(r"[^.!?。！？]*[?？]", _body(turn))[-1]
+
     def anaphoric(turn):
         return bool(
-            re.search(r"\b(it|this|that|these|those|they|them)\b|这|那|它", _body(turn), re.I)
+            re.search(
+                r"\b(it|this|that|these|those|they|them)\b|这|那|它", question_text(turn), re.I
+            )
         )
 
-    def topics(turn):
+    def topics(turn, question_only=False):
+        text = question_text(turn) if question_only else _body(turn)
         return (
-            (set(turn.get("keys", ())) | set(re.findall(r"\w{3,}", _body(turn).lower())))
+            (
+                (set() if question_only else set(turn.get("keys", ())))
+                | set(re.findall(r"\w{3,}", text.lower()))
+            )
             - _STOP
             - names
+            - {
+                "what",
+                "which",
+                "where",
+                "when",
+                "who",
+                "whom",
+                "whose",
+                "why",
+                "how",
+                "long",
+                "many",
+                "much",
+                "kind",
+                "sort",
+            }
         )
 
     for hit in hits:
@@ -149,9 +174,9 @@ def build_evidence_groups(
             include([anchor - 2])
         if following and question(following[0]):
             next_question = following[0]
-            same_topic = bool(topics(current[0]) & topics(next_question))
+            same_topic = bool(topics(current[0]) & topics(next_question, question_only=True))
             fragment = bool(
-                re.search(r"\bfor\b[^?？]*\bor\b[^?？]*[?？]", _body(next_question), re.I)
+                re.search(r"\bfor\b[^?？]*\bor\b[^?？]*[?？]", question_text(next_question), re.I)
             )
             reply = index.get_turns([f"{ep}:{anchor + 2}"])
             if (
