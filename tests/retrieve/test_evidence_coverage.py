@@ -13,6 +13,7 @@ from openviking.retrieve.evidence_fusion import (
 from openviking.retrieve.evidence_retriever import EvidenceIndex
 from openviking.retrieve.evidence_strategy import (
     build_evidence_groups,
+    fuse_candidates,
     retrieve_coverage,
     select_evidence_groups,
 )
@@ -110,6 +111,7 @@ def test_time_candidates_use_recorded_window_time(index):
         now=datetime(2026, 11, 10, tzinfo=timezone.utc),
         content_turn_ids=set(),
     )
+
     assert hits[0].turn_id == "chat:0"
     index.graph_unavailable = True
     assert (
@@ -121,3 +123,131 @@ def test_time_candidates_use_recorded_window_time(index):
         )
         == []
     )
+
+
+def test_repeated_queries_and_memory_hints_do_not_multiply_source_votes():
+    direct = {"turn_id": "direct", "score": 0.032}
+    repeated = {"turn_id": "other", "score": 0.02}
+    hits = fuse_candidates([[direct, repeated], [repeated]], [repeated, direct])
+    assert [h["turn_id"] for h in hits] == ["direct", "other"]
+    assert hits[0]["score"] == 0.032
+    assert hits[1]["score"] == 0.02
+
+
+def test_memory_hints_can_recall_missing_sources_without_borrowing_raw_scores():
+    hits = fuse_candidates(
+        [[{"turn_id": "direct", "score": 0.03}]],
+        [{"turn_id": "new", "score": 1000}],
+    )
+    assert [h["turn_id"] for h in hits] == ["direct", "new"]
+    assert hits[1]["query_branches"] == []
+
+
+def test_relevant_sources_from_same_episode_are_not_penalized(index):
+    rows = index.get_turns(["chat:0", "chat:1", "chat:2"])
+    groups = [
+        {
+            "anchor_id": str(i),
+            "turn_ids": [str(i)],
+            "turns": [dict(t, episode=ep)],
+            "score": score,
+            "query_branches": [0],
+        }
+        for i, (t, ep, score) in enumerate(
+            zip(rows, ["same", "same", "other"], [2, 1.1, 1], strict=True)
+        )
+    ]
+    assert [t["episode"] for t in select_evidence_groups(groups, top_k=2)] == ["same", "same"]
+
+
+def append_story(index, messages, session="story"):
+    index.append_chunk(
+        session,
+        [
+            {"id": f"{session}-{i}", "text": text, "speaker": speaker}
+            for i, (speaker, text) in enumerate(messages)
+        ],
+    )
+    return dict(index.get_turns([f"{session}:0"])[0], turn_id=f"{session}:0", score=1.0)
+
+
+def test_counter_question_keeps_both_answers_and_stops_at_topic_change(index):
+    hit = append_story(
+        index,
+        [
+            ("Milo", "How long have you worked with clay?"),
+            ("Aria", "Since college. How long have you worked with clay?"),
+            ("Milo", "Nine years."),
+            ("Aria", "Do you own pets?"),
+            ("Milo", "I own cats."),
+        ],
+    )
+    groups = build_evidence_groups(index, [hit])
+    assert groups[0]["turn_ids"] == ["story:0", "story:1", "story:2"]
+    assert len(select_evidence_groups(groups, top_k=3)) == 3
+    assert select_evidence_groups(groups, top_k=2) == []
+
+
+@pytest.mark.parametrize("question", ["What did you learn from it?", "For walking or running?"])
+def test_followup_question_and_answer_are_kept_together(index, question):
+    hit = append_story(
+        index,
+        [
+            ("Milo", "Here is the new item I bought."),
+            ("Aria", question),
+            ("Milo", "It is for exercise."),
+            ("Aria", "Any travel plans?"),
+        ],
+    )
+    assert build_evidence_groups(index, [hit])[0]["turn_ids"] == ["story:0", "story:1", "story:2"]
+
+
+def test_anaphoric_answer_includes_the_antecedent(index):
+    append_story(
+        index,
+        [
+            ("Milo", "Here is my new book."),
+            ("Aria", "What did you learn from it?"),
+            ("Milo", "It taught me patience."),
+        ],
+    )
+    hit = dict(index.get_turns(["story:2"])[0], turn_id="story:2", score=1.0)
+    assert build_evidence_groups(index, [hit])[0]["turn_ids"] == ["story:0", "story:1", "story:2"]
+
+
+def test_followup_expansion_does_not_cross_session_boundaries(index):
+    hit = append_story(index, [("Milo", "Here is my new book.")])
+    append_story(index, [("Aria", "What did you learn from it?")], session="unrelated")
+    assert build_evidence_groups(index, [hit])[0]["turn_ids"] == ["story:0"]
+
+
+def test_unanswered_followup_does_not_displace_its_antecedent(index):
+    hit = append_story(
+        index,
+        [
+            ("Milo", "Here is my new book."),
+            ("Aria", "What did you learn from it?"),
+        ],
+    )
+    assert build_evidence_groups(index, [hit])[0]["turn_ids"] == ["story:0"]
+
+
+@pytest.mark.asyncio
+async def test_returned_facts_are_supported_by_selected_sources(index):
+    from types import SimpleNamespace
+
+    keep = {"source_turn_ids": ["a"]}
+    drop = {"source_turn_ids": ["missing"]}
+    hints = SimpleNamespace(
+        candidates=lambda *args: [], diagnostics={}, events=[], selected_facts=[keep, drop]
+    )
+    evidence, _ = await retrieve_coverage(
+        index,
+        "Where are my keys?",
+        embed=AsyncMock(return_value=None),
+        top_k=2,
+        max_supplementary_queries=0,
+        memory_sources=hints,
+    )
+    assert {t["source_id"] for t in evidence} == {"q", "a"}
+    assert hints.selected_facts == [keep]

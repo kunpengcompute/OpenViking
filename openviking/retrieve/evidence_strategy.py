@@ -14,6 +14,7 @@ from functools import lru_cache
 from typing import Any
 
 from openviking.retrieve.evidence_features import (
+    _STOP,
     _normalize_date,
     extract_keys,
     extract_labeled_ents,
@@ -99,6 +100,27 @@ def build_evidence_groups(
 ) -> list[dict]:
     """Preserve adjacent questions and replies, including chunk boundaries."""
     groups = []
+    names = {
+        word
+        for turn in index._turn_by_id.values()
+        for word in turn.get("speaker", "").casefold().split()
+    }
+
+    def question(turn):
+        return bool(re.search(r"[?？]", _body(turn)))
+
+    def anaphoric(turn):
+        return bool(
+            re.search(r"\b(it|this|that|these|those|they|them)\b|这|那|它", _body(turn), re.I)
+        )
+
+    def topics(turn):
+        return (
+            (set(turn.get("keys", ())) | set(re.findall(r"\w{3,}", _body(turn).lower())))
+            - _STOP
+            - names
+        )
+
     for hit in hits:
         ep, anchor = hit["episode"], hit["turn"]
         current = index.get_turns([f"{ep}:{anchor}"])
@@ -106,14 +128,39 @@ def build_evidence_groups(
             continue
         members = {anchor: current[0]}
         previous = index.get_turns([f"{ep}:{anchor - 1}"])
-        if previous and "?" in _body(previous[0]):
+        if previous and question(previous[0]):
             members[anchor - 1] = previous[0]
-        # Close the anchor's own question, not every new question introduced
-        # by its reply; that would recursively absorb the whole conversation.
-        if "?" in _body(current[0]):
-            following = index.get_turns([f"{ep}:{anchor + 1}"])
-            if following and following[0].get("speaker") != current[0].get("speaker"):
-                members[anchor + 1] = following[0]
+        following = index.get_turns([f"{ep}:{anchor + 1}"])
+        if (
+            following
+            and question(current[0])
+            and following[0].get("speaker") != current[0].get("speaker")
+        ):
+            members[anchor + 1] = following[0]
+
+        def include(positions, ep=ep, members=members):
+            extra = index.get_turns([f"{ep}:{i}" for i in positions])
+            if len(set(members) | {t["turn"] for t in extra}) <= max_group_turns:
+                members.update((t["turn"], t) for t in extra)
+
+        # Resolve a local "what did you learn from it?" / "is that recent?"
+        # against its antecedent. Never infer links between separate sessions.
+        if previous and question(previous[0]) and anaphoric(previous[0]):
+            include([anchor - 2])
+        if following and question(following[0]):
+            next_question = following[0]
+            same_topic = bool(topics(current[0]) & topics(next_question))
+            fragment = bool(
+                re.search(r"\bfor\b[^?？]*\bor\b[^?？]*[?？]", _body(next_question), re.I)
+            )
+            reply = index.get_turns([f"{ep}:{anchor + 2}"])
+            if (
+                reply
+                and reply[0].get("speaker") != next_question.get("speaker")
+                and (anaphoric(next_question) or same_topic or fragment)
+            ):
+                # One follow-up only, even if its answer introduces a new topic.
+                include([anchor + 1, anchor + 2])
         if len(members) > max_group_turns:
             continue
         turns = [members[i] for i in sorted(members)]
@@ -131,17 +178,15 @@ def build_evidence_groups(
 
 
 def select_evidence_groups(groups: list[dict], *, top_k: int) -> list[dict]:
-    """Select whole groups; reward uncovered query branches and episodes."""
+    """Select whole groups; reward uncovered branches without penalizing relevance."""
     selected: dict[str, dict] = {}
     branches: set[int] = set()
-    episodes: dict[str, int] = {}
     pending = list(groups)
     while pending and len(selected) < top_k:
 
         def priority(group):
-            ep = group["turns"][0]["episode"]
             novelty = len(set(group["query_branches"]) - branches)
-            score = group["score"] * (1 + 0.25 * novelty) / (1 + 0.15 * episodes.get(ep, 0))
+            score = group["score"] * (1 + 0.25 * novelty)
             return (not group.get("date_protected", False), -score, group["anchor_id"])
 
         pending.sort(key=priority)
@@ -155,8 +200,6 @@ def select_evidence_groups(groups: list[dict], *, top_k: int) -> list[dict]:
             continue
         selected.update(additions)
         branches.update(group["query_branches"])
-        ep = group["turns"][0]["episode"]
-        episodes[ep] = episodes.get(ep, 0) + 1
     return list(selected.values())
 
 
@@ -242,7 +285,13 @@ def plan_collection_queries(question: str) -> list[str]:
     return []
 
 
-def fuse_candidates(batches: list[list[dict]]) -> list[dict]:
+def fuse_candidates(batches: list[list[dict]], hints: list[dict] | None = None) -> list[dict]:
+    """Keep the strongest query support per source; hints supply recall, not extra votes.
+
+    Query paraphrases and verified facts often point to the same original
+    message. Counting each as independent support drowns out direct evidence.
+    Lexical/semantic ranks have already been fused by retrieve_candidates.
+    """
     merged: dict[str, dict] = {}
     for branch, batch in enumerate(batches):
         seen = set()
@@ -252,8 +301,12 @@ def fuse_candidates(batches: list[list[dict]]) -> list[dict]:
                 continue
             seen.add(tid)
             row = merged.setdefault(tid, dict(hit, score=0.0, query_branches=[]))
-            row["score"] += 1 / (60 + rank)
+            row["score"] = max(row["score"], hit.get("score", 0) or 1 / (60 + rank))
             row["query_branches"].append(branch)
+    for rank, hit in enumerate(hints or [], 1):
+        tid = hit["turn_id"]
+        if tid not in merged:
+            merged[tid] = dict(hit, score=1 / (60 + rank), query_branches=[])
     return sorted(merged.values(), key=lambda r: (-r["score"], r["turn_id"]))
 
 
@@ -321,16 +374,15 @@ async def retrieve_coverage(
             await asyncio.wait_for(supplement(), timeout=20.0)
         except (TimeoutError, asyncio.TimeoutError):
             diagnostics["errors"].append({"stage": "supplement", "error_type": "TimeoutError"})
+    memory_hits = []
     if memory_sources is not None:
         memory_hits = await asyncio.to_thread(
             memory_sources.candidates, question, index, candidate_limit
         )
-        if memory_hits:
-            batches.append(memory_hits)
         diagnostics["memories"] = dict(
             memory_sources.diagnostics, candidate_ids=[h["turn_id"] for h in memory_hits]
         )
-    hits = fuse_candidates(batches)
+    hits = fuse_candidates(batches, memory_hits)
     protected = []
     if memory_sources is not None and memory_sources.events:
         hits, protected, diagnostics["events"] = await asyncio.to_thread(
@@ -394,6 +446,13 @@ async def retrieve_coverage(
             if group["anchor_id"] in protected:
                 group["date_protected"] = True
     evidence = select_evidence_groups(groups, top_k=top_k)
+    if memory_sources is not None:
+        selected_sources = {t.get("source_id") for t in evidence}
+        memory_sources.selected_facts = [
+            f
+            for f in memory_sources.selected_facts
+            if set(f["source_turn_ids"]) <= selected_sources
+        ]
     diagnostics["candidate_count"] = len(hits)
     diagnostics["selected_ids"] = [f"{t['episode']}:{t['turn']}" for t in evidence]
     if target_queries:
