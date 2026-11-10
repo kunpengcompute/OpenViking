@@ -40,8 +40,14 @@ jobs:
           set -euo pipefail
           ln -sfn /opt/ov-venv .venv
           uv sync --frozen --inexact --no-install-project --extra test --extra gemini
-      - name: ut   # ut 作业自行准备环境（形态①独立构建：编译扩展 + editable 安装）
+      - name: ut   # 开发分支执行源码 UT；master 执行交付检查
+        env:
+          OV_CI_TARGET_BRANCH: ${{ inputs.branch }}
         run: |-
+          if [ "$OV_CI_TARGET_BRANCH" = "master" ]; then
+            echo "master 的交付检查由 build_ci.sh 执行，UT 作业返回成功。"
+            exit 0
+          fi
           export UV_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple
           export UV_DEFAULT_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
           export UV_HTTP_TIMEOUT=600
