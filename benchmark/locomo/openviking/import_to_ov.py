@@ -354,6 +354,8 @@ async def viking_ingest(
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     use_image_url: bool = False,
+    session_id: Optional[str] = None,
+    message_offset: int = 0,
 ) -> Dict[str, int]:
     """Save messages to OpenViking via OpenViking SDK client.
     Returns token usage dict with embedding and vlm token counts.
@@ -381,16 +383,17 @@ async def viking_ingest(
     await client.initialize()
 
     try:
-        # Create session
-        create_res = await client.create_session()
-        session_id = create_res["session_id"]
+        # All chunks of one conversation share the same archived episode.
+        if session_id is None:
+            create_res = await client.create_session()
+            session_id = create_res["session_id"]
 
         # Add messages one by one with created_at
         for idx, msg in enumerate(messages):
             msg_created_at = None
             if base_datetime:
                 # 每条消息递增1秒，确保时间顺序
-                msg_dt = base_datetime + timedelta(seconds=idx)
+                msg_dt = base_datetime + timedelta(seconds=message_offset + idx)
                 msg_created_at = msg_dt.isoformat()
 
             await client.add_message(
@@ -431,7 +434,12 @@ async def viking_ingest(
 
         # Get trace_id from commit result
         trace_id = result.get("trace_id", "")
-        return {"token_usage": token_usage, "task_id": task_id, "trace_id": trace_id}
+        return {
+            "session_id": session_id,
+            "token_usage": token_usage,
+            "task_id": task_id,
+            "trace_id": trace_id,
+        }
 
     finally:
         await client.close()
@@ -461,6 +469,8 @@ async def process_single_session(
         token_usage = {"embedding": 0, "vlm": 0, "llm_input": 0, "llm_output": 0, "total": 0}
         chunk_task_ids: List[str] = []
         chunk_trace_ids: List[str] = []
+        session_id = None
+        message_offset = 0
 
         # 使用 sample_id 作为 user_id 和 agent_id，实现独立的 userspace/agentspace
         for chunk in chunks:
@@ -471,7 +481,11 @@ async def process_single_session(
                 user_id=str(sample_id),
                 agent_id=str(sample_id),
                 use_image_url=args.use_image_url,
+                session_id=session_id,
+                message_offset=message_offset,
             )
+            session_id = result["session_id"]
+            message_offset += len(chunk)
             chunk_usage = result["token_usage"]
             for key in token_usage:
                 token_usage[key] += int(chunk_usage.get(key, 0) or 0)
@@ -495,6 +509,7 @@ async def process_single_session(
             "timestamp": run_time,
             "sample_id": sample_id,
             "session": session_key,
+            "session_id": session_id,
             "status": "success",
             "meta": meta,
             "token_usage": token_usage,

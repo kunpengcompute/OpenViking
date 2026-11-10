@@ -99,6 +99,33 @@ async def test_index_lock_releases_after_failed_write():
 
 
 @pytest.mark.asyncio
+async def test_same_session_archives_keep_contiguous_question_answer_context():
+    from openviking.retrieve.evidence_strategy import build_evidence_groups
+
+    fs = EvidenceFS()
+    chat = session(fs, "conversation")
+    await chat._append_to_evidence_index(
+        [
+            Message(id="m1", role="user", parts=[TextPart("[Dana]: Here is my new book.")]),
+            Message(
+                id="m2", role="assistant", parts=[TextPart("[Robin]: What did you learn from it?")]
+            ),
+        ],
+        chat.uri + "/history/archive_001",
+    )
+    await chat._append_to_evidence_index(
+        [Message(id="m3", role="user", parts=[TextPart("[Dana]: It taught me patience.")])],
+        chat.uri + "/history/archive_002",
+    )
+    index = await load_index(fs, "viking://user/alice/.index/evidence.json", chat.ctx)
+    hit = dict(index.resolve_sources(["m3"])[0], turn_id="conversation:2", score=1.0)
+    group = build_evidence_groups(index, [hit])[0]
+    assert group["turn_ids"] == ["conversation:0", "conversation:1", "conversation:2"]
+    # Deleting this session still revokes every archive through the same URI.
+    assert len({t["uri"] for t in group["turns"]}) == 1
+
+
+@pytest.mark.asyncio
 async def test_model_fact_verification_distinguishes_named_subject_and_role():
     from datetime import datetime, timezone
 
