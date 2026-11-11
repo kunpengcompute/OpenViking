@@ -11,6 +11,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         ca-certificates \
         python3-devel \
         python3-pip \
+        ccache \
     && dnf clean all
 
 # pip 走华为云镜像
@@ -60,7 +61,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/ov-venv \
     UV_DEFAULT_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
 
 WORKDIR /opt/ov-warm-py
-COPY requirements-ci.txt ./
+COPY .gitcode/dockerfiles/requirements-ci.txt ./
 RUN uv venv /opt/ov-venv \
     && uv pip install --python /opt/ov-venv/bin/python -r requirements-ci.txt \
     && uv pip install --python /opt/ov-venv/bin/python "setuptools>=61" wheel "setuptools-scm>=8.0" "maturin>=1.0,<2.0" \

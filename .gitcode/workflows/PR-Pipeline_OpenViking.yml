@@ -20,7 +20,7 @@ concurrency: # 并发控制（GitCode 原生语法）
 
 permissions:
   repository: read
-  pr: write
+  pr: read
 env:
   pr_id: ${{ atomgit.event.pull_request.number }}
   target_branch: ${{ atomgit.event.pull_request.base.ref }}
@@ -142,8 +142,8 @@ stages:
             with:
               project-name: "boostkit"
 
-      AntiPoison-scan: # 恶意代码扫描
-        name: AntiPoison-scan
+      antipoison-scan: # 恶意代码扫描
+        name: antipoison-scan
         needs: [ check_skip ]
         if: ${{ jobs.check_skip.outputs.skip != 'true' }}
         runs-on: ["ubuntu-latest", "x64", "slim"]
@@ -169,6 +169,15 @@ stages:
             with:
               allow-unsafe-pr-checkout: true
               ref: refs/merge-requests/${{ env.pr_id }}/merge
+          - name: Cache pre-commit
+            uses: cache
+            with:
+              path: |
+                ~/.cache/pre-commit
+                ~/.cache/pip
+              key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+              restore-keys: |
+                pre-commit-${{ runner.os }}-
           - name: Setup Python
             uses: setup-python
             with:
