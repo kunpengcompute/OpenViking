@@ -9,10 +9,7 @@ on:
       pr_id:
         required: true
         type: string
-      branch:            # PR 目标分支
-        required: true
-        type: string
-      default_branch:    # 默认分支（脚本回退用的检出位置）
+      target_branch:            # PR 目标分支
         required: true
         type: string
 
@@ -24,17 +21,19 @@ jobs:
     container:
       image: ${{ inputs.docker_img }}
     steps:
-      - name: fast_checkout
-        identifier: fast_checkout
+      - name: checkout
+        identifier: checkout
         uses: checkout
         with:
           allow-unsafe-pr-checkout: true
           ref: refs/merge-requests/${{ inputs.pr_id }}/merge
-      - name: checkout_default_scripts   # 预合入代码缺脚本时用默认分支副本
-        uses: checkout
+      - name: cache_uv
+        uses: cache
         with:
-          ref: ${{ inputs.default_branch }}
-          path: base-scripts
+          path: ~/.cache/uv
+          key: uv-build-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-build-${{ runner.os }}-
       - name: setup_deps   # 复用镜像内预建的 /opt/ov-venv；严格模式：lock 过期则直接失败
         run: |-
           set -euo pipefail
@@ -48,10 +47,6 @@ jobs:
           export UV_HTTP_RETRIES=5
           export OV_SKIP_UV_SYNC=1   # 依赖与构建后端已由 setup_deps 装好
           if [ -f build_ci.sh ]; then
-            bash build_ci.sh
-          elif [ -f base-scripts/build_ci.sh ]; then
-            mkdir -p .gitcode/scripts
-            cp base-scripts/build_ci.sh build_ci.sh
             bash build_ci.sh
           else
             echo "ERROR: build_ci.sh 在预合入代码和基分支中均不存在"; exit 1
