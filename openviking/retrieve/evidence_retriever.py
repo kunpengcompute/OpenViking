@@ -90,6 +90,7 @@ class EvidenceIndex(EvidenceRanking):
         *,
         archive_uri: Optional[str] = None,
         graph_enabled: bool = False,
+        embedding_states: Optional[List[dict]] = None,
     ) -> bool:
         """Incrementally index one archived chunk (called after commit).
         ``messages`` must be the archived message list, each with
@@ -152,6 +153,8 @@ class EvidenceIndex(EvidenceRanking):
                 emb = embeddings[i]
                 if emb:
                     turn["emb"] = [float(v) for v in emb]
+            if embedding_states and i < len(embedding_states):
+                turn["embedding_state"] = dict(embedding_states[i])
             episode["turns"].append(turn)
             self._index_turn(turn)
             new_ids.append(tid)
@@ -225,6 +228,24 @@ class EvidenceIndex(EvidenceRanking):
             ),
             "pending_window_count": len(self.graph["pending_archive_uris"]),
             "unavailable": self.graph_unavailable,
+        }
+
+    def embedding_diagnostics(self) -> Dict[str, Any]:
+        turns = list(self._turn_by_id.values())
+        ready = sum(bool(t.get("emb")) for t in turns)
+        return {
+            "total": len(turns),
+            "ready": ready,
+            "missing_embedding": len(turns) - ready,
+            "vector_coverage": ready / len(turns) if turns else 1.0,
+            "pending_embedding": sum(
+                not t.get("emb") and t.get("embedding_state", {}).get("status") == "pending"
+                for t in turns
+            ),
+            "failed_embedding": sum(
+                not t.get("emb") and t.get("embedding_state", {}).get("status") == "failed"
+                for t in turns
+            ),
         }
 
     def rebuild_graph(self, archive_groups: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -486,7 +507,13 @@ class EvidenceIndex(EvidenceRanking):
         self._dirty = True
 
     def replace_source(
-        self, source_id: str, text: str, speaker: str, date: str, embedding=None
+        self,
+        source_id: str,
+        text: str,
+        speaker: str,
+        date: str,
+        embedding=None,
+        embedding_state=None,
     ) -> None:
         """Replace one unambiguous turn without changing its graph membership."""
         turns = self.resolve_sources([source_id])
@@ -496,8 +523,11 @@ class EvidenceIndex(EvidenceRanking):
         ents, keys = extract_keys(text)
         turn.update(text=text, speaker=speaker, date=date, ents=sorted(ents), keys=sorted(keys))
         turn.pop("emb", None)
+        turn.pop("embedding_state", None)
         if embedding:
             turn["emb"] = list(embedding)
+        if embedding_state:
+            turn["embedding_state"] = dict(embedding_state)
         rebuilt = type(self).from_dict(self.to_dict())
         for window in list(rebuilt.graph["windows"].values()):
             if source_id in {

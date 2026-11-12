@@ -498,12 +498,15 @@ class SessionService:
                 if "/history/" in path
             ]
             embedding = None
+            embedding_states = []
             if archives:
                 from openviking.session.session import _embed_turn_texts
 
                 embedder = fs._get_embedder(ctx)
                 if embedder is not None:
-                    embedding = (await _embed_turn_texts(embedder, [content]))[0]
+                    embedding = (
+                        await _embed_turn_texts(embedder, [content], states=embedding_states)
+                    )[0]
             index_uri = session_uri.rsplit("/sessions/", 1)[0] + "/.index/evidence.json"
             stage = "evidence_index"
             async with evidence_index_lock(fs, index_uri, ctx) as index_lease:
@@ -552,6 +555,11 @@ class SessionService:
                         speaker,
                         message.created_at or "",
                         embedding if stored_text == content else None,
+                        embedding_state=(
+                            embedding_states[0]
+                            if embedding_states and stored_text == content
+                            else None
+                        ),
                     )
                 index.pending_source_updates.remove(message_id)
                 index._dirty = True

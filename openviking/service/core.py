@@ -103,6 +103,7 @@ class OpenVikingService:
         self._uri_mutation_coordinator = UriMutationCoordinator()
         self._watch_scheduler: Optional[WatchScheduler] = None
         self._session_auto_commit_scheduler: Optional[SessionAutoCommitScheduler] = None
+        self._evidence_embedding_repair = None
         self._encryptor: Optional[Any] = None
         self._privacy_config_service: Optional[UserPrivacyConfigService] = None
         self._runtime_config_manager: Optional[Any] = None
@@ -671,11 +672,18 @@ class OpenVikingService:
         if self._runtime_config_manager is not None:
             self._runtime_config_manager.start_refresh_loop()
         self._initialized = True
+        from openviking.retrieve.evidence_embedding import EvidenceEmbeddingRepair
+
+        self._evidence_embedding_repair = EvidenceEmbeddingRepair(self._viking_fs)
+        self._evidence_embedding_repair.start()
         logger.info("OpenVikingService initialized")
 
     async def close(self) -> None:
         """Close OpenViking and release resources."""
         await self._resource_service.close_background_tasks()
+        if self._evidence_embedding_repair is not None:
+            await self._evidence_embedding_repair.stop()
+            self._evidence_embedding_repair = None
         vlm_resolver = getattr(self, "_vlm_resolver", None)
 
         if self._runtime_config_manager:

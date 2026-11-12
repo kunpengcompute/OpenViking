@@ -358,6 +358,7 @@ class SearchService:
                 use_graph=use_graph,
                 use_time=use_time,
             )
+            diagnostics["embeddings"] = index.embedding_diagnostics()
             return {
                 "query": query,
                 "index_uri": index_uri,
@@ -396,6 +397,7 @@ class SearchService:
             "index_uri": index_uri,
             "n_evidence": len(evidence),
             "evidence": [{k: v for k, v in turn.items() if k != "emb"} for turn in evidence],
+            "diagnostics": {"embeddings": index.embedding_diagnostics()},
         }
 
     @staticmethod

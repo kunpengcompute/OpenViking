@@ -237,7 +237,7 @@ class EvidenceRanking:
     def get_turns(self, turn_ids: List[str]) -> List[Dict[str, Any]]:
         """Read evidence from this index only, without exposing stored vectors."""
         return [
-            {k: v for k, v in self._turn_by_id[tid].items() if k != "emb"}
+            {k: v for k, v in self._turn_by_id[tid].items() if k not in {"emb", "embedding_state"}}
             for tid in turn_ids
             if tid in self._turn_by_id
         ]
