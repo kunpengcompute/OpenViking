@@ -126,7 +126,11 @@ def _scope(quote: str) -> str | None:
     chinese = re.search(r"(?:自|从)[^，。！？]{1,70}?(?:以来|开始)|(?:今年|去年|本月|上月)", quote)
     if chinese:
         return chinese.group(0)
-    match = re.search(r"\b(since\s+[^,.!?]+|in\s+my\s+[^,.!?]+)", quote, re.I)
+    match = re.search(
+        r"\b(since\s+[^,.!?]+|in\s+my\s+[^,.!?]+|(?:this|last)\s+(?:year|month|week))\b",
+        quote,
+        re.I,
+    )
     if not match:
         return None
     return re.split(r"\b(?:which|where|when|and|but)\b", match.group(1), maxsplit=1, flags=re.I)[

@@ -74,6 +74,24 @@ def test_missing_source_is_not_a_fact():
     assert make_fact_records("我去了北京。", "user", "", None, lambda t, ts: (t, [])) == []
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("I completed 4 essays this year.", "this year"),
+        ("I have now completed 7 essays this year.", "this year"),
+        ("We finished 3 reports last month.", "last month"),
+        ("I read 2 books this week.", "this week"),
+        ("I completed 4 essays since May.", "since May"),
+        ("我今年完成了4篇论文。", "今年"),
+        ("I have 3 books on this yearly plan.", None),
+    ],
+)
+def test_personal_fact_calendar_scope(text, expected):
+    from openviking.session.memory.atomic_facts import _scope
+
+    assert _scope(text) == expected
+
+
 def test_alias_matching_does_not_invent_english_entities_without_nlp(monkeypatch):
     monkeypatch.setattr(fact_records, "_parse", lambda text: None)
     assert not alias_in_text("son", "I like this song")
