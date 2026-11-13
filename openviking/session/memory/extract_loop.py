@@ -10,7 +10,7 @@ import asyncio
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from openviking.models.vlm.base import ToolCall, VLMBase
+from openviking.models.vlm.base import ToolCall, VLMBase, raise_for_incomplete_completion
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
     MemoryFile,
@@ -29,7 +29,7 @@ from openviking.session.memory.utils import (
     parse_json_with_stability,
     pretty_print_messages,
 )
-from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.utils.json_parser import JsonUtils, extract_json_content
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
 from openviking_cli.utils import get_logger
@@ -646,6 +646,8 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     f"[KVCache] prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
                 )
 
+        raise_for_incomplete_completion(getattr(response, "finish_reason", None))
+
         # Case 0: Handle string response (when tools are not provided) or None
         if response is None:
             content = ""
@@ -665,6 +667,14 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
         # Parse operations from content
         if content:
+            # A repaired unterminated string can look schema-valid while
+            # persisting only half a memory. Require a complete JSON document
+            # before applying the shared field/structure tolerance below.
+            try:
+                json.loads(extract_json_content(content))
+            except (ValueError, TypeError):
+                tracer.error("Memory operations require complete JSON before schema parsing")
+                return (None, None)
             try:
                 # print(f'LLM response content: {content}')
                 logger.debug(f"[assistant]\n{content}")

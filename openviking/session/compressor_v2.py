@@ -725,6 +725,7 @@ class SessionCompressorV2:
             ctx,
             extract_context,
             allowed_memory_types=allowed_memory_types,
+            session_owned=True,
         )
         isolation_handler.prepare_messages()
 

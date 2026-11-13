@@ -895,14 +895,28 @@ class VikingFS:
             return 0
         return len([part for part in match_file.split("/") if part])
 
-    async def stat(self, uri: str, ctx: Optional[RequestContext] = None) -> Dict[str, Any]:
+    async def stat(
+        self,
+        uri: str,
+        ctx: Optional[RequestContext] = None,
+        *,
+        skip_count: bool = False,
+        include_lock_status: bool = True,
+    ) -> Dict[str, Any]:
         """
         File/directory information.
 
         example: {'name': 'resources', 'size': 128, 'mode': 2147484141, 'modTime': '2026-02-10T21:26:02.934376379+08:00', 'isDir': True, 'isLocked': False, 'count': 42, 'meta': {'Name': 'localfs', 'Type': 'local', 'Content': {'local_path': '...'}}}
 
+        Args:
+            uri: Viking URI to inspect.
+            ctx: Request identity and access scope.
+            skip_count: Skip the directory vector count when it is not needed.
+            include_lock_status: Include the advisory lock status. Defaults to
+                True for compatibility; existence checks can disable it.
+
         Extra field:
-            isLocked (bool): Whether the path is currently held by a path lock
+            isLocked (bool): When requested, whether the path is held by a path lock
                 (either the path itself or any ancestor directory). Returns
                 False when the LockManager is not initialized or the lookup
                 fails.
@@ -930,19 +944,22 @@ class VikingFS:
         else:
             if self._is_legacy_session_root_uri(uri):
                 now = datetime.now(timezone.utc).isoformat()
-                return {
+                result = {
                     "name": "session",
                     "size": 0,
                     "mode": 0o755,
                     "modTime": now,
                     "isDir": True,
-                    "isLocked": False,
                 }
+                if include_lock_status:
+                    result["isLocked"] = False
+                return result
             raise NotFoundError(uri, "file") from last_not_found
         if isinstance(result, dict):
-            result["isLocked"] = await self._is_path_locked_async(path)
-            # Add count for directories if vector store available
-            if result.get("isDir", False):
+            if include_lock_status:
+                result["isLocked"] = await self._is_path_locked_async(path)
+            # Add count for directories if requested and a vector store is available.
+            if not skip_count and result.get("isDir", False):
                 try:
                     vector_store = self._get_vector_store()
                     if vector_store:
@@ -2553,8 +2570,10 @@ class VikingFS:
                 raw = b""
 
             text = self._decode_bytes(raw)
-        except Exception:
-            raise NotFoundError(uri, "file")
+        except Exception as exc:
+            if is_not_found_error(exc):
+                raise NotFoundError(uri, "file") from exc
+            raise
 
         if offset == 0 and limit == -1:
             return text

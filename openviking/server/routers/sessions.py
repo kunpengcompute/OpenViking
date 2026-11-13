@@ -16,6 +16,7 @@ from openviking.server.identity import AuthMode, RequestContext
 from openviking.server.models import ErrorInfo, Response
 from openviking.server.responses import error_response
 from openviking.server.telemetry import run_operation
+from openviking.session.auto_commit_policy import validate_idle_timeout_input
 from openviking.session.tool_views import add_messages_with_tool_views_async
 from openviking.telemetry import TelemetryRequest
 from openviking_cli.utils import get_logger
@@ -130,11 +131,39 @@ class UsedRequest(BaseModel):
     skill: Optional[Dict[str, Any]] = None
 
 
+class AutoCommitPolicyRequest(BaseModel):
+    """Optional per-session automatic commit thresholds and idle timeout."""
+
+    pending_token_threshold: Optional[int] = None
+    message_count_threshold: Optional[int] = None
+    idle_timeout_seconds: Optional[int] = None
+    keep_recent_count: Optional[int] = None
+    min_commit_interval_seconds: Optional[int] = None
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("idle_timeout_seconds")
+    @classmethod
+    def validate_idle_timeout_seconds(cls, value: Optional[int]) -> Optional[int]:
+        return None if value is None else validate_idle_timeout_input(value)
+
+    @model_validator(mode="after")
+    def reject_explicit_null_fields(self) -> "AutoCommitPolicyRequest":
+        null_fields = [field for field in self.model_fields_set if getattr(self, field) is None]
+        if null_fields:
+            raise ValueError(
+                "auto_commit_policy fields must be integers; use "
+                "auto_commit_policy=null to disable automatic commits"
+            )
+        return self
+
+
 class CreateSessionRequest(BaseModel):
     """Request model for creating a session."""
 
     session_id: Optional[str] = None
     memory_policy: Optional[Dict[str, Any]] = None
+    auto_commit_policy: Optional[AutoCommitPolicyRequest] = None
     telemetry: TelemetryRequest = False
 
 
@@ -202,6 +231,12 @@ async def create_session(
     If session_id is None, creates a new session with auto-generated ID.
     """
     service = get_service()
+    update_auto_commit_policy = "auto_commit_policy" in request.model_fields_set
+    auto_commit_policy = (
+        request.auto_commit_policy.model_dump(exclude_none=True)
+        if request.auto_commit_policy is not None
+        else None
+    )
 
     async def _create() -> dict[str, Any]:
         await service.initialize_user_directories(_ctx)
@@ -209,11 +244,14 @@ async def create_session(
             _ctx,
             request.session_id,
             memory_policy=request.memory_policy,
+            auto_commit_policy=auto_commit_policy,
+            update_auto_commit_policy=update_auto_commit_policy,
         )
         return {
             "session_id": session.session_id,
             "uri": session.uri,
             "user": session.user.to_dict(),
+            "auto_commit_policy": service.sessions.effective_auto_commit_policy(session),
         }
 
     execution = await run_operation(
@@ -252,8 +290,62 @@ async def get_session(
     result["uri"] = session.uri
     result["user"] = session.user.to_dict()
     result["pending_tokens"] = int(session.meta.pending_tokens or 0)
+    result["auto_commit_policy"] = service.sessions.effective_auto_commit_policy(session)
     result["latest_finished_archive_id"] = await session.get_latest_finished_archive_id()
     return Response(status="ok", result=result)
+
+
+class UpdateSessionConfigRequest(BaseModel):
+    """Request body for PATCH /sessions/{id}/config."""
+
+    auto_commit_policy: Optional[AutoCommitPolicyRequest] = None
+    telemetry: TelemetryRequest = False
+
+    model_config = {"extra": "forbid"}
+
+
+@router.patch("/{session_id}/config")
+async def update_session_config(
+    session_id: str = Path(..., description="Session ID"),
+    request: UpdateSessionConfigRequest = Body(default_factory=UpdateSessionConfigRequest),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Update or disable this session's automatic commit policy.
+
+    Omit auto_commit_policy to leave the current policy unchanged; pass null to
+    disable automatic commits for this session.
+    """
+    from openviking_cli.exceptions import NotFoundError
+
+    service = get_service()
+    update_policy = "auto_commit_policy" in request.model_fields_set
+    policy = (
+        request.auto_commit_policy.model_dump(exclude_none=True)
+        if request.auto_commit_policy is not None
+        else None
+    )
+
+    async def _update() -> dict[str, Any]:
+        session = await service.sessions.update_auto_commit_policy(
+            session_id,
+            _ctx,
+            policy=policy,
+            update=update_policy,
+        )
+        return {
+            "session_id": session.session_id,
+            "auto_commit_policy": service.sessions.effective_auto_commit_policy(session),
+        }
+
+    try:
+        execution = await run_operation(
+            operation="session.update_config",
+            telemetry=request.telemetry,
+            fn=_update,
+        )
+    except NotFoundError:
+        return error_response("NOT_FOUND", f"Session {session_id} not found")
+    return Response(status="ok", result=execution.result, telemetry=execution.telemetry)
 
 
 @router.get("/{session_id}/tool-results")
@@ -265,7 +357,7 @@ async def list_tool_results(
 ):
     """List externalized tool results for a session."""
     service = get_service()
-    session = await service.sessions.get(session_id, _ctx, auto_create=False)
+    session = await service.sessions.open(session_id, _ctx, auto_create=False)
     result = await session.list_tool_results(tool_name=tool_name, limit=limit)
     return Response(status="ok", result=_to_jsonable(result))
 
@@ -287,7 +379,7 @@ async def read_tool_result(
             details={"field": "limit", "value": limit},
         )
     service = get_service()
-    session = await service.sessions.get(session_id, _ctx, auto_create=False)
+    session = await service.sessions.open(session_id, _ctx, auto_create=False)
     result = await session.read_tool_result(
         tool_result_id,
         offset=offset,
@@ -308,7 +400,7 @@ async def search_tool_result(
 ):
     """Search within an externalized tool result."""
     service = get_service()
-    session = await service.sessions.get(session_id, _ctx, auto_create=False)
+    session = await service.sessions.open(session_id, _ctx, auto_create=False)
     result = await session.search_tool_result(
         tool_result_id,
         query=q,
@@ -347,7 +439,7 @@ async def get_session_archive(
     from openviking_cli.exceptions import NotFoundError
 
     service = get_service()
-    session = await service.sessions.get(session_id, _ctx, auto_create=False)
+    session = await service.sessions.open(session_id, _ctx, auto_create=False)
     try:
         result = await session.get_session_archive(archive_id)
     except NotFoundError:
@@ -455,10 +547,10 @@ async def add_message(
     service = get_service()
 
     async def _add() -> dict[str, Any]:
-        session = await service.sessions.get(session_id, _ctx, auto_create=True)
+        session = await service.sessions.open(session_id, _ctx, auto_create=True)
         parts = _resolve_message_parts(request)
 
-        session.add_messages(
+        await session.add_messages_async(
             [
                 {
                     "role": request.role,
@@ -468,11 +560,18 @@ async def add_message(
                     "message_kind": request.message_kind,
                     "source_message_ids": request.source_message_ids,
                 }
-            ]
+            ],
+        )
+        await service.sessions.maybe_schedule_auto_commit(
+            session_id,
+            _ctx,
+            reason_hint="message_write",
+            session=session,
         )
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
+            "pending_tokens": int(session.meta.pending_tokens),
         }
 
     execution = await run_operation(
@@ -497,7 +596,7 @@ async def batch_add_messages(
     service = get_service()
 
     async def _batch_add() -> dict[str, Any]:
-        session = await service.sessions.get(session_id, _ctx, auto_create=True)
+        session = await service.sessions.open(session_id, _ctx, auto_create=True)
         specs = []
         for msg_request in request.messages:
             parts = _resolve_message_parts(msg_request)
@@ -512,6 +611,12 @@ async def batch_add_messages(
                 }
             )
         result = await add_messages_with_tool_views_async(session, specs)
+        await service.sessions.maybe_schedule_auto_commit(
+            session_id,
+            _ctx,
+            reason_hint="message_write",
+            session=session,
+        )
         return result
 
     execution = await run_operation(

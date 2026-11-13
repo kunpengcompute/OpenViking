@@ -7,7 +7,7 @@ OpenViking uses a virtual filesystem where all directories are data records.
 This module defines the preset directory structure that is created on initialization.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from openviking.core.context import Context, Vectorize
@@ -192,6 +192,9 @@ class DirectoryInitializer:
         """
         if "user" not in PRESET_DIRECTORIES:
             return 0
+        # Provision this authenticated user's fixed entry directories with the
+        # user scope. Keep the request's actor-filtered context unchanged.
+        ctx = replace(ctx, actor_peer_id=None)
         user_space_root = canonical_user_root(ctx)
         user_tree = PRESET_DIRECTORIES["user"]
         parent_uri = "viking://user"

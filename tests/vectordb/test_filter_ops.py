@@ -138,22 +138,26 @@ class TestFilterOpsLargeFields(unittest.TestCase):
         }
         return get_or_create_local_collection(meta_data=collection_meta, path=self.path)
 
-    def test_upsert_record_with_oversized_json_field_raises(self):
+    def test_upsert_record_with_oversized_json_field_remains_searchable(self):
         large_abstract = 'prefix "quoted" \\\\ path\n' + ("x" * 66000)
         uri = "viking://user/memories/large.md"
-        with self.assertRaisesRegex(
-            (RuntimeError, ValueError), "fields.*exceeds 65535 bytes"
-        ):
-            self.collection.upsert_data(
-                [
-                    {
-                        "id": 1,
-                        "embedding": [1.0, 0, 0, 0],
-                        "uri": uri,
-                        "abstract": large_abstract,
-                    }
-                ]
-            )
+        result = self.collection.upsert_data(
+            [{"id": 1, "embedding": [1.0, 0, 0, 0], "uri": uri, "abstract": large_abstract}]
+        )
+        self.assertEqual(result.ids, [1])
+        self.collection.create_index(
+            "large",
+            {"IndexName": "large", "VectorIndex": {"IndexType": "flat"}, "ScalarIndex": ["uri"]},
+        )
+        result = self.collection.search_by_vector(
+            "large",
+            dense_vector=[1.0, 0, 0, 0],
+            limit=10,
+            filters={"op": "must", "field": "uri", "conds": [uri]},
+            output_fields=["uri", "abstract"],
+        )
+        self.assertEqual([item.id for item in result.data], [1])
+        self.assertEqual(result.data[0].fields["abstract"], large_abstract)
 
 
 class TestFilterOpsComplex(unittest.TestCase):

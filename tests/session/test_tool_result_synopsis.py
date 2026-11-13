@@ -41,8 +41,24 @@ def test_render_stub_preserves_navigation_contract():
     assert "original_chars: 120" in rendered
     assert "preview_chars: 80" in rendered
     assert "ref: viking://session/s1/tool-results/tr_123" in rendered
-    assert "openviking_tool_result_search" in rendered
-    assert "openviking_tool_result_read" in rendered
+    assert "Original output is saved at the ref above." in rendered
+    assert "openviking_tool_result_" not in rendered
+    assert "Synopsis:" in rendered and "Structure:" in rendered
+    assert "Notable items:" in rendered and "Sample:\nalpha\nbeta\ngamma" in rendered
+
+
+def test_neutral_guide_does_not_rewrite_original_sample_or_appear_without_ref():
+    synopsis = ToolResultSynopsis(
+        kind="text",
+        title="Tool documentation",
+        summary=["Tool documentation sample"],
+        structure=[],
+        notable_items=[],
+        sample="Explore:\nopenviking_tool_result_search is mentioned in the original.",
+    )
+    rendered = render_tool_result_stub(synopsis, original_chars=100, preview_chars=100)
+    assert synopsis.sample in rendered
+    assert "Original output is saved" not in rendered
 
 
 def test_json_synopsis_reports_shape():

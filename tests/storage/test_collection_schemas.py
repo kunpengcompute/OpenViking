@@ -21,17 +21,22 @@ from openviking.storage.errors import EmbeddingRebuildRequiredError
 from openviking.storage.expr import Eq
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.viking_vector_index_backend import _SingleAccountBackend
+from openviking_cli.utils.config.log_config import LogConfig
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
 
-class _DummyEmbedder:
+class _DummyEmbedder(DenseEmbedderBase):
     def __init__(self):
+        super().__init__("dummy-test")
         self.calls = 0
 
     def embed(self, text: str, is_query: bool = False) -> EmbedResult:
         del is_query
         self.calls += 1
         return EmbedResult(dense_vector=[0.1, 0.2])
+
+    def get_dimension(self) -> int:
+        return 2
 
 
 class _DummyConfig:
@@ -42,6 +47,7 @@ class _DummyConfig:
         volcengine_data_api_key: str | None = None,
         max_input_tokens: int = 4096,
     ):
+        self.log = LogConfig()
         self.storage = SimpleNamespace(
             vectordb=SimpleNamespace(
                 name="context",
@@ -204,7 +210,7 @@ async def test_init_context_collection_rejects_mismatched_nonempty_collection(mo
         lambda: config,
     )
 
-    with pytest.raises(EmbeddingRebuildRequiredError, match="Rebuild is required"):
+    with pytest.raises(EmbeddingRebuildRequiredError, match="(?i)rebuild is required"):
         await init_context_collection(_FakeStorage())
 
 
@@ -290,6 +296,8 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
 
     import openviking.storage.collection_schemas as collection_schemas
 
+    previous_propagate = collection_schemas.logger.propagate
+    collection_schemas.logger.propagate = False
     collection_schemas.logger.addHandler(caplog.handler)
     collection_schemas.logger.setLevel(logging.WARNING)
     try:
@@ -298,6 +306,7 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
             await handler.on_dequeue(_build_queue_payload())
     finally:
         collection_schemas.logger.removeHandler(caplog.handler)
+        collection_schemas.logger.propagate = previous_propagate
 
     warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
     assert warnings.count("Embedding circuit breaker is open; re-enqueueing messages") == 1
@@ -372,8 +381,8 @@ async def test_embedding_handler_propagates_account_id_on_error(monkeypatch):
         is_closing = False
         has_queue_manager = False
 
-    class _BrokenEmbedder:
-        def embed(self, text: str) -> EmbedResult:
+    class _BrokenEmbedder(_DummyEmbedder):
+        def embed(self, text: str, is_query: bool = False) -> EmbedResult:
             raise RuntimeError("boom")
 
     captured: dict[str, object] = {}
@@ -449,7 +458,7 @@ async def test_embedding_handler_drops_input_too_large_without_requeue(monkeypat
             self.enqueued.append(msg)
             return None
 
-    class _OversizedInputEmbedder:
+    class _OversizedInputEmbedder(_DummyEmbedder):
         def embed(self, text: str, is_query: bool = False) -> EmbedResult:
             del text, is_query
             raise RuntimeError("Malformed input request: expected maxLength: 50000, actual: 75000")

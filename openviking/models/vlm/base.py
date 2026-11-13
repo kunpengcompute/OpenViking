@@ -23,6 +23,16 @@ _THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>")
 logger = get_logger(__name__)
 
 
+class VLMOutputLimitError(RuntimeError):
+    """The provider stopped before completing its output."""
+
+
+def raise_for_incomplete_completion(finish_reason: Optional[str]) -> None:
+    """Preserve length failures before a provider response becomes plain text."""
+    if finish_reason in ("length", "max_tokens"):
+        raise VLMOutputLimitError(f"VLM output token limit reached (finish_reason={finish_reason})")
+
+
 @dataclass
 class ToolCall:
     """Single tool call from LLM."""
@@ -278,6 +288,7 @@ class VLMBase(ABC):
     def _extract_content_from_response(self, response) -> str:
         if isinstance(response, str):
             return response
+        raise_for_incomplete_completion(getattr(response.choices[0], "finish_reason", None))
         return response.choices[0].message.content or ""
 
 

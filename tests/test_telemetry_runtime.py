@@ -576,6 +576,12 @@ async def test_embedding_handler_binds_registered_operation_telemetry(monkeypatc
     register_telemetry(telemetry)
 
     class _TelemetryAwareEmbedder:
+        def prepare_embedding_input(self, content):
+            return content
+
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            return self.embed(text, is_query=is_query)
+
         def embed(self, text: str, is_query: bool = False) -> EmbedResult:
             assert text == "hello"
             assert is_query is False
@@ -662,8 +668,10 @@ async def test_resource_service_add_resource_reports_queue_summary(monkeypatch):
         def register_request(self, telemetry_id: str) -> None:
             del telemetry_id
 
-        async def wait_for_request(self, telemetry_id: str, timeout=None) -> None:
-            del telemetry_id, timeout
+        async def wait_for_request(
+            self, telemetry_id: str, timeout=None, poll_interval=0.1
+        ) -> None:
+            del telemetry_id, timeout, poll_interval
 
         def build_queue_status(self, telemetry_id: str):
             del telemetry_id
@@ -728,3 +736,14 @@ def test_telemetry_summary_includes_only_memory_group_when_memory_metrics_exist(
     assert "vector" not in summary
     assert "semantic_nodes" not in summary
     assert "errors" not in summary
+
+
+def test_server_startup_can_import_tracer_module():
+    """The server lifespan imports the module, while callers use tracer()."""
+    from types import ModuleType
+
+    from openviking.telemetry import tracer, tracer_module
+
+    assert isinstance(tracer_module, ModuleType)
+    assert callable(tracer)
+    assert callable(tracer_module.init_tracer_from_server_config)

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 from openviking.core.peer_id import normalize_peer_id, normalize_peer_selector
 from openviking.server.identity import RequestContext, Role
 from openviking.service import OpenVikingService
+from openviking.session.tool_views import add_messages_with_tool_views_async
 from openviking.telemetry import TelemetryRequest
 from openviking.telemetry.execution import (
     attach_telemetry_payload,
@@ -477,19 +478,21 @@ class LocalClient(BaseClient):
         result = session.meta.to_dict()
         result["uri"] = session.uri
         result["user"] = session.user.to_dict()
+        result["latest_finished_archive_id"] = await session.get_latest_finished_archive_id()
         return result
 
     async def get_session_context(
         self, session_id: str, token_budget: int = 128_000
     ) -> Dict[str, Any]:
         """Get assembled session context."""
-        session = await self._service.sessions.get(session_id, self._ctx, auto_create=False)
-        result = await session.get_session_context(token_budget=token_budget)
+        result = await self._service.sessions.get_context(
+            session_id, self._ctx, token_budget=token_budget
+        )
         return _to_jsonable(result)
 
     async def get_session_archive(self, session_id: str, archive_id: str) -> Dict[str, Any]:
         """Get one completed archive for a session."""
-        session = await self._service.sessions.get(session_id, self._ctx, auto_create=False)
+        session = await self._service.sessions.open(session_id, self._ctx, auto_create=False)
         result = await session.get_session_archive(archive_id)
         return _to_jsonable(result)
 
@@ -532,6 +535,9 @@ class LocalClient(BaseClient):
         created_at: Optional[str] = None,
         peer_id: Optional[str] = None,
         telemetry: TelemetryRequest = False,
+        *,
+        message_kind: Optional[str] = None,
+        source_message_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Add a message to a session.
 
@@ -555,6 +561,8 @@ class LocalClient(BaseClient):
                 parts,
                 created_at,
                 peer_id,
+                message_kind,
+                source_message_ids,
             ),
         )
         return attach_telemetry_payload(
@@ -570,10 +578,12 @@ class LocalClient(BaseClient):
         parts: Optional[List[Dict[str, Any]]],
         created_at: Optional[str],
         peer_id: Optional[str],
+        message_kind: Optional[str] = None,
+        source_message_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         from openviking.message.part import Part, TextPart, part_from_dict
 
-        session = await self._service.sessions.get(session_id, self._ctx, auto_create=True)
+        session = await self._service.sessions.open(session_id, self._ctx, auto_create=True)
 
         message_parts: list[Part]
         if parts is not None:
@@ -583,15 +593,22 @@ class LocalClient(BaseClient):
         else:
             raise ValueError("Either content or parts must be provided")
 
-        session.add_message(
-            role,
-            message_parts,
-            peer_id=self._resolve_message_peer_id(role, peer_id),
-            created_at=created_at,
+        await session.add_messages_async(
+            [
+                {
+                    "role": role,
+                    "parts": message_parts,
+                    "peer_id": self._resolve_message_peer_id(role, peer_id),
+                    "created_at": created_at,
+                    "message_kind": message_kind,
+                    "source_message_ids": source_message_ids,
+                }
+            ]
         )
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
+            "pending_tokens": int(session.meta.pending_tokens),
         }
 
     async def batch_add_messages(
@@ -618,7 +635,7 @@ class LocalClient(BaseClient):
     ) -> Dict[str, Any]:
         from openviking.message.part import Part, TextPart, part_from_dict
 
-        session = await self._service.sessions.get(session_id, self._ctx, auto_create=True)
+        session = await self._service.sessions.open(session_id, self._ctx, auto_create=True)
         specs: list[dict[str, Any]] = []
 
         for index, message in enumerate(messages):
@@ -643,15 +660,12 @@ class LocalClient(BaseClient):
                         message.get("peer_id"),
                     ),
                     "created_at": message.get("created_at"),
+                    "message_kind": message.get("message_kind"),
+                    "source_message_ids": message.get("source_message_ids"),
                 }
             )
 
-        added = session.add_messages(specs)
-        return {
-            "session_id": session_id,
-            "message_count": len(session.messages),
-            "added": len(added),
-        }
+        return await add_messages_with_tool_views_async(session, specs)
 
     def _resolve_message_peer_id(self, role: str, peer_id: Optional[str]) -> Optional[str]:
         if self._legacy_agent_id is None:
@@ -764,7 +778,7 @@ class LocalClient(BaseClient):
             True if the session exists, False otherwise
         """
         try:
-            await self._service.sessions.get(session_id, self._ctx, auto_create=False)
+            await self._service.sessions.open(session_id, self._ctx, auto_create=False)
             return True
         except NotFoundError:
             return False

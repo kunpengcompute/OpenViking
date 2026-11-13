@@ -25,6 +25,7 @@ class FieldType(IntEnum):
     list_int64 = 6
     list_string = 7
     list_float32 = 8
+    text = 9
 
 
 class StorageOpType(IntEnum):
@@ -52,6 +53,7 @@ def _default_value_for_type(data_type: FieldType) -> Any:
         FieldType.list_int64: [],
         FieldType.list_string: [],
         FieldType.list_float32: [],
+        FieldType.text: "",
     }[data_type]
 
 
@@ -66,6 +68,7 @@ def _field_type_size(data_type: FieldType) -> int:
         FieldType.list_int64: UINT32_SIZE,
         FieldType.list_string: UINT32_SIZE,
         FieldType.list_float32: UINT32_SIZE,
+        FieldType.text: UINT32_SIZE,
     }[data_type]
 
 
@@ -74,6 +77,7 @@ class Schema:
         if not isinstance(fields, list) or not fields:
             raise ValueError("Schema fields must be a non-empty list")
 
+        self._fields = fields
         self.field_metas: Dict[str, FieldMeta] = {}
         self.field_orders: List[FieldMeta] = [None] * len(fields)  # type: ignore[list-item]
         current_offset = 1
@@ -140,8 +144,28 @@ class BytesRow:
     def __init__(self, schema: Schema):
         self.schema = schema
         self.field_order = schema.get_field_order()
+        self._text_codec: Any = None
+        if any(meta.data_type == FieldType.text for meta in self.field_order):
+            # Reuse the canonical Python codec when native BytesRow is absent.
+            # Import lazily to avoid the engine/store import cycle.
+            from openviking.storage.vectordb.store.bytes_row import (
+                _PyBytesRow,
+                _PyFieldType,
+                _PySchema,
+            )
+
+            fields = []
+            for original in schema._fields:
+                converted = dict(original)
+                converted["data_type"] = _PyFieldType(int(original["data_type"]))
+                if "legacy_data_type" in original:
+                    converted["legacy_data_type"] = _PyFieldType(int(original["legacy_data_type"]))
+                fields.append(converted)
+            self._text_codec = _PyBytesRow(_PySchema(fields))
 
     def serialize(self, row_data: Any) -> bytes:
+        if self._text_codec is not None:
+            return self._text_codec.serialize(row_data)
         fixed_formats: list[str] = []
         fixed_values: list[Any] = []
         variable_formats: list[str] = []
@@ -191,22 +215,22 @@ class BytesRow:
                 variable_values.extend(items)
                 variable_region_offset += UINT16_SIZE + len(items) * INT64_SIZE
             elif field_meta.data_type == FieldType.list_float32:
-                items = [float(item) for item in value]
+                float_items = [float(item) for item in value]
                 fixed_formats.append("I")
                 fixed_values.append(variable_region_offset)
                 variable_formats.append("H")
-                variable_values.append(len(items))
-                variable_formats.append(f"{len(items)}f")
-                variable_values.extend(items)
-                variable_region_offset += UINT16_SIZE + len(items) * FLOAT32_SIZE
+                variable_values.append(len(float_items))
+                variable_formats.append(f"{len(float_items)}f")
+                variable_values.extend(float_items)
+                variable_region_offset += UINT16_SIZE + len(float_items) * FLOAT32_SIZE
             elif field_meta.data_type == FieldType.list_string:
-                items = [str(item) for item in value]
+                string_items = [str(item) for item in value]
                 fixed_formats.append("I")
                 fixed_values.append(variable_region_offset)
                 variable_formats.append("H")
-                variable_values.append(len(items))
+                variable_values.append(len(string_items))
                 variable_region_offset += UINT16_SIZE
-                for item in items:
+                for item in string_items:
                     encoded = item.encode("utf-8")
                     variable_formats.append("H")
                     variable_values.append(len(encoded))
@@ -224,6 +248,8 @@ class BytesRow:
         return [self.serialize(row_data) for row_data in rows_data]
 
     def deserialize_field(self, serialized_data: bytes, field_name: str) -> Any:
+        if self._text_codec is not None:
+            return self._text_codec.deserialize_field(serialized_data, field_name)
         field_meta = self.schema.get_field_meta(field_name)
         if field_meta.id >= serialized_data[0]:
             return field_meta.default_value
@@ -277,7 +303,7 @@ class BytesRow:
 
 
 class _RequestBase:
-    __slots__ = ()
+    __slots__: tuple[str, ...] = ()
 
     def to_backend(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__slots__}

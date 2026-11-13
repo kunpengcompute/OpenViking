@@ -481,6 +481,50 @@ async def test_persistent_store_cross_tracker_visibility():
     assert loaded.result == {"ok": True}
 
 
+async def test_stable_task_id_reuses_completed_task_after_restart():
+    store = PersistentTaskStore(_FakeAgfs())
+    tracker = TaskTracker(store=store)
+    task = await tracker.create(
+        "session_commit", resource_id="sess", task_id="archive-job", **_owner_kwargs()
+    )
+    await tracker.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+    restarted = TaskTracker(store=store)
+    reused = await restarted.create(
+        "session_commit", resource_id="sess", task_id="archive-job", **_owner_kwargs()
+    )
+    assert reused.task_id == task.task_id
+    assert reused.status == TaskStatus.COMPLETED
+    assert reused.result == {"ok": True}
+    with pytest.raises(ValueError, match="different operation"):
+        await restarted.create(
+            "session_commit", resource_id="other-session", task_id="archive-job", **_owner_kwargs()
+        )
+
+
+async def test_stable_task_lookup_outage_never_overwrites_completed_task(monkeypatch):
+    store = PersistentTaskStore(_FakeAgfs())
+    original = TaskTracker(store=store)
+    task = await original.create(
+        "session_commit", resource_id="sess", task_id="fixed-id", **_owner_kwargs()
+    )
+    await original.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+    restarted = TaskTracker(store=store)
+    read = store._agfs.read
+
+    async def outage(*args, **kwargs):
+        raise TimeoutError("task lookup unavailable")
+
+    monkeypatch.setattr(store._agfs, "read", outage)
+    with pytest.raises(TimeoutError):
+        await restarted.create(
+            "session_commit", resource_id="sess", task_id="fixed-id", **_owner_kwargs()
+        )
+    monkeypatch.setattr(store._agfs, "read", read)
+    recovered = await TaskTracker(store=store).get(task.task_id, **_owner_kwargs())
+    assert recovered.status == TaskStatus.COMPLETED
+    assert recovered.result == {"ok": True}
+
+
 async def test_persistent_store_writes_task_record_json():
     agfs = _FakeAgfs()
     store = PersistentTaskStore(agfs)

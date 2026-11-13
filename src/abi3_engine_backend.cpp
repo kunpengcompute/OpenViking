@@ -324,6 +324,13 @@ PyObject* value_to_py(const vdb::Value& value, vdb::FieldType field_type) {
             text.data(), static_cast<Py_ssize_t>(text.size()));
       }
       break;
+    case vdb::FieldType::TEXT:
+      if (std::holds_alternative<std::string>(value)) {
+        const auto& text = std::get<std::string>(value);
+        return PyUnicode_FromStringAndSize(
+            text.data(), static_cast<Py_ssize_t>(text.size()));
+      }
+      break;
     case vdb::FieldType::BINARY:
       if (std::holds_alternative<std::string>(value)) {
         const auto& blob = std::get<std::string>(value);
@@ -392,7 +399,8 @@ bool py_to_field_value(PyObject* obj, vdb::FieldType data_type,
       return true;
     }
     case vdb::FieldType::STRING:
-    case vdb::FieldType::BINARY: {
+    case vdb::FieldType::BINARY:
+    case vdb::FieldType::TEXT: {
       std::string value;
       if (!py_to_string(obj, &value, true)) {
         return false;
@@ -505,6 +513,9 @@ bool py_to_field_type(PyObject* obj, vdb::FieldType* out) {
     case 8:
       *out = vdb::FieldType::LIST_FLOAT32;
       return true;
+    case 9:
+      *out = vdb::FieldType::TEXT;
+      return true;
     default:
       raise_value_error("Unsupported field type");
       return false;
@@ -548,6 +559,16 @@ bool parse_schema_fields(PyObject* fields_obj,
         !py_to_field_type(type_obj, &field.data_type)) {
       Py_DECREF(item);
       return false;
+    }
+
+    PyObject* legacy_type_obj = PyDict_GetItemString(item, "legacy_data_type");
+    if (legacy_type_obj != nullptr) {
+      vdb::FieldType legacy_type;
+      if (!py_to_field_type(legacy_type_obj, &legacy_type)) {
+        Py_DECREF(item);
+        return false;
+      }
+      field.legacy_data_type = legacy_type;
     }
 
     const long field_id = PyLong_AsLong(id_obj);
@@ -1001,10 +1022,13 @@ PyObject* py_bytes_row_deserialize(PyObject*, PyObject* args) {
     return nullptr;
   }
 
-  std::string payload;
-  if (!py_to_string(payload_obj, &payload, true)) {
+  char* payload_data = nullptr;
+  Py_ssize_t payload_size = 0;
+  if (PyBytes_AsStringAndSize(payload_obj, &payload_data, &payload_size) < 0) {
     return nullptr;
   }
+  // The call arguments keep these immutable bytes alive while the GIL is released.
+  const std::string_view payload(payload_data, static_cast<size_t>(payload_size));
 
   PyObject* result = PyDict_New();
   if (result == nullptr) {
@@ -1054,10 +1078,12 @@ PyObject* py_bytes_row_deserialize_field(PyObject*, PyObject* args) {
     return nullptr;
   }
 
-  std::string payload;
-  if (!py_to_string(payload_obj, &payload, true)) {
+  char* payload_data = nullptr;
+  Py_ssize_t payload_size = 0;
+  if (PyBytes_AsStringAndSize(payload_obj, &payload_data, &payload_size) < 0) {
     return nullptr;
   }
+  const std::string_view payload(payload_data, static_cast<size_t>(payload_size));
 
   const auto* meta = handle->schema->get_field_meta(field_name);
   if (meta == nullptr) {

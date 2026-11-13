@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0
+
 import pytest
 
 from openviking.core.directories import PRESET_DIRECTORIES, DirectoryInitializer
@@ -56,3 +58,37 @@ async def test_initialize_user_directories_creates_root_and_first_level_only():
 
     assert second_count == 0
     assert set(viking_fs.contexts) == expected_uris
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [Role.USER, Role.ADMIN, Role.ROOT])
+async def test_actor_session_bootstrap_keeps_user_scope_and_request_view(role: Role) -> None:
+    from openviking.storage.viking_fs import VikingFS
+    from openviking_cli.exceptions import PermissionDeniedError
+
+    guard = VikingFS.__new__(VikingFS)
+    writes: list[RequestContext] = []
+
+    class GuardedFS(_FakeVikingFS):
+        async def write_context(self, uri, abstract, overview, is_leaf, ctx):
+            guard._ensure_mutable_access(uri, ctx)
+            writes.append(ctx)
+            await super().write_context(uri, abstract, overview, is_leaf, ctx)
+
+    fs, db = GuardedFS(), _FakeVikingDB()
+    ctx = RequestContext(
+        user=UserIdentifier("acme", "alice"),
+        role=role,
+        actor_peer_id="mail-agent",
+        from_oauth=True,
+    )
+    initializer = DirectoryInitializer(db, viking_fs=fs)
+    count = await initializer.initialize_user_directories(ctx)
+    assert count == 1 + len(PRESET_DIRECTORIES["user"].children)
+    assert all(uri.startswith("viking://user/alice") for uri in fs.contexts)
+    assert all(c.user == ctx.user and c.role == role and c.from_oauth for c in writes)
+    assert all(c.actor_peer_id is None for c in writes)
+    assert ctx.actor_peer_id == "mail-agent"
+    with pytest.raises(PermissionDeniedError):
+        guard._ensure_mutable_access("viking://user/alice/peers/other/resources", ctx)
+    assert await initializer.initialize_user_directories(ctx) == 0

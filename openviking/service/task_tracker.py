@@ -239,17 +239,27 @@ class TaskTracker:
         *,
         account_id: str,
         user_id: str,
+        task_id: Optional[str] = None,
     ) -> TaskRecord:
         """Register a new pending task. Returns a snapshot copy."""
         self._validate_owner(account_id, user_id)
         task = TaskRecord(
-            task_id=str(uuid4()),
+            task_id=task_id or str(uuid4()),
             task_type=task_type,
             resource_id=resource_id,
             account_id=account_id,
             user_id=user_id,
         )
         async with self._async_lock:
+            existing = (
+                await self._load_for_update(task.task_id, account_id, user_id)
+                if task_id is not None
+                else None
+            )
+            if existing is not None:
+                if existing.task_type != task_type or existing.resource_id != resource_id:
+                    raise ValueError("Task id already belongs to a different operation")
+                return self._copy(existing)
             await self._store.create(task)
             with self._lock:
                 self._tasks[task.task_id] = task

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any
 
 from openviking.message.part import ToolPart
@@ -25,10 +24,11 @@ def add_messages_with_tool_views(session: Session, specs: list[dict[str, Any]]) 
 
 
 async def add_messages_with_tool_views_async(
-    session: Any, specs: list[dict[str, Any]]
+    session: Session, specs: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Run the synchronous native batch write without blocking the event loop."""
-    return await asyncio.to_thread(add_messages_with_tool_views, session, specs)
+    originals = _original_outputs(specs)
+    added = await session.add_messages_async(specs)
+    return _receipt(session, added, originals)
 
 
 def _original_outputs(specs):

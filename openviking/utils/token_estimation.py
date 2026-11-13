@@ -6,38 +6,31 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
-
-def _is_cjk_code_point(code_point: int) -> bool:
-    return (
-        0x3400 <= code_point <= 0x4DBF
-        or 0x4E00 <= code_point <= 0x9FFF
-        or 0xF900 <= code_point <= 0xFAFF
-        or 0x20000 <= code_point <= 0x2EBEF
-        or 0x3040 <= code_point <= 0x30FF
-        or 0x31F0 <= code_point <= 0x31FF
-        or 0xAC00 <= code_point <= 0xD7AF
-        or 0x1100 <= code_point <= 0x11FF
-        or 0x3130 <= code_point <= 0x318F
-        or 0xFF00 <= code_point <= 0xFFEF
-        or 0x3000 <= code_point <= 0x303F
-    )
-
-
-def _code_point_weight(code_point: int) -> float:
-    if _is_cjk_code_point(code_point):
-        return 1.5
-    if code_point > 0xFFFF:
-        return 2.0
-    return 0.25
+_CJK_CODE_POINTS = re.compile(
+    "[\u1100-\u11ff\u3000-\u30ff\u3130-\u318f\u31f0-\u31ff"
+    "\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+    "\uff00-\uffef\U00020000-\U0002ebef]"
+)
+_NON_BMP_CODE_POINTS = re.compile("[\U00010000-\U0010ffff]")
+_CJK_NON_BMP_CODE_POINTS = re.compile("[\U00020000-\U0002ebef]")
 
 
 def text_token_weight(text: str | None) -> float:
     """Return additive token weight before rounding, including rendered separators."""
     if not text:
         return 0.0
-    return sum(_code_point_weight(ord(char)) for char in text)
+    if text.isascii():
+        return len(text) * 0.25
+    cjk = len(_CJK_CODE_POINTS.findall(text))
+    other_non_bmp = len(_NON_BMP_CODE_POINTS.findall(text)) - len(
+        _CJK_NON_BMP_CODE_POINTS.findall(text)
+    )
+    # Count character classes in the regex engine instead of a Python loop.
+    # CJK weighs 1.5, other non-BMP 2.0, and all remaining characters 0.25.
+    return len(text) * 0.25 + cjk * 1.25 + other_non_bmp * 1.75
 
 
 def estimate_text_tokens(text: str | None) -> int:

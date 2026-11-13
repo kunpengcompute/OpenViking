@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from openviking.observability.usage_audit.inventory import ContextInventoryProvider
 from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.identity import RequestContext, Role
+from openviking.service.fs_service import FSService
+from openviking.storage.viking_fs import VikingFS
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -90,3 +92,40 @@ async def test_context_inventory_warns_on_unexpected_stat_failures():
 
     assert counts == {"files": 0, "skills": 0, "memories": 0, "total": 0}
     warning.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_context_inventory_uses_real_stat_default_enrichment():
+    class DirectoryAGFS:
+        def __init__(self):
+            self.paths = []
+
+        def stat(self, path):
+            self.paths.append(path)
+            return {"name": path.rsplit("/", 1)[-1], "isDir": True}
+
+    counts_by_uri = {
+        "viking://resources": 2,
+        "viking://user/user-1/skills": 3,
+        "viking://user/user-1/memories": 5,
+    }
+
+    async def count(*, filter, ctx):
+        assert ctx is request_ctx
+        return counts_by_uri[filter.path]
+
+    agfs = DirectoryAGFS()
+    vectors = SimpleNamespace(count=AsyncMock(side_effect=count))
+    fs = VikingFS(agfs=agfs, vector_store=vectors)
+    provider = ContextInventoryProvider(SimpleNamespace(fs=FSService(viking_fs=fs)), ttl_seconds=0)
+    request_ctx = _ctx()
+
+    counts = await provider.get_counts(request_ctx)
+
+    assert counts == {"files": 2, "skills": 3, "memories": 5, "total": 10}
+    assert vectors.count.await_count == 3
+    assert set(agfs.paths) == {
+        "/local/acct-1/resources",
+        "/local/acct-1/user/user-1/skills",
+        "/local/acct-1/user/user-1/memories",
+    }

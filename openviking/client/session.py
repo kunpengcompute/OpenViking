@@ -42,6 +42,9 @@ class Session:
         parts: Optional[List[Part]] = None,
         created_at: Optional[str] = None,
         peer_id: Optional[str] = None,
+        *,
+        message_kind: Optional[str] = None,
+        source_message_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Add a message to the session.
 
@@ -57,6 +60,11 @@ class Session:
         Returns:
             Result dict with session_id and message_count
         """
+        metadata: dict[str, Any] = {}
+        if message_kind is not None:
+            metadata["message_kind"] = message_kind
+        if source_message_ids is not None:
+            metadata["source_message_ids"] = source_message_ids
         if parts is not None:
             parts_dicts = [asdict(p) for p in parts]
             return await self._client.add_message(
@@ -65,6 +73,7 @@ class Session:
                 parts=parts_dicts,
                 created_at=created_at,
                 peer_id=peer_id,
+                **metadata,
             )
         return await self._client.add_message(
             self.session_id,
@@ -72,6 +81,7 @@ class Session:
             content=content,
             created_at=created_at,
             peer_id=peer_id,
+            **metadata,
         )
 
     async def batch_add_messages(

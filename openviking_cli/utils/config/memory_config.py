@@ -9,6 +9,32 @@ from openviking_cli.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+class SessionAutoCommitConfig(BaseModel):
+    """Server-wide controls for idle-based session commits."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable automatic commits after sessions have been idle.",
+    )
+    idle_timeout_seconds: int = Field(
+        default=86_400,
+        ge=0,
+        description="Idle duration before archiving a session. Set to 0 to disable idle commits.",
+    )
+    check_interval_seconds: float = Field(
+        default=600.0,
+        gt=0,
+        description="Minimum delay between idle-session scans.",
+    )
+    scan_rate_limit_files_per_second: float = Field(
+        default=2.0,
+        gt=0,
+        description="Maximum session metadata files read per second during idle scans.",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class MemoryConfig(BaseModel):
     """Memory configuration for OpenViking."""
 
@@ -84,6 +110,10 @@ class MemoryConfig(BaseModel):
             "memory items (page_id, links field, and link resolution). When disabled (default), "
             "no page_id or link fields are generated, and link resolution is skipped."
         ),
+    )
+    session_auto_commit: SessionAutoCommitConfig = Field(
+        default_factory=SessionAutoCommitConfig,
+        description="Server-wide idle session auto-commit controls.",
     )
 
     model_config = {"extra": "forbid"}
