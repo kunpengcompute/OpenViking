@@ -1,0 +1,5 @@
+Vendored without modification from Vercel agent-browser v0.27.1.
+Source: https://github.com/vercel-labs/agent-browser/tree/v0.27.1/skills/agent-browser
+License: Apache-2.0; see LICENSE.
+Runtime usage guides are provided by the installed CLI: agent-browser skills get core.
+Chat transport and file delivery are documented separately in prompts/browser.md.

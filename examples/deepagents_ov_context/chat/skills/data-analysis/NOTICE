@@ -1,0 +1,4 @@
+Workflow adapted from DeerFlow data-analysis.
+Source: https://github.com/bytedance/deer-flow/tree/7097694abed8250cc0ceace5050335eaead6da81/skills/public/data-analysis
+Workflow license: MIT; upstream attribution is retained in LICENSE.txt.
+Modified for per-Run paths and preinstalled dependencies. scripts/analyze.py is a new implementation under the repository AGPL-3.0 license, using pandas/openpyxl with an in-memory DuckDB connection instead of spatial extensions and shared caches.

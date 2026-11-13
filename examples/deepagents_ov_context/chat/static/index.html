@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OVContext · Chat Lab</title>
+  <style>
+    :root{color-scheme:light;--bg:#f6f7f9;--paper:#fff;--ink:#152431;--muted:#637583;--line:#e1e7ed;--blue:#2557e7;--green:#087c66;--mono:ui-monospace,SFMono-Regular,Consolas,monospace}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
+    button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid var(--line);background:white;color:var(--ink);border-radius:9px;padding:8px 12px}button:hover:not(:disabled){border-color:#9caec0;background:#f7faff}button:disabled{opacity:.45;cursor:not-allowed}button.primary{background:var(--blue);border-color:var(--blue);color:white}button.danger{color:#b53030}input,textarea{border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);padding:9px;width:100%;outline:none}input:focus,textarea:focus{border-color:var(--blue)}
+    header{height:74px;display:flex;align-items:center;justify-content:space-between;padding:0 26px;border-bottom:1px solid var(--line);background:var(--paper)}.brand{font-size:19px;font-weight:750;letter-spacing:-.5px}.brand span{font-weight:400;color:var(--muted);margin-left:10px}.status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px}.dot{width:7px;height:7px;border-radius:50%;background:#9ba7b1}.dot.ready{background:#0d9b7b}
+    .app{display:grid;grid-template-columns:232px minmax(340px,1fr) 370px;height:calc(100dvh - 74px);max-width:1800px;margin:auto}aside{padding:20px 16px;overflow:auto;border-right:1px solid var(--line)}.eyebrow{text-transform:uppercase;font-size:11px;letter-spacing:1.4px;color:var(--muted);font-weight:700;margin-bottom:12px}.create{display:grid;gap:10px}.create label{font-size:12px;color:var(--muted)}.create button{margin-top:4px}.sessions{display:grid;gap:8px;margin-top:22px}.session{text-align:left;width:100%;padding:12px;overflow:hidden}.session.active{border-color:#a8bafa;background:#edf2ff}.session strong{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.session small{color:var(--muted);font:11px var(--mono)}
+    main{display:flex;flex-direction:column;min-height:0;background:white}.chat-head{padding:20px 26px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}.chat-head h1{font-size:16px;margin:0 0 3px}.session-meta{font:11px var(--mono);color:var(--muted);word-break:break-all}.badge{color:var(--green);background:#eaf6f2;border-radius:5px;padding:3px 8px;font-size:11px;align-self:start;white-space:nowrap}.messages{flex:1;overflow:auto;padding:26px;scroll-behavior:smooth}.turn{margin:0 auto 18px;max-width:800px;border:1px solid var(--line);border-left:4px solid #8797a5;border-radius:11px;background:#f7f8fa;padding:13px 16px}.turn .role{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:11px;letter-spacing:.8px;font-weight:700;margin-bottom:9px;color:var(--muted)}.turn .body{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8}.turn.user{background:#f1f5fd;border-left-color:#2557e7}.turn.user .role{color:#2557e7}.turn.assistant{background:#f5f3fa;border-left-color:#7753b8}.turn.assistant .role{color:#7753b8}.turn.tool{background:#eff7f3;border-left-color:#087c66}.turn.tool .role{color:#087c66}.turn.tool .body{font:12px/1.7 var(--mono);color:#315b4f}.turn.tool.expanded .body{max-height:480px;overflow:auto}.tool-toggle{font-size:11px;letter-spacing:0;font-weight:400;padding:3px 8px;background:#fff;white-space:nowrap;flex-shrink:0}.tool-toggle:focus-visible{outline:2px solid var(--blue);outline-offset:2px}.turn.pending .body:after{content:'▋';animation:blink 1s infinite;color:var(--blue)}@keyframes blink{50%{opacity:0}}.notice{font-size:12px;color:#aa3838;padding:10px 14px;border:1px solid #f0d5d5;background:#fff8f8;border-radius:8px;margin:10px auto;max-width:800px}.composer{padding:16px 26px 20px;border-top:1px solid var(--line)}.composer textarea{resize:none;min-height:83px;border-radius:12px;padding:12px}.composer-bottom{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px}.hint{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px}
+    .debug{background:#fafbfc;border-left:1px solid var(--line);padding:20px 18px;overflow:auto;min-width:0}.debug-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}.debug-header strong{font-size:13px}.debug-header button{font-size:11px;padding:5px 8px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:18px}.stat{border:1px solid var(--line);border-radius:8px;background:white;padding:10px}.stat span{font-size:10px;color:var(--muted);display:block}.stat b{font:19px var(--mono)}.meta{font:10px/1.9 var(--mono);color:var(--muted);overflow-wrap:anywhere;margin-bottom:18px}.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);padding-bottom:9px;margin-bottom:12px}.tabs button{font-size:11px;border:none;padding:5px 8px;background:transparent;color:var(--muted)}.tabs button.active{background:#e9eefb;color:var(--blue)}.panel{display:none}.panel.active{display:block}pre{font:10px/1.7 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:12px;background:#f0f3f7;border-radius:8px;max-height:480px;overflow:auto}.event{padding:9px 0;border-bottom:1px solid var(--line);font:10px/1.7 var(--mono)}.event strong{display:block;color:#28497e;font-weight:600}.event details{margin-top:4px}.event summary{cursor:pointer;color:var(--muted)}.event pre{margin-top:6px}.debug-note{font-size:11px;color:var(--muted);margin:16px 0}.run-state{font-size:11px;color:var(--blue)}
+    @media(max-width:1150px){.app{grid-template-columns:190px minmax(320px,1fr) 300px}.debug{padding:18px 12px}header{padding:0 18px}.chat-head,.composer{padding-left:18px;padding-right:18px}}
+    @media(max-width:900px){.app{grid-template-columns:180px 1fr;height:auto;min-height:calc(100dvh - 74px)}main{height:calc(100dvh - 74px)}.debug{grid-column:1/-1;border-top:1px solid var(--line);max-height:600px}.stats{grid-template-columns:repeat(4,1fr)}.brand span{display:none}}
+    @media(max-width:550px){.app{grid-template-columns:1fr}aside{border-bottom:1px solid var(--line);max-height:230px}.create{grid-template-columns:1fr 1fr auto;align-items:end}.sessions{display:flex;overflow:auto;margin-top:12px}.session{min-width:160px}.eyebrow{display:none}main{height:75dvh}.debug{grid-column:1}.status{max-width:190px;font-size:10px}.messages{padding:18px}}
+    .native-messages{display:grid;gap:16px}.native-message{border:1px solid #cad5df;border-left:4px solid #637583;border-radius:9px;overflow:hidden;background:white}.native-message[data-type="human"]{border-left-color:#2557e7}.native-message[data-type="ai"]{border-left-color:#7753b8}.native-message[data-type="tool"]{border-left-color:#087c66}.native-message header{height:auto;min-height:38px;padding:9px 12px;display:block;background:#eef2f6;border-bottom:1px solid var(--line)}.native-message header strong{font:600 12px var(--mono)}.native-message header small{display:block;font:10px/1.7 var(--mono);color:var(--muted);overflow-wrap:anywhere;margin-top:4px}.native-message pre{border-radius:0;background:white;font-size:11px;padding:14px;line-height:1.8}.native-empty{font-size:12px;color:var(--muted)}
+  .create select,.create textarea{width:100%;max-width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:white;font:12px var(--mono)}.create details{font-size:11px;min-width:0}.create details label{display:block;margin-top:8px}
+    .tool-calls{margin-top:12px;min-width:0}.tool-calls-heading{font-size:11px;font-weight:700;color:#7753b8;margin-bottom:8px}.tool-call{background:#fff;border:1px solid #ddd6eb;border-radius:8px;margin-top:8px;overflow:hidden}.tool-call-head{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:6px 12px;padding:10px 12px;background:#eee9f6}.tool-call-head strong{font:600 13px var(--mono);overflow-wrap:anywhere}.tool-call-id{font:10px var(--mono);color:var(--muted);overflow-wrap:anywhere}.call-args{margin:0;padding:0 12px}.call-arg{padding:10px 0;border-bottom:1px solid var(--line)}.call-arg:last-child{border-bottom:0}.call-arg dt{font:600 11px var(--mono);color:#655681;margin-bottom:5px}.call-arg dd{margin:0;min-width:0}.call-arg-value,.call-raw pre{font:12px/1.65 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;tab-size:2;margin:0}.call-arg .tool-toggle{margin-top:7px}.call-raw{border-top:1px solid var(--line);padding:8px 12px;color:var(--muted);font-size:11px}.call-raw summary{cursor:pointer}.call-raw pre{margin-top:8px;max-height:360px;overflow:auto;color:var(--ink)}.call-no-args,.call-error{font-size:12px;padding:0 12px}.call-error{color:#aa3838}
+    .reasoning{border-top:1px solid #ddd6eb;margin-top:10px;padding-top:8px;color:#655681;font-size:11px}.reasoning summary{cursor:pointer}.reasoning pre{margin-top:8px;font:12px/1.7 var(--mono);color:var(--ink);max-height:320px;overflow:auto}
+  </style>
+</head>
+<body>
+  <header><div class="brand">OVContext<span>/ Chat Lab</span></div><div class="status"><i class="dot" id="health-dot"></i><span id="health">正在连接本地 OV…</span></div></header>
+  <div class="app">
+    <aside>
+      <div class="eyebrow">Sessions</div>
+      <form class="create" id="create-form">
+        <label>运行环境（新会话）<select id="environment-id"><option value="daily">日常调试</option></select></label>
+        <label>实验批次（可留空）<input id="experiment-id" maxlength="100" pattern="[a-zA-Z0-9_.-]+" placeholder="如 schedule-no-todo-20261030"></label>
+        <label>用户<input id="user-id" value="debug-user" maxlength="100" required></label>
+        <label>Agent<input id="agent-id" value="chat-agent" maxlength="100" required></label>
+        <label>执行配置（新会话）<select id="execution-mode"><option value="current">当前版本（默认）</option><option value="baseline">DeepAgent · 无 OV</option><option value="context_only">当前版本 · 关闭记忆检索</option><option value="ordinary">当前版本 · 普通记忆</option><option value="experience">当前版本 · 经验记忆</option></select></label>
+        <details><summary>实验配置（新会话生效）</summary>
+          <label>普通记忆 URI（每行一个，可留空）<textarea id="ordinary-uris" rows="2"></textarea></label>
+          <label>经验记忆 URI（每行一个，可留空）<textarea id="experience-uris" rows="2"></textarea></label>
+          <label>记忆预算（字符）<input id="memory-budget" type="number" min="1" max="64000" placeholder="空值继承 .env"></label>
+          <label>最大输出 Token（空值继承服务）<input id="profile-max-tokens" type="number" min="1" max="65536"></label>
+          <label>模型上下文窗口（空值继承服务）<input id="profile-context-window" type="number" min="1024" max="1000000"></label>
+          <label>基础上下文比例（空值继承服务）<input id="profile-base-ratio" type="number" min="0.01" max="0.99" step="0.01"></label>
+          <label>同步压缩触发比例（空值继承服务）<input id="profile-capacity-ratio" type="number" min="0.01" max="0.99" step="0.01"></label>
+          <label>图步数上限（空值继承服务）<input id="profile-recursion" type="number" min="1" max="1000"></label>
+          <label>Thinking<select id="profile-thinking"><option value="">继承服务配置</option><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
+          <label>任务计划（write_todos）<select id="profile-todos"><option value="">继承服务配置</option><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
+          <label>任务超时秒数（可留空）<input id="profile-timeout" type="number" min="1" max="3600"></label>
+          <label>会话补充要求（可留空，沿用通用办公规则）<textarea id="profile-prompt" rows="3"></textarea></label>
+        </details>
+        <details><summary>自动提交配置（新会话生效）</summary>
+          <p class="aside-note">留空继承 .env。仅“当前版本（默认）”组启用自动提交，实验对照组保持关闭。</p>
+          <fieldset id="commit-settings">
+            <label>提交 Token 预算<input id="commit-token-budget" type="number" min="1" step="1" placeholder="继承服务配置"></label>
+            <label>提交容量比例（大于 0，最高 0.7）<input id="commit-ratio" type="number" min="0.000001" max="0.7" step="any" placeholder="继承服务配置"></label>
+            <label>完成 Run 数阈值<input id="commit-run-threshold" type="number" min="1" step="1" placeholder="继承服务配置"></label>
+            <label>保留最近消息条数<input id="commit-keep-recent" type="number" min="0" max="10000" step="1" placeholder="继承服务配置"></label>
+          </fieldset>
+        </details>
+        <button type="submit" id="new-session">＋ 新建会话</button>
+      </form>
+      <label>会话筛选<select id="session-filter"><option value="all">全部会话</option><option value="daily">日常调试</option><option value="experiment">实验会话</option></select></label>
+      <label>查找会话<input id="session-search" placeholder="批次、标题、用户"></label>
+      <nav class="sessions" id="sessions" aria-label="会话列表"></nav>
+    </aside>
+    <main>
+      <div class="chat-head"><div><h1 id="title">新会话</h1><div class="session-meta" id="session-meta"></div></div><span class="badge" id="badge">本地调试</span></div>
+      <div class="messages" id="messages" aria-live="polite"></div>
+      <form class="composer" id="chat-form"><textarea id="prompt" aria-label="消息" placeholder="输入消息…" maxlength="32000" required></textarea><div class="composer-bottom"><span class="hint" id="hint">Enter 发送 · Shift + Enter 换行</span><div class="actions"><button type="button" id="stop" class="danger" disabled>停止</button><button type="submit" id="send" class="primary">发送 ↗</button></div></div></form>
+    </main>
+    <section class="debug" aria-label="调试面板">
+      <div class="debug-header"><strong>链路调试</strong><div><button id="extract-memory" disabled>提取记忆</button> <button id="restore" disabled>从 OV 恢复</button></div></div>
+      <div class="stats"><div class="stat"><span>缓存消息</span><b id="cache-count">—</b></div><div class="stat"><span>写入游标</span><b id="write-index">—</b></div><div class="stat"><span>首段输出 / 秒</span><b id="first-token">—</b></div><div class="stat"><span>完成耗时 / 秒</span><b id="duration">—</b></div><div class="stat"><span>本轮输入 Token</span><b id="input-tokens">—</b></div><div class="stat"><span>本轮输出 Token</span><b id="output-tokens">—</b></div><div class="stat"><span>本轮总 Token</span><b id="total-tokens">—</b></div></div><p class="debug-note" id="usage-note">用量以模型返回的 usage 为准。</p>
+      <p class="debug-note" id="memory-status">提取：未触发</p><p class="debug-note" id="recall-status">召回：等待本轮执行</p><details id="recall-details" hidden><summary>查看本轮召回正文</summary><pre id="recall-content"></pre></details><div class="meta" id="identity">会话身份将在创建后显示</div>
+      <div class="run-state" id="run-state">等待发送</div>
+      <label class="debug-note" for="run-history">调试轮次</label><select id="run-history" aria-label="调试轮次" style="width:100%;margin:6px 0 10px"><option value="">暂无记录</option></select><p class="debug-note" id="trace-note">模型输入和执行事件按 Run 保存；OVContext 展示当前会话。</p>
+      <div class="tabs" role="tablist"><button class="active" data-tab="events">执行事件</button><button data-tab="input">模型输入</button><button data-tab="context">OVContext</button></div>
+      <div class="panel active" id="panel-events"><div id="events"></div></div>
+      <div class="panel" id="panel-input"><div id="model-input" class="native-messages">尚未调用模型</div></div>
+      <div class="panel" id="panel-context"><p class="debug-note">会话元信息</p><pre id="context-meta">尚未读取上下文</pre><p class="debug-note">messages · list[BaseMessage]</p><div id="context" class="native-messages">尚未读取上下文</div></div>
+      <button id="export">导出本轮调试记录 ↓</button>
+    </section>
+  </div>
+  <script>
+    'use strict';
+    const $=id=>document.getElementById(id);
+    let selected=null, submitting=false, busy=false, sessionList=[], controller=null, assistant=null, started=0, firstToken=false, debugEvents=[], lastContext=null, terminal=false, turnOrdinal=0, memoryPollTimer=null, memoryPending=false, traceLoad=0, displayedRun=null, tracePollTimer=null;
+    const json=value=>JSON.stringify(value,null,2);
+    async function api(path,options={}){
+      const response=await fetch(path,{...options,headers:{'Content-Type':'application/json',...options.headers}});
+      if(!response.ok){let data;try{data=await response.json()}catch{data={detail:`HTTP ${response.status}`}}throw new Error(typeof data.detail==='string'?data.detail:json(data.detail))}
+      return response.json();
+    }
+    function notice(text){const node=document.createElement('div');node.className='notice';node.textContent=text;$('messages').append(node);scroll();}
+    function scroll(){$('messages').scrollTop=$('messages').scrollHeight;}
+    function setBusy(value){busy=value;$('run-history').disabled=value;$('send').disabled=value||!!selected?.history_only;$('stop').disabled=!value;$('restore').disabled=value||!selected||!!selected.history_only;$('restore').textContent=(selected?.execution?.mode==='baseline')?'清除 checkpoint':'从 OV 恢复';$('extract-memory').disabled=value||!selected||!!selected.history_only||memoryPending||(selected?.execution?.mode==='baseline');$('new-session').disabled=value;document.querySelectorAll('.session').forEach(node=>node.disabled=value);$('badge').textContent=value?'流式接收中':selected?.history_only?'实验历史 · 只读':'本地调试';}
+    function renderSessions(){
+      $('sessions').replaceChildren();
+      const filter=$('session-filter').value;const query=$('session-search').value.toLowerCase();
+      for(const session of sessionList.filter(s=>[s.title,s.experiment_id,s.user_id,s.session_id].join(' ').toLowerCase().includes(query)).filter(s=>filter==='all'||(filter==='experiment'?(s.environment_id!=='daily'&&s.environment_id!=null)||s.experiment_id:(!s.environment_id||s.environment_id==='daily')&&!s.experiment_id))){const button=document.createElement('button');button.className='session'+(selected?.session_id===session.session_id?' active':'');button.disabled=busy;const title=document.createElement('strong');title.textContent=session.title;const meta=document.createElement('small');meta.textContent=`${session.user_id} / ${session.agent_id} · ${session.execution?.mode||'current'} · ${session.environment_id||'daily'}${session.experiment_id?' / '+session.experiment_id:''}`;button.append(title,meta);button.onclick=()=>selectSession(session);$('sessions').append(button);}
+    }
+    async function loadSessions(){sessionList=await api('/api/sessions');if(selected){selected=sessionList.find(item=>item.session_id===selected.session_id)||selected;$('title').textContent=selected.title;}renderSessions();}
+    function contentText(content){if(typeof content==='string')return content;return (content||[]).map(part=>typeof part==='string'?part:part.text||json(part)).join('\n');}
+    function isReasoningPart(part){return part&&typeof part==='object'&&['reasoning','thinking'].includes(part.type);}
+    function reasoningText(message){
+      const raw=message.additional_kwargs?.reasoning_content;
+      if(typeof raw==='string'&&raw.trim())return raw;
+      return (Array.isArray(message.content)?message.content:[]).filter(isReasoningPart).map(part=>{
+        const text=[part.reasoning,part.thinking,part.text].find(value=>typeof value==='string');
+        return text??(Array.isArray(part.summary)?part.summary.map(item=>typeof item.text==='string'?item.text:'').join('\n'):'');
+      }).filter(text=>text.trim()).join('\n\n');
+    }
+    function toolPreview(text){
+      let preview=text.split('\n',5).slice(0,4).join('\n').slice(0,240);
+      // Avoid cutting a UTF-16 surrogate pair at the preview boundary.
+      if(/[\uD800-\uDBFF]$/.test(preview))preview=preview.slice(0,-1);
+      return preview.length<text.length?preview.trimEnd()+'\n…':text;
+    }
+    function turn(role,text,pending=false){
+      text=String(text??'');const node=document.createElement('div');node.className=`turn ${role}${pending?' pending':''}`;
+      const label=document.createElement('div');label.className='role';const name=document.createElement('span');name.textContent={user:'YOU',assistant:'ASSISTANT',tool:'TOOL'}[role]||role;label.append(name);
+      const body=document.createElement('div');body.className='body';body.id=`turn-body-${++turnOrdinal}`;const preview=role==='tool'?toolPreview(text):text;body.textContent=preview;
+      if(preview!==text){const toggle=document.createElement('button');toggle.type='button';toggle.className='tool-toggle';toggle.textContent='展开全文';toggle.setAttribute('aria-expanded','false');toggle.setAttribute('aria-controls',body.id);toggle.onclick=()=>{const expanded=toggle.getAttribute('aria-expanded')!=='true';toggle.setAttribute('aria-expanded',String(expanded));toggle.textContent=expanded?'收起全文':'展开全文';node.classList.toggle('expanded',expanded);body.textContent=expanded?text:preview;};label.append(toggle);}
+      node.append(label,body);$('messages').append(node);scroll();return node;
+    }
+    function renderToolCalls(node,calls){
+      const group=document.createElement('section');group.className='tool-calls';group.setAttribute('aria-label','工具调用');
+      const heading=document.createElement('div');heading.className='tool-calls-heading';heading.textContent=`工具调用 · ${calls.length}`;group.append(heading);
+      for(const call of calls){
+        const card=document.createElement('article');card.className='tool-call';
+        const header=document.createElement('div');header.className='tool-call-head';
+        const name=document.createElement('strong');name.textContent=call.name||'未命名工具';header.append(name);
+        if(call.id){const id=document.createElement('code');id.className='tool-call-id';id.textContent=call.id;header.append(id);}
+        card.append(header);
+        const args=call.args,fields=args&&typeof args==='object'&&!Array.isArray(args)?Object.entries(args):[['args',args]];
+        const priority={command:0,argv:1};fields.sort((a,b)=>(priority[a[0]]??2)-(priority[b[0]]??2));
+        const list=document.createElement('dl');list.className='call-args';
+        for(const [key,value] of fields){
+          const row=document.createElement('div');row.className='call-arg';
+          const label=document.createElement('dt');label.textContent=key==='command'?'命令 · command':key==='argv'?'命令参数 · argv':key;
+          const cell=document.createElement('dd');const pre=document.createElement('pre');pre.className='call-arg-value';
+          const full=typeof value==='string'?value:json(value)??String(value);let preview=full.split('\n').slice(0,6).join('\n').slice(0,600);
+          if(/[\uD800-\uDBFF]$/.test(preview))preview=preview.slice(0,-1);
+          const clipped=preview.length<full.length;pre.textContent=clipped?preview.trimEnd()+'\n…':full;cell.append(pre);
+          if(clipped){const toggle=document.createElement('button');toggle.type='button';toggle.className='tool-toggle';toggle.textContent='展开完整参数';toggle.setAttribute('aria-expanded','false');pre.id=`call-arg-${++turnOrdinal}`;toggle.setAttribute('aria-controls',pre.id);toggle.onclick=()=>{const expanded=toggle.getAttribute('aria-expanded')!=='true';toggle.setAttribute('aria-expanded',String(expanded));toggle.textContent=expanded?'收起参数':'展开完整参数';pre.textContent=expanded?full:preview.trimEnd()+'\n…';};cell.append(toggle);}
+          row.append(label,cell);list.append(row);
+        }
+        if(!fields.length){const empty=document.createElement('p');empty.className='call-no-args';empty.textContent='无参数';card.append(empty);}else card.append(list);
+        if(call.error){const error=document.createElement('p');error.className='call-error';error.textContent=call.error;card.append(error);}
+        const raw=document.createElement('details');raw.className='call-raw';const summary=document.createElement('summary');summary.textContent='原始调用 JSON';const pre=document.createElement('pre');pre.textContent=json(call);raw.append(summary,pre);card.append(raw);group.append(card);
+      }
+      node.append(group);
+    }
+    function renderChatMessage(message,node=null){
+      if(message.type==='system')return null;
+      const role=message.type==='human'?'user':message.type==='tool'?'tool':'assistant';
+      if(role==='tool')return turn('tool',`${message.name||message.tool_call_id||'工具结果'}\n${contentText(message.content)}`);
+      const content=role==='assistant'&&Array.isArray(message.content)?message.content.filter(part=>!isReasoningPart(part)):message.content;
+      const text=contentText(content),reasoning=role==='assistant'?reasoningText(message):'',calls=[...(message.tool_calls||[]),...(message.invalid_tool_calls||[])];
+      if(!text&&!reasoning&&!calls.length){node?.remove();return null;}
+      node=node||turn(role,text);node.classList.remove('pending');const body=node.querySelector('.body');body.textContent=text;body.hidden=!text;
+      node.querySelector('.reasoning')?.remove();
+      if(reasoning){const details=document.createElement('details');details.className='reasoning';const summary=document.createElement('summary');summary.textContent='Reasoning';const pre=document.createElement('pre');pre.textContent=reasoning;details.append(summary,pre);node.append(details);}
+      node.querySelector('.tool-calls')?.remove();if(calls.length)renderToolCalls(node,calls);scroll();return node;
+    }
+    function showArtifacts(items){for(const item of items){const node=document.createElement('div');node.className='turn';const link=document.createElement('a');const label={presentation:'PPT',document:'Word',spreadsheet:'Excel',pdf:'PDF',data:'数据',text:'文档',image:'图片'}[item.kind]||'文件';link.textContent=`下载 ${label} · ${item.filename}${item.slides==null?'':` (${item.slides} 页)`}`;link.href=item.url;link.download=item.filename;node.append(link);$('messages').append(node);}scroll();}
+    function renderNativeMessages(target,messages=[],reprs=[]){
+      target.replaceChildren();
+      if(!messages.length){const empty=document.createElement('p');empty.className='native-empty';empty.textContent='暂无消息';target.append(empty);return;}
+      const names={system:'SystemMessage',human:'HumanMessage',ai:'AIMessage',tool:'ToolMessage'};
+      messages.forEach((message,index)=>{const card=document.createElement('article');card.className='native-message';card.dataset.type=message.type;const header=document.createElement('header');const title=document.createElement('strong');title.textContent=`#${index+1} · ${names[message.type]||message.type}`;const id=document.createElement('small');id.textContent=`id: ${message.id??'—'}${message.tool_call_id?' · tool_call_id: '+message.tool_call_id:''}`;header.append(title,id);const body=document.createElement('pre');body.textContent=reprs[index]??'消息表示尚未加载';card.append(header,body);target.append(card);});
+    }
+    function showContext(view){lastContext=view;const {messages,message_reprs,...metadata}=view;$('context-meta').textContent=json(metadata);renderNativeMessages($('context'),messages,message_reprs);$('cache-count').textContent=view.cached_message_count;$('write-index').textContent=view.write_index??'—';$('hint').textContent=`${view.source==='checkpoint'?'Checkpoint 缓存':view.source==='ov'?'OV 历史':'新会话'} · Enter 发送`;}
+    function showRunStatistics(stats){
+      $('first-token').textContent=Number.isFinite(stats?.first_token_seconds)?stats.first_token_seconds.toFixed(2):stats?.status==='running'?'等待中':stats?'未产生正文':'—';
+      $('duration').textContent=Number.isFinite(stats?.seconds)?stats.seconds.toFixed(2):stats?.status==='running'?'执行中':'—';
+      for(const field of ['input','output','total'])$(''+field+'-tokens').textContent=Number.isFinite(stats?.[field+'_tokens'])?stats[field+'_tokens'].toLocaleString():'未提供';
+      $('usage-note').textContent=!stats?'历史记录未保存耗时和 Token 用量；新执行会自动记录。':`本轮累计，含工具循环；${stats.usage_calls}/${stats.model_calls} 次模型请求返回用量。${stats.usage_calls<stats.model_calls?'当前为已知部分。':''}`;
+      $('run-state').textContent=!stats?'等待发送':({done:selected?.execution?.mode==='baseline'?'已完成 · checkpoint 已保存（未使用 OV）':'已完成 · 会话状态已保存',error:'执行失败 · 已保留运行统计',cancelled:'已停止 · 已保留运行统计',interrupted:'上次执行被中断 · 耗时未完整记录'}[stats.status]||`Run ${stats.run_id}`);
+    }
+    function showMemoryStatus(status){
+      memoryPending=['pending','running','unknown'].includes(status.status);
+      const count=Object.values(status.memories_extracted||{}).reduce((sum,n)=>sum+n,0);
+      const labels={idle:'未触发或无可归档消息',pending:'已提交，等待提取',running:'提取中',completed:`已完成 · 本次生成 ${count} 条记忆`,failed:'提取失败 · 请检查 OV 任务',unknown:'结果未知 · 请检查 OV 任务，勿重复提交'};
+      $('memory-status').textContent='提取：'+(labels[status.status]||status.status)+(status.stage?' · '+status.stage:'');
+      $('extract-memory').disabled=busy||!selected||memoryPending;
+    }
+    async function pollMemory(sessionId){if((selected?.execution?.mode==='baseline')){memoryPending=false;$('extract-memory').disabled=true;$('memory-status').textContent='此配置不使用本版本的记忆提取';return;}
+      clearTimeout(memoryPollTimer);
+      try{const status=await api(`/api/sessions/${sessionId}/memory`);if(selected?.session_id!==sessionId)return;showMemoryStatus(status);if(['pending','running'].includes(status.status))memoryPollTimer=setTimeout(()=>pollMemory(sessionId),2000);}
+      catch(error){if(selected?.session_id===sessionId)$('memory-status').textContent='提取状态读取失败：'+error.message;}
+    }
+    function showRecall(data){
+      const user=(data.messages||[]).find(message=>message.type==='human'&&message.additional_kwargs?.ov_context_injected);
+      if(!user)return;
+      const text=contentText(user.content);const end=text.indexOf('[用户原文]');
+      $('recall-content').textContent=end<0?text:text.slice(0,end).trim();$('recall-details').hidden=false;
+    }
+    async function selectSession(session){
+      if(busy)return;clearTimeout(memoryPollTimer);memoryPending=false;selected=session;$('environment-id').value=session.environment_id||'daily';$('experiment-id').value=session.experiment_id||'';const execution=session.execution||{mode:'current'};$('execution-mode').value=execution.mode;restoreCommitSettings(execution);for(const [element,key] of [['profile-context-window','context_window'],['profile-base-ratio','base_context_ratio'],['profile-capacity-ratio','capacity_ratio']])$(element).value=execution[key]??'';$('ordinary-uris').value=(execution.target_uris||[]).join('\n');$('experience-uris').value=(execution.experience_target_uris||[]).join('\n');$('memory-budget').value=execution.memory_budget_chars??'';$('profile-prompt').value=execution.system_prompt||'';$('profile-max-tokens').value=execution.max_tokens??'';$('profile-recursion').value=execution.recursion_limit??'';$('profile-timeout').value=execution.timeout_seconds??'';$('profile-thinking').value=execution.thinking==null?'':execution.thinking?'enabled':'disabled';$('profile-todos').value=execution.enable_todos==null?'':execution.enable_todos?'enabled':'disabled';const savedPlanning=session.config_snapshot?.execution?.profile;if(savedPlanning)$('profile-todos').options[0].textContent='沿用会话：'+((savedPlanning.enable_todos??true)?'开启':'关闭');clearTimeout(tracePollTimer);clearDebug();$('run-history').replaceChildren(new Option('加载中…',''));traceLoad++;$('recall-status').textContent='召回：加载本轮调试记录…';$('recall-details').hidden=true;pollMemory(session.session_id);showRunStatistics(session.last_run);localStorage.setItem('ov-chat-session',session.session_id);$('title').textContent=session.title;$('session-meta').textContent=session.session_id;$('identity').textContent=`environment: ${session.environment_id||'daily'}\nexperiment: ${session.experiment_id||'—'}\naccount: ${session.account_id}\nuser: ${session.user_id}\nagent: ${session.agent_id}\nmode: ${session.execution?.mode||'current'}`;$('identity').style.whiteSpace='pre-wrap';setBusy(false);renderSessions();
+      const detail=await api(`/api/sessions/${session.session_id}`);if(selected.session_id!==session.session_id)return;selected=detail.session;showRunStatistics(selected.last_run);showContext(detail.context);$('messages').replaceChildren();for(const message of detail.context.messages)renderChatMessage(message);showArtifacts(await api(`/api/sessions/${session.session_id}/artifacts`));if(selected.needs_restore)notice('上次执行未完成，请先从 OV 恢复或新建会话。');await loadDebug(session.session_id);scroll();
+    }
+    function executionProfile(){
+      const profile={mode:$('execution-mode').value};
+      for(const [element,key] of [['ordinary-uris','target_uris'],['experience-uris','experience_target_uris']]){
+        if($(element).value.trim())profile[key]=$(element).value.split('\n').map(s=>s.trim()).filter(Boolean);
+      }
+      if($('memory-budget').value!=='')profile.memory_budget_chars=Number($('memory-budget').value);
+      for(const [element,key] of [['profile-context-window','context_window'],['profile-base-ratio','base_context_ratio'],['profile-capacity-ratio','capacity_ratio']]){
+        if($(element).value!=='')profile[key]=Number($(element).value);
+      }
+      for(const [element,key] of [['profile-max-tokens','max_tokens'],['profile-recursion','recursion_limit'],['profile-timeout','timeout_seconds']]){
+        if($(element).value!=='')profile[key]=Number($(element).value);
+      }
+      if($('profile-thinking').value!=='')profile.thinking=$('profile-thinking').value==='enabled';
+      if($('profile-todos').value!=='')profile.enable_todos=$('profile-todos').value==='enabled';
+      if($('profile-prompt').value.trim())profile.system_prompt=$('profile-prompt').value.trim();
+      if(profile.mode==='current'){
+        const commit={};for(const [element,key] of commitFields()){if($(element).value!=='')commit[key]=Number($(element).value);}
+        if(Object.keys(commit).length)profile.commit=commit;
+      }
+      return profile;
+    }
+    function commitFields(){return [['commit-token-budget','token_budget'],['commit-ratio','commit_token_threshold_ratio'],['commit-run-threshold','completed_run_threshold'],['commit-keep-recent','keep_recent_count']];}
+    function syncCommitControls(){$('commit-settings').disabled=$('execution-mode').value!=='current';}
+    function restoreCommitSettings(execution){for(const [element,key] of commitFields())$(element).value=execution.commit?.[key]??'';syncCommitControls();}
+    async function createSession(){const session=await api('/api/sessions',{method:'POST',body:JSON.stringify({environment_id:$('environment-id').value,experiment_id:$('experiment-id').value||null,user_id:$('user-id').value,agent_id:$('agent-id').value,execution:executionProfile()})});await loadSessions();await selectSession(session);return session;}
+    function logEvent(type,data,elapsed_ms=Math.round(performance.now()-started)){if(type==='token')return;debugEvents.push({event:type,data,elapsed_ms});const row=document.createElement('div');row.className='event';const title=document.createElement('strong');title.textContent=type==='stage'?data.name:type;row.append(title);if(type==='stage'&&data.duration_ms!=null){const time=document.createElement('span');time.textContent=`${data.duration_ms.toFixed(1)} ms`;row.append(time)}else{const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=type==='model_input'?`${data.messages.length} 条实际模型输入`:'查看数据';const pre=document.createElement('pre');pre.textContent=json(data);details.append(summary,pre);row.append(details)}$('events').append(row);}
+    function clearDebug(){
+      displayedRun=null;debugEvents=[];$('events').replaceChildren();renderNativeMessages($('model-input'));
+      $('recall-status').textContent='召回：本轮尚无查询记录';$('recall-details').hidden=true;$('recall-content').textContent='';
+    }
+    function showRecallStatus(data){
+      if(data.name==='memory.recall')$('recall-status').textContent=`召回：${({success:'命中',empty:'无匹配记忆',timeout:'超时',error:'查询失败'}[data.status]||data.status)} · ${data.count??0} 条`;
+    }
+    async function loadDebug(sessionId,runId=null){
+      if(selected?.session_id!==sessionId)return;
+      const revision=++traceLoad;clearTimeout(tracePollTimer);clearDebug();$('trace-note').textContent='加载调试记录…';
+      try{
+      const runs=await api(`/api/sessions/${sessionId}/runs`);
+      if(selected?.session_id!==sessionId||revision!==traceLoad)return;
+      const chosen=runId||runs[0]?.run_id;
+      $('run-history').replaceChildren();
+      for(const run of runs){const option=new Option(`${new Date(run.created_at*1000).toLocaleString()} · ${run.statistics.status} · ${run.prompt.slice(0,24)}`,run.run_id);$('run-history').append(option);}
+      if(!chosen){clearDebug();$('run-history').append(new Option('暂无记录',''));$('trace-note').textContent='本会话没有已保存的调试记录；新执行会自动保存。';return;}
+      $('run-history').value=chosen;
+      const trace=await api(`/api/sessions/${sessionId}/runs/${encodeURIComponent(chosen)}`);
+      if(selected?.session_id!==sessionId||revision!==traceLoad)return;
+      clearDebug();displayedRun=trace.run_id;showRunStatistics(trace.statistics);
+      for(const item of trace.events){logEvent(item.event,item.data,item.elapsed_ms);if(item.event==='stage')showRecallStatus(item.data);if(item.event==='model_input'){showRecall(item.data);renderNativeMessages($('model-input'),item.data.messages,item.data.message_reprs);}}
+      if(!trace.events.length)$('events').textContent='本轮尚未产生执行事件。';
+      $('trace-note').textContent=`已保存 Run ${trace.run_id} · ${trace.events.length} 个事件；模型输入展示本轮最后一次调用，其余调用见执行事件。OVContext 为当前会话。`;
+      if(trace.statistics.status==='running')tracePollTimer=setTimeout(()=>{if(!busy&&selected?.session_id===sessionId)loadDebug(sessionId,chosen);},2000);
+      }catch(error){if(selected?.session_id===sessionId&&revision===traceLoad){clearDebug();$('trace-note').textContent='调试记录读取失败：'+error.message;}}
+    }
+    $('run-history').onchange=()=>{if(selected&&!busy)loadDebug(selected.session_id,$('run-history').value).catch(error=>{clearDebug();$('trace-note').textContent=error.message;});};
+    function accept(type,data){
+      logEvent(type,data);
+      if(type==='start'){displayedRun=data.run_id;$('run-history').replaceChildren(new Option('本轮执行中',data.run_id));$('trace-note').textContent='实时事件正在保存；OVContext 展示当前会话。';$('recall-status').textContent='召回：等待查询';$('recall-details').hidden=true;showRunStatistics(data.statistics);$('run-state').textContent=`Run ${data.run_id}`;}
+      if(type==='statistics'){showRunStatistics(data.statistics);}
+      if(type==='stage'){showRecallStatus(data);if(data.name==='artifacts.published'&&selected){api(`/api/sessions/${selected.session_id}/artifacts`).then(showArtifacts).catch(error=>notice(error.message));}}
+      if(type==='model_input'){showRecall(data);renderNativeMessages($('model-input'),data.messages,data.message_reprs);}
+      if(type==='token'){if(!firstToken){firstToken=true;$('first-token').textContent=(Number.isFinite(data.first_token_seconds)?data.first_token_seconds:(performance.now()-started)/1000).toFixed(2)}if(!assistant)assistant=turn('assistant','',true);assistant.querySelector('.body').textContent+=data.text;scroll();}
+      if(type==='message'){const message=data.message;if(message.type==='tool'){assistant?.classList.remove('pending');assistant=null;renderChatMessage(message);}else if(message.type==='ai'){renderChatMessage(message,assistant);assistant=null;}}
+      if(type==='done'){terminal=true;if(data.statistics)showRunStatistics(data.statistics);showContext(data.context);showArtifacts(data.artifacts||[]);$('duration').textContent=data.seconds.toFixed(2);$('run-state').textContent=selected?.execution?.mode==='baseline'?'已完成 · checkpoint 已保存（未使用 OV）':'已完成 · 会话状态已保存';}
+      if(type==='error'||type==='cancelled'){terminal=true;if(data.statistics)showRunStatistics(data.statistics);notice(data.message);$('run-state').textContent=type==='cancelled'?'已停止':'执行失败';}
+    }
+    // UTF-8 is decoded across network chunks; SSE frames may split at any byte.
+    async function readStream(response){
+      const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
+      try{while(true){const {value,done}=await reader.read();buffer+=decoder.decode(value,{stream:!done});let boundary;while((boundary=buffer.indexOf('\n\n'))!==-1){const frame=buffer.slice(0,boundary).replace(/\r/g,'');buffer=buffer.slice(boundary+2);let type='message';const lines=[];for(const line of frame.split('\n')){if(line.startsWith('event:'))type=line.slice(6).trim();if(line.startsWith('data:'))lines.push(line.slice(5).trimStart())}if(lines.length)accept(type,JSON.parse(lines.join('\n')));}if(done)break;}if(!terminal)throw new Error('连接提前结束，回复可能未完整写入。请从 OV 恢复后检查。');}finally{reader.releaseLock();}
+    }
+    async function send(event){event?.preventDefault();if(busy||submitting||selected?.history_only)return;const text=$('prompt').value.trim();if(!text)return;submitting=true;
+      try{if(!selected)await createSession();setBusy(true);turn('user',text);$('prompt').value='';assistant=null;terminal=false;traceLoad++;clearTimeout(tracePollTimer);clearDebug();firstToken=false;started=performance.now();controller=new AbortController();
+        const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:selected.session_id,message:text}),signal:controller.signal});if(!response.ok){const data=await response.json();throw new Error(data.detail||`HTTP ${response.status}`)}await readStream(response);
+      }catch(error){notice(error.name==='AbortError'?'连接已断开，请检查会话状态。':error.message);$('run-state').textContent='未完成';}
+      finally{assistant?.classList.remove('pending');assistant=null;controller=null;submitting=false;setBusy(false);await loadSessions().catch(error=>notice(error.message));if(selected){await loadDebug(selected.session_id).catch(error=>{$('trace-note').textContent='调试记录读取失败：'+error.message;});pollMemory(selected.session_id);}}
+    }
+    $('execution-mode').onchange=syncCommitControls;
+    $('session-search').oninput=renderSessions;
+    $('session-filter').onchange=renderSessions;
+    $('environment-id').onchange=async()=>{try{const defaults=await api('/api/execution-profiles?environment_id='+encodeURIComponent($('environment-id').value));$('profile-todos').options[0].textContent='继承环境：'+(defaults.agent_defaults.enable_todos?'开启':'关闭');for(const [element,key] of commitFields())$(element).placeholder='继承环境：'+defaults.commit_defaults[key];for(const [element,key] of [['profile-base-ratio','base_context_ratio'],['profile-capacity-ratio','capacity_ratio']])$(element).placeholder='继承环境：'+defaults.context_defaults[key];}catch(error){notice(error.message)}};
+    $('create-form').onsubmit=event=>{event.preventDefault();createSession().catch(error=>notice(error.message))};$('chat-form').onsubmit=send;
+    $('prompt').onkeydown=event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();send()}};
+    $('extract-memory').onclick=async()=>{if(!selected||busy||memoryPending)return;const sessionId=selected.session_id;setBusy(true);$('stop').disabled=true;try{showMemoryStatus(await api(`/api/sessions/${sessionId}/memory`,{method:'POST'}));}catch(error){notice(error.message)}finally{setBusy(false);pollMemory(sessionId);}};
+    $('stop').onclick=async()=>{if(!selected)return;$('stop').disabled=true;try{await api(`/api/sessions/${selected.session_id}/cancel`,{method:'POST'})}catch(error){notice(error.message)}};
+    $('restore').onclick=async()=>{if(!selected||busy)return;setBusy(true);try{const detail=await api(`/api/sessions/${selected.session_id}/restore`,{method:'POST'});setBusy(false);await selectSession(detail.session);$('run-state').textContent=(selected?.execution?.mode==='baseline')?'已清除 checkpoint':'已清除 checkpoint · 下一轮从 OV 加载';}catch(error){notice(error.message)}finally{setBusy(false)}};
+    document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-tab],.panel').forEach(node=>node.classList.remove('active'));button.classList.add('active');$('panel-'+button.dataset.tab).classList.add('active')});
+    $('export').onclick=()=>{const blob=new Blob([json({session:selected,context:lastContext,run_id:displayedRun,events:debugEvents})],{type:'application/json'});const url=URL.createObjectURL(blob),anchor=document.createElement('a');anchor.href=url;anchor.download=`ov-chat-${selected?.session_id||'debug'}.json`;anchor.click();URL.revokeObjectURL(url)};
+    async function init(){try{const environments=await api('/api/environments');$('environment-id').replaceChildren(...environments.map(e=>new Option(e.label,e.id)));const health=await api('/api/health');const defaults=await api('/api/execution-profiles?environment_id='+encodeURIComponent($('environment-id').value));$('profile-todos').options[0].textContent='继承服务：'+(defaults.agent_defaults.enable_todos?'开启':'关闭');for(const [element,key] of commitFields())$(element).placeholder='继承服务：'+defaults.commit_defaults[key];for(const [element,key] of [['profile-base-ratio','base_context_ratio'],['profile-capacity-ratio','capacity_ratio']])$(element).placeholder='继承服务：'+defaults.context_defaults[key];$('health-dot').classList.add('ready');$('health').textContent=`OV 已连接 · ${health.model} · Thinking ${health.thinking?'ON':'OFF'}`;await loadSessions();const saved=localStorage.getItem('ov-chat-session');const session=sessionList.find(item=>item.session_id===saved);if(session)await selectSession(session);}catch(error){$('health').textContent=error.message;notice(error.message)}}init();
+  </script>
+</body>
+</html>
