@@ -69,13 +69,28 @@ def _message_budget(
     message: dict[str, Any], reasoning_costs: Mapping[str, int], tokens_per_image: int = 1024
 ) -> int:
     if not _text_only(message):
-        # Unknown provider fields and media retain a conservative wire fallback.
         content = message.get("content") if isinstance(message, dict) else None
-        images = sum(
-            isinstance(block, dict) and block.get("type") in {"image_url", "image", "input_image"}
-            for block in (content if isinstance(content, list) else [])
-        )
-        return len(_encode(message).encode("utf-8")) + max(1, images) * tokens_per_image
+        if isinstance(content, list):
+            text_blocks = [
+                block
+                for block in content
+                if not (
+                    isinstance(block, dict)
+                    and block.get("type") in {"image_url", "image", "input_image"}
+                )
+            ]
+            image_count = len(content) - len(text_blocks)
+            if image_count:
+                # Base64/URL bytes carry an image, not text presented to the
+                # model. Price known image blocks by the image allowance while
+                # preserving text, framing and reasoning accounting.
+                visible = {**message, "content": text_blocks}
+                return (
+                    _message_budget(visible, reasoning_costs, tokens_per_image)
+                    + image_count * tokens_per_image
+                )
+        # Unknown provider fields and other media keep the wire fallback.
+        return len(_encode(message).encode("utf-8")) + tokens_per_image
     visible = dict(message)
     encrypted = visible.pop("encrypted_content", None)
     reasoning = visible.pop("reasoning_content", None)

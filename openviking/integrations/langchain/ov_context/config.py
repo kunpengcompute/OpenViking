@@ -25,8 +25,11 @@ class OVContextConfig:
     tool_results: bool = True
     summary_check_interval: int = 2
     poll_max_interval: float = 2.0
+    batch_tool_messages: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.batch_tool_messages) is not bool:
+            raise ValueError("batch_tool_messages must be a boolean")
         if type(self.summary_check_interval) is not int or self.summary_check_interval < 1:
             raise ValueError("summary_check_interval must be a positive integer")
         if self.context_failure not in ("raise", "host"):

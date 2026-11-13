@@ -8,9 +8,12 @@ The objects in this package depend on optional framework packages. Importing
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any
 
 __all__ = [
+    "CommitConfig",
+    "CommitResult",
     "InMemoryOpenVikingClient",
     "OpenVikingChatMessageHistory",
     "OpenVikingCommitPolicy",
@@ -19,11 +22,15 @@ __all__ = [
     "OpenVikingSessionContextAssembler",
     "OpenVikingStore",
     "create_openviking_tools",
+    "load_commit_config",
     "with_openviking_context",
 ]
 
 
 def __getattr__(name: str) -> Any:
+    if name in {"CommitConfig", "CommitResult", "load_commit_config"}:
+        module = import_module(".ov_context.commit", __name__)
+        return getattr(module, name)
     if name == "OpenVikingRetriever":
         from openviking.integrations.langchain.retrievers import OpenVikingRetriever
 
@@ -45,7 +52,7 @@ def __getattr__(name: str) -> Any:
 
         return OpenVikingSessionContextAssembler
     if name == "OpenVikingCommitPolicy":
-        from openviking.integrations.langchain.client import OpenVikingCommitPolicy
+        from openviking.integrations.langchain.ov_context.commit import OpenVikingCommitPolicy
 
         return OpenVikingCommitPolicy
     if name == "with_openviking_context":

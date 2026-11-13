@@ -8,7 +8,7 @@ from typing import Annotated, Any, Callable, Protocol
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import BaseTool, ToolException
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from pydantic.v1 import ValidationError as V1ValidationError
 
 from .identity import RunIdentity
@@ -26,6 +26,24 @@ class ToolResultAccess(Protocol):
 SearchQuery = Annotated[
     str, Field(min_length=1, max_length=MAX_QUERY_CHARS, pattern=r"\S", strict=True)
 ]
+
+
+# Validation schemas are process-wide; tool closures remain bound to each Run.
+# ToolRuntime is injected from the coroutine signature by LangGraph.
+class _ReadArguments(BaseModel):
+    ref: str
+    offset: Annotated[int, Field(ge=0, strict=True)] = 0
+    limit: Annotated[int, Field(ge=1, le=20_000, strict=True)] = 20_000
+
+
+class _SearchArguments(BaseModel):
+    ref: str
+    queries: Annotated[list[SearchQuery], Field(min_length=1, max_length=MAX_QUERIES, strict=True)]
+    limit: Annotated[int, Field(ge=1, le=MAX_MATCHES, strict=True)] = MAX_MATCHES
+
+
+class _ListArguments(BaseModel):
+    limit: Annotated[int, Field(ge=1, le=50, strict=True)] = 50
 
 
 def _validation_error(error: ValidationError | V1ValidationError) -> str:
@@ -49,15 +67,21 @@ def make_session_tools(
         return identity
 
     def result_id(ref: str, sid: str) -> str:
+        if not ref.startswith("viking://"):
+            raise ToolException(
+                "Invalid ref: expected an OV tool-result reference, not a local path or URL. "
+                "Use the file-reading tool for local files, or call "
+                "openviking_tool_result_list to obtain this session's references."
+            )
         prefix = f"/sessions/{sid}/tool-results/"
-        if not ref.startswith("viking://") or prefix not in ref:
+        if prefix not in ref:
             raise ValueError("Tool result reference belongs to a different session")
         tail = ref.split(prefix, 1)[1]
         if not tail or "/" in tail or "\\" in tail or tail in (".", ".."):
             raise ValueError("Invalid tool result reference")
         return tail
 
-    @tool
+    @tool(args_schema=_ReadArguments)
     async def openviking_tool_result_read(
         ref: str,
         runtime: ToolRuntime,
@@ -85,7 +109,7 @@ def make_session_tools(
                 "Call openviking_tool_result_list to see this session's references."
             ) from exc
 
-    @tool
+    @tool(args_schema=_SearchArguments)
     async def openviking_tool_result_search_many(
         ref: str,
         queries: Annotated[
@@ -126,7 +150,7 @@ def make_session_tools(
                 "Call openviking_tool_result_list to see this session's references."
             ) from exc
 
-    @tool
+    @tool(args_schema=_ListArguments)
     async def openviking_tool_result_list(
         runtime: ToolRuntime, limit: Annotated[int, Field(ge=1, le=50, strict=True)] = 50
     ) -> dict[str, Any]:
@@ -145,7 +169,7 @@ def make_session_tools(
         openviking_tool_result_list,
     ]
     for session_tool in tools:
-        # Argument validation and a reference to a missing tool result are recoverable;
+        # Argument validation, non-OV refs and missing tool results are recoverable;
         # identity and other SDK failures retain their existing handling.
         session_tool.handle_validation_error = _validation_error
         session_tool.handle_tool_error = True

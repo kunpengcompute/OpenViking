@@ -59,10 +59,6 @@ class OVSessionClient(Protocol):
 
     async def get_task(self, task_id: str, *, identity: OVIdentity) -> Mapping[str, Any] | None: ...
 
-    async def list_tasks(
-        self, *, task_type: str, resource_id: str, status: str, limit: int, identity: OVIdentity
-    ) -> list[dict[str, Any]]: ...
-
 
 class AsyncClientHandle:
     """Initialize owned SDKs; borrow application-initialized SDKs without mutation."""
