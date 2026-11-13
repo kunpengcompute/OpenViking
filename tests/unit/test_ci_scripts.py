@@ -129,3 +129,27 @@ def test_root_entrypoints_resolve_source_and_sibling_build(ci_env, tmp_path, scr
     )
     assert result.returncode == 17, result.stdout + result.stderr
     assert "退出码 17" in result.stdout
+
+
+def test_unit_extra_covers_component_imports_when_build_sync_is_skipped():
+    import tomllib
+    from packaging.requirements import Requirement
+
+    extras = tomllib.loads((SCRIPTS / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    pending, visited, names = ["test"], set(), set()
+    while pending:
+        extra = pending.pop()
+        if extra in visited:
+            continue
+        visited.add(extra)
+        for value in extras[extra]:
+            requirement = Requirement(value)
+            if requirement.marker and not requirement.marker.evaluate():
+                continue
+            if requirement.name == "openviking":
+                pending.extend(requirement.extras)
+            else:
+                names.add(requirement.name)
+    assert {"deepagents", "langchain-openai", "langgraph-checkpoint-sqlite"}.issubset(names)

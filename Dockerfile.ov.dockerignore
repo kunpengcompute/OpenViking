@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+.git
+.venv
+**/__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.*
+/ov.conf
+/ov.conf.*
+/data/
+/logs/
+/workspace/
+/build/
+/dist/
+/target/

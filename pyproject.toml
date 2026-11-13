@@ -32,6 +32,7 @@ classifiers = [
 dependencies = [
     "pydantic>=2.0.0",
     "typing-extensions>=4.5.0",
+    "tomli>=2.0.0; python_version < '3.11'",
     "pyyaml>=6.0",
     "httpx>=0.25.0",
     "pdfplumber>=0.10.0",
@@ -51,7 +52,7 @@ dependencies = [
     "volcengine-python-sdk[ark]>=5.0.3",
     "fastapi>=0.128.0",
     "uvicorn>=0.39.0",
-    "xxhash>=3.0.0",
+    "xxhash>=3.0.0,<4",
     "jinja2>=3.1.6",
     "tabulate>=0.9.0",
     "urllib3>=2.7.0",
@@ -81,13 +82,14 @@ dependencies = [
     "cryptography>=42.0.0",
     "argon2-cffi>=23.0.0",
     "lark-oapi>=1.5.3",
-    "mcp>=1.27.0",
+    "mcp>=1.27.0,<2",
     "pathspec>=1.1.1",
 ]
 
 
 [project.optional-dependencies]
 test = [
+    "openviking[deepagents,benchmark]; python_version >= '3.11'",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-xdist>=3.5.0",
@@ -155,7 +157,7 @@ bot = [
     "tavily-python>=0.5.0",
     "gradio>=6.6.0",
     "py-machineid>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
 ]
 # vikingbot optional features
 bot-langfuse = ["langfuse>=3.0.0"]
@@ -186,9 +188,16 @@ langchain = [
     "langchain-core>=1.0.0,<2.0.0",
 ]
 langgraph = [
-    "langchain>=1.0.0,<2.0.0",
-    "langchain-core>=1.0.0,<2.0.0",
-    "langgraph>=1.0.0,<2.0.0",
+    "langchain>=1.3.14,<2.0.0",
+    "langchain-core>=1.6.0,<2.0.0",
+    "langgraph>=1.2.10,<2.0.0",
+]
+deepagents = [
+    "langgraph-checkpoint-sqlite>=3.0.1,<4.0.0",
+    "deepagents==0.7.3; python_version >= '3.11' and python_version < '4'",
+    "langchain>=1.3.14,<2.0.0",
+    "langchain-core>=1.6.0,<2.0.0",
+    "langgraph>=1.2.10,<2.0.0",
 ]
 local-embed = [
     "llama-cpp-python>=0.3.0",
@@ -246,6 +255,16 @@ no_implicit_optional = false
 warn_redundant_casts = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "openviking.integrations.langchain.ov_context.*",
+    "openviking.integrations.langchain.middleware",
+    "examples.deepagents_ov_context.*",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
