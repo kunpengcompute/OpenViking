@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "openviking_version": "0.4.1",
+  "base_repository": "https://github.com/volcengine/OpenViking.git",
+  "base_tag": "v0.4.1",
+  "base_ref": "740b7fcbe7890f442fa8b7ad775d74ae1bc6b084",
+  "development_branch": "dev_0.4.1",
+  "status": "release",
+  "groups": [
+    {
+      "name": "context-integration",
+      "output": "feature/0001-openviking-context-integration.patch",
+      "description": "OpenViking context integration changes against the pinned upstream release",
+      "patterns": [
+        "openviking/*",
+        "openviking_cli/*",
+        "src/*",
+        "crates/ragfs/*",
+        "Cargo.toml",
+        "Cargo.lock",
+        "MANIFEST.in",
+        "setup.py",
+        "pyproject.toml",
+        "uv.lock",
+        "Dockerfile.ov",
+        "Dockerfile.ov.dockerignore"
+      ],
+      "exclude": []
+    }
+  ],
+  "profiles": {
+    "full-default": [
+      "context-integration"
+    ]
+  },
+  "excluded_paths": [
+    "examples/*",
+    "benchmark/*",
+    "tests/*",
+    "docs/*",
+    ".pre-commit-config.yaml",
+    "build_ci.sh",
+    "ut_ci.sh"
+  ],
+  "source_commit": "e526e3fb35bbaba89c6e51e703d674da9c3c8ec4",
+  "development_tree": "8994386a9bce3a01bd43638cfd894216e5854f76",
+  "source_tree": "3cef47b538f7bec176dbeb85a0833c7e5c21f4df"
+}

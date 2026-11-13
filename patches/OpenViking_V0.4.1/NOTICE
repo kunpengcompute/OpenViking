@@ -1,0 +1,8 @@
+OpenViking
+Upstream: https://github.com/volcengine/OpenViking
+License: GNU Affero General Public License, version 3 (AGPL-3.0)
+
+This repository contains OpenViking documentation and patch delivery tooling.
+Original copyright and license notices remain applicable to upstream code and patches.
+The repository layout and patch delivery workflow follow boostkit/tensorflow:
+https://gitcode.com/boostkit/tensorflow

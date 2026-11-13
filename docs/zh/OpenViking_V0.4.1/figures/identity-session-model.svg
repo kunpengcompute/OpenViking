@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="880" viewBox="0 0 1200 880" role="img" aria-labelledby="title desc">
+  <title id="title">身份会话模型：访问身份、Session 与 Run</title>
+  <desc id="desc">account、user、actor peer 共同确定访问身份，与 session_id 组合为身份标识，用于 OV SDK 的会话访问。每个 Session 固定绑定创建时的访问身份，包含多个连续 Run；本次执行由 run_id 标识，重试沿用同一标识。</desc>
+  <defs>
+    <marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#416c9b"/></marker>
+    <marker id="green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#458671"/></marker>
+  </defs>
+  <style>
+    text {font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;fill:#20364b}
+    .title {font-size:28px;font-weight:650}
+    .name {font-size:23px;font-weight:650}
+    .body {font-size:19px;fill:#435a6c}
+    .small {font-size:17px;fill:#607689}
+    .code {font-family:'SFMono-Regular',Menlo,Consolas,monospace;font-size:19px;fill:#245778}
+    .flow {fill:none;stroke:#416c9b;stroke-width:2;marker-end:url(#blue)}
+    .bus {fill:none;stroke:#416c9b;stroke-width:2}
+    .session {fill:none;stroke:#458671;stroke-width:2;marker-end:url(#green)}
+  </style>
+  <rect width="1200" height="880" fill="white"/>
+  <text x="40" y="52" class="title">身份会话模型</text>
+  <text x="40" y="86" class="small">访问身份确定数据范围，Session 承载持续对话，Run 标识其中一次执行。</text>
+
+  <rect x="40" y="118" width="1120" height="194" rx="14" fill="#f6f9fd" stroke="#bac8d5"/>
+  <text x="64" y="156" class="name">访问身份</text>
+  <rect x="64" y="180" width="328" height="106" rx="10" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="88" y="220" class="name">account</text>
+  <text x="88" y="258" class="body">业务数据空间</text>
+  <rect x="436" y="180" width="328" height="106" rx="10" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="460" y="220" class="name">user</text>
+  <text x="460" y="258" class="body">当前访问者</text>
+  <rect x="808" y="180" width="328" height="106" rx="10" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="832" y="220" class="name">actor peer</text>
+  <text x="832" y="258" class="body">调用 OV 的 Agent</text>
+  <path d="M228 286 V350 H600 M972 286 V350 H600 M600 286 V350" class="bus"/>
+  <path d="M600 350 V386 H410 V424" class="flow"/>
+  <text x="622" y="373" class="small">与 session_id 组合</text>
+
+  <rect x="40" y="424" width="740" height="130" rx="12" fill="#edf4ff" stroke="#9bb6d5"/>
+  <text x="64" y="463" class="name">身份标识</text>
+  <text x="64" y="500" class="code">account + user + actor peer + session_id</text>
+  <text x="64" y="532" class="small">定位本次访问的 OV 会话</text>
+  <rect x="850" y="424" width="310" height="130" rx="12" fill="#edf7f4" stroke="#9fcdbf"/>
+  <text x="874" y="463" class="name">OV Session</text>
+  <text x="874" y="500" class="code">session_id</text>
+  <text x="874" y="532" class="small">持续保存的对话</text>
+  <path d="M850 489 H782" class="session"/>
+
+  <path d="M410 554 V674" class="flow"/>
+  <text x="430" y="620" class="small">identity + session_id</text>
+  <rect x="40" y="674" width="740" height="124" rx="12" fill="#f6f9fd" stroke="#bac8d5"/>
+  <text x="64" y="716" class="name">OV SDK 会话访问</text>
+  <text x="64" y="758" class="body">按身份标识读取、写入消息、工具原文及归档</text>
+
+  <path d="M1005 554 V674" class="session"/>
+  <text x="1025" y="610" class="small">包含多轮</text>
+  <text x="1025" y="637" class="small">连续执行</text>
+  <rect x="850" y="674" width="310" height="124" rx="12" fill="#edf7f4" stroke="#9fcdbf"/>
+  <text x="874" y="712" class="name">Run</text>
+  <text x="874" y="746" class="code">run_id</text>
+  <text x="874" y="778" class="small">本次执行，重试沿用同一标识</text>
+
+  <text x="40" y="851" class="body">每个 Session 固定绑定创建时的访问身份；同一身份组合可以创建多个独立 Session。</text>
+</svg>

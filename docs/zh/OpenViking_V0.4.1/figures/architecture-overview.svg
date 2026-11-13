@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1720" viewBox="0 0 1600 1720" role="img" aria-labelledby="title desc">
+<title id="title">DeepAgents 与 OpenViking 上下文管理逻辑架构</title>
+<desc id="desc">DeepAgents 通过五个异步 Hook 接入 OpenVikingContextMiddleware。SessionEngine 协调 OVMessageWriter、OVContextReader、OpenVikingCommitPolicy 和 ContextAssembler，共同使用 Session 级 OVContext；图状态同时保存原始消息和 ov_context，并由 checkpointer 持久化。组装器保留本次请求的系统提示、Skill 索引和工具定义；容量压缩经过提交、等待归档、读取、候选校验和重新计数。AsyncHTTPClient 通过请求级 OVIdentity 访问 OV；空闲提交由 OV 服务端调度。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#356a9a"/></marker>
+<marker id="green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#278270"/></marker>
+</defs>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;fill:#20364b}
+.title{font-size:32px;font-weight:650}.layer{font-size:25px;font-weight:650}.name{font-size:23px;font-weight:650}.body{font-size:20px}.small{font-size:18px;fill:#536a7e}.code{font-family:Menlo,Consolas,'PingFang SC',monospace;font-size:19px}.accent{fill:#14705c;font-weight:650}
+.call{fill:none;stroke:#356a9a;stroke-width:2;marker-end:url(#arrow)}
+.data{fill:none;stroke:#278270;stroke-width:2;stroke-dasharray:6 4;marker-end:url(#green)}
+</style>
+<rect width="1600" height="1720" fill="white"/>
+
+<text x="36" y="50" class="title">DeepAgents × OpenViking：上下文管理逻辑架构</text>
+<path d="M1070 40 H1118" class="call"/>
+<text x="1130" y="46" class="small">调用 / 执行顺序</text>
+<path d="M1320 40 H1368" class="data"/>
+<text x="1380" y="46" class="small">数据交付</text>
+<rect x="36" y="90" width="1528" height="276" rx="12" fill="#f5f9ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="60" y="128" class="layer">DeepAgents 执行层</text>
+<rect x="64" y="151" width="1008" height="72" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="84" y="180" class="name">图状态：state[&quot;messages&quot;] + state[&quot;ov_context&quot;]</text>
+<text x="84" y="208" class="small">原始图消息与上下文状态一同保存；同 Session 使用稳定 thread_id</text>
+<rect x="1172" y="151" width="364" height="72" rx="12" fill="#edf7f2" stroke="#a5cbbb" stroke-width="1.5"/>
+<text x="1354" y="181" class="name" text-anchor="middle">checkpointer</text>
+<text x="1354" y="209" class="small" text-anchor="middle">保存 / 恢复图状态</text>
+<path d="M1072 187 H1172" class="call" marker-start="url(#arrow)"/>
+<rect x="64" y="251" width="960" height="81" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="84" y="282" class="code">abefore_agent · abefore_model · aafter_model · aafter_agent</text>
+<text x="84" y="312" class="small">统一写入入口：用户输入、助手消息、工具调用与结果、收尾增量</text>
+<rect x="1072" y="251" width="464" height="81" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="1092" y="282" class="name">awrap_model_call</text>
+<text x="1092" y="312" class="small">核对归档、单 Run 召回、组装与预算准入</text>
+<path d="M544 332 V390" class="call"/>
+<path d="M1304 332 V390" class="call"/>
+<rect x="36" y="390" width="1528" height="920" rx="12" fill="#f5faf8" stroke="#a9cebf" stroke-width="1.5"/>
+<text x="60" y="430" class="layer">OpenVikingContextMiddleware</text>
+<text x="60" y="459" class="small">解析 RunIdentity、校验 owner；Hook 将 OVContext 状态更新交回图</text>
+<rect x="64" y="481" width="1472" height="54" rx="12" fill="#e6f2ed" stroke="#a9cebf" stroke-width="1.5"/>
+<text x="84" y="515" class="name">SessionEngine：编排消息写入、上下文读取、提交及候选缓存应用</text>
+<rect x="64" y="577" width="432" height="146" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="84" y="613" class="name">OVMessageWriter</text>
+<text x="84" y="648" class="body">格式转换 · 预校验 · 分批写入</text>
+<text x="84" y="681" class="body">按确认游标推进增量</text>
+<text x="84" y="708" class="small">返回本地消息 / 工具短视图副本</text>
+<rect x="544" y="577" width="480" height="146" rx="12" fill="#e6f2ed" stroke="#7fb5a1" stroke-width="1.5"/>
+<text x="564" y="613" class="name">OVContext：Session 级状态</text>
+<text x="564" y="648" class="code">messages · archive_id · write_index</text>
+<text x="564" y="681" class="code">owner · pending_commit · context_status</text>
+<text x="564" y="708" class="small">Run 临时状态随任务结束清理</text>
+<rect x="1072" y="577" width="464" height="146" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="1092" y="613" class="name">OVContextReader</text>
+<text x="1092" y="648" class="small">exchange_context()：摘要与近期消息</text>
+<text x="1092" y="681" class="small">recall()：普通 / 经验记忆</text>
+<text x="1092" y="708" class="small">同 Run 首次召回，后续复用结果</text>
+<path d="M496 655 H544" class="data"/>
+<text x="504" y="565" class="small">增量</text>
+<path d="M1072 655 H1024" class="data"/>
+<text x="1028" y="565" class="small">快照 / 召回结果</text>
+<rect x="64" y="785" width="432" height="162" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="84" y="821" class="name">OpenVikingCommitPolicy</text>
+<text x="84" y="855" class="body">策略提交：源消息 pending_tokens</text>
+<text x="84" y="885" class="body">或已完成 Run 数达到配置阈值</text>
+<text x="84" y="925" class="small">提交参数：实际 keep_recent_count</text>
+<rect x="544" y="785" width="992" height="162" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="564" y="821" class="name">ContextAssembler</text>
+<text x="564" y="856" class="body">固定输入：本次系统提示、Skill 索引、工具 Schema 与调用配置</text>
+<text x="564" y="887" class="body">历史输入：OVContext 消息（含本轮用户与召回副本）</text>
+<text x="564" y="925" class="body accent">OV 指引幂等更新；完整输入计数与准入</text>
+<path d="M784 723 V785" class="data"/>
+<text x="796" y="760" class="small">缓存消息</text>
+<path d="M544 861 H496" class="call"/>
+<text x="500" y="770" class="small">容量提交</text>
+<text x="84" y="996" class="name">容量修复：完整模型输入达到 capacity_limit 时暂停本次模型调用</text>
+<rect x="64" y="1022" width="232" height="91" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="180" y="1057" class="name" text-anchor="middle">提交</text>
+<text x="180" y="1088" class="small" text-anchor="middle">安全归档前缀</text>
+<path d="M296 1067 H312" class="call"/>
+<rect x="312" y="1022" width="232" height="91" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="428" y="1057" class="name" text-anchor="middle">等待归档</text>
+<text x="428" y="1088" class="small" text-anchor="middle">已知任务 / 新边界</text>
+<path d="M544 1067 H560" class="call"/>
+<rect x="560" y="1022" width="232" height="91" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="676" y="1057" class="name" text-anchor="middle">Reader 读取</text>
+<text x="676" y="1088" class="small" text-anchor="middle">摘要 + 近期消息</text>
+<path d="M792 1067 H808" class="call"/>
+<rect x="808" y="1022" width="232" height="91" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="924" y="1057" class="name" text-anchor="middle">候选校验</text>
+<text x="924" y="1088" class="small" text-anchor="middle">结构与输入预算</text>
+<path d="M1040 1067 H1056" class="call"/>
+<rect x="1056" y="1022" width="232" height="91" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="1172" y="1057" class="name" text-anchor="middle">替换缓存</text>
+<text x="1172" y="1088" class="small" text-anchor="middle">messages + archive_id</text>
+<path d="M1288 1067 H1304" class="call"/>
+<rect x="1304" y="1022" width="232" height="91" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="1420" y="1057" class="name" text-anchor="middle">重新计数</text>
+<text x="1420" y="1088" class="small" text-anchor="middle">满足 input_limit</text>
+<text x="84" y="1149" class="small">每次模型调用最多一轮容量修复；候选包含当前用户副本与近期完整工具组。</text>
+<text x="84" y="1180" class="body accent">预算准入通过 → 模型 handler；修复失败或仍超限 → 预算异常。</text>
+<rect x="64" y="1211" width="1472" height="74" rx="12" fill="#edf4ff" stroke="#b7cde3" stroke-width="1.5"/>
+<text x="84" y="1241" class="name">AsyncHTTPClient / AsyncClientHandle</text>
+<text x="84" y="1270" class="small">显式传入 OVIdentity(account, user, actor peer)，每请求生成身份头；HTTP 连接池复用</text>
+<path d="M800 1310 V1370" class="call"/>
+<text x="824" y="1348" class="small">HTTP：写入 / 提交 / 上下文读取 / 记忆检索</text>
+<rect x="36" y="1370" width="1528" height="314" rx="12" fill="#f8f6fc" stroke="#c8bfdf" stroke-width="1.5"/>
+<text x="60" y="1410" class="layer">OV 服务层</text>
+<rect x="64" y="1435" width="432" height="146" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="84" y="1471" class="name">消息与工具原文</text>
+<text x="84" y="1508" class="small">持久化消息及工具正文</text>
+<text x="84" y="1536" class="small">随写入返回短视图与 ref</text>
+<text x="84" y="1564" class="small">支持原文 list / search / read</text>
+<rect x="544" y="1435" width="480" height="146" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="564" y="1471" class="name">归档与记忆提取</text>
+<text x="564" y="1508" class="small">归档已完成交互，生成会话摘要</text>
+<text x="564" y="1536" class="small">提取长期记忆并建立索引</text>
+<text x="564" y="1564" class="small">任务受理、归档及索引分别完成</text>
+<rect x="1072" y="1435" width="464" height="146" rx="12" fill="#fff" stroke="#c6d4e0" stroke-width="1.5"/>
+<text x="1092" y="1471" class="name">上下文与记忆服务</text>
+<text x="1092" y="1508" class="small">按归档边界返回摘要与近期消息</text>
+<text x="1092" y="1536" class="small">提供授权范围内的记忆检索</text>
+<text x="1092" y="1564" class="small">结果交由 Reader 恢复及组织</text>
+<rect x="64" y="1603" width="1472" height="56" rx="12" fill="#eee9f8" stroke="#c8bfdf" stroke-width="1.5"/>
+<text x="84" y="1638" class="body">服务端空闲调度：SessionService._run_auto_commit() → 归档；后续模型调用核对新边界并读取</text>
+<text x="36" y="1707" class="small">提交策略统计待归档源消息；容量准入统计实际完整模型输入，两者分别配置。</text>
+</svg>
