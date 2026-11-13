@@ -1,0 +1,12 @@
+{
+  "id":"API-00","notice":"固定模拟业务；合同仅供阅读，不调用接口，不依赖真实系统。所有地址为.invalid。",
+  "version":"3.0","date":"2026-10-10","base_url":"https://personal-skill.example.invalid",
+  "auth":"模拟Bearer身份；user取认证上下文，不接收客户端代指定其他用户。",
+  "contracts":[
+    {"id":"API-01","method":"GET","path":"/personal-skills/resolve?skill_identifier={id}","key":"当前用户内，包内skill_identifier大小写敏感精确匹配；标识只读，不按名称判断。","responses":{"new":{"action":"create","latest_version":null},"existing":{"action":"add_version","skill_id":"S-DEMO","latest_version":"2.3.1"}},"meaning":"不同标识新建，相同标识新增版本；历史版本不覆盖。"},
+    {"id":"API-02","method":"POST","path":"/personal-skills","fields":{"skill_identifier":"来自包，只读","name":"必填，可修改；默认文件名去.zip；去首尾空格后1-40字符","package_filename":"只读","package":"ZIP结构合法且≤10MiB","idempotency_key":"相同键+相同载荷重放返回同一保存版本，不重复创建"},"constraints":"新建固定1.0.0，不接收版本输入；非法字段/包阻止保存。","response":{"http":201,"market_saved":true,"skill_id":"S-DEMO","version_id":"V-1","version":"1.0.0","installed":false}},
+    {"id":"API-03","method":"POST","path":"/personal-skills/{skill_id}/versions","fields":{"name":"可修改，默认已有市场名称；同样1-40字符","skill_identifier":"只读，与已有资产相同","package_filename":"只读","package":"ZIP合法且≤10MiB","version":"必填，三段数字SemVer；无前导零、预发布或构建后缀；数字三元组比较，必须大于最新版本","idempotency_key":"相同键+相同载荷返回同一保存版本"},"response":{"http":201,"market_saved":true,"version_id":"V-NEW","version":"2.3.2","installed":false},"conflict":"409 VERSION_CONFLICT：刷新最新版本后重填，不覆盖、不自动递增。"},
+    {"id":"API-04","method":"POST","path":"/workspaces/current/install","precondition":"市场已保存且用户选择安装；version_id必须是已保存版本。","fields":{"version_id":"必填","idempotency_key":"必填，避免重复提交"},"states":[{"http":200,"workspace_kind":"writable","state":"installed","meaning":"安装成功才原子替换原工作区版本"},{"http":202,"workspace_kind":"controlled","state":"pending_approval","meaning":"仅提交审批，不是已安装；市场与原工作区版本保留；查看审批，不重复提交"}],"failure":"403或503均不删除市场、不替换原工作区版本；不同恢复入口见API-05。"},
+    {"id":"API-05","errors":[{"http":400,"code":"INVALID_PACKAGE","stage":"market","action":"保留表单并定位文件，阻止提交，不安装"},{"http":422,"code":"INVALID_FIELD","stage":"market","action":"保留表单并定位名称/版本，不安装"},{"http":409,"code":"VERSION_CONFLICT","stage":"market","action":"刷新最新版本后重填，不覆盖、不自动递增、不安装"},{"http":403,"code":"MARKET_FORBIDDEN","stage":"market","action":"保留表单提示权限，不安装"},{"http":403,"code":"WORKSPACE_FORBIDDEN","stage":"install","action":"保留市场及原工作区版本；先申请/恢复权限，再按需安装"},{"http":503,"code":"INSTALL_UNAVAILABLE","stage":"install","action":"保留市场及原工作区版本；提供重试安装或稍后管理；只重试已保存版本"}],"response_deadline_seconds":null,"manual_retry_limit":null,"approval_deadline_seconds":null}
+  ]
+}

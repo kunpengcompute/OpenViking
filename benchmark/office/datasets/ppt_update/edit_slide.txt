@@ -1,0 +1,85 @@
+# -*- coding: utf-8 -*-
+"""Common helper: apply text replacements inside <a:t> runs of a slide XML
+(by run index), keep a per-slide backup, then dump the resulting runs
+for verification.
+"""
+import os
+
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'unpacked')
+BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backup')
+
+
+def get_matches(xml):
+    import re
+    pattern = re.compile(r'(<a:t[^>]*>)([^<]*)(</a:t>)')
+    return list(pattern.finditer(xml))
+
+
+def apply_edits(slide, edits):
+    """edits: list of (run_index, old_substring, new_substring)"""
+    path = os.path.join(BASE, 'ppt', 'slides', slide + '.xml')
+    xml = open(path, encoding='utf-8').read()
+
+    os.makedirs(BACKUP, exist_ok=True)
+    bk = os.path.join(BACKUP, slide + '.xml')
+    if not os.path.exists(bk):
+        open(bk, 'w', encoding='utf-8').write(xml)
+
+    matches = get_matches(xml)
+    texts = [m.group(2) for m in matches]
+    by_idx = {}
+
+    for idx, old, new in edits:
+        if idx < 0 or idx >= len(texts):
+            raise SystemExit(
+                'FAIL %s: run idx %d out of range (have %d runs)'
+                % (slide, idx, len(texts))
+            )
+        if old not in texts[idx]:
+            raise SystemExit(
+                'FAIL %s: run %d text %r does not contain %r'
+                % (slide, idx, texts[idx], old)
+            )
+        by_idx[idx] = (old, new)
+
+    out = []
+    last = 0
+    applied = []
+
+    for i, m in enumerate(matches):
+        out.append(xml[last:m.start(1)])
+        t = m.group(2)
+
+        if i in by_idx:
+            old, new = by_idx[i]
+            t = t.replace(old, new)
+            applied.append((i, old, new))
+
+        out.append(m.group(1))
+        out.append(t)
+        out.append(m.group(3))
+        last = m.end(3)
+
+    out.append(xml[last:])
+
+    if len(applied) != len(edits):
+        raise SystemExit(
+            'FAIL %s: only %d of %d edits applied'
+            % (slide, len(applied), len(edits))
+        )
+
+    new_xml = ''.join(out)
+    open(path, 'w', encoding='utf-8').write(new_xml)
+
+    print('OK %s: %d edits applied' % (slide, len(applied)))
+    for i, old, new in sorted(applied):
+        print('  run %d: %r -> %r' % (i, old, new))
+
+    return new_xml
+
+
+def dump(slide):
+    path = os.path.join(BASE, 'ppt', 'slides', slide + '.xml')
+    xml = open(path, encoding='utf-8').read()
+    for i, m in enumerate(get_matches(xml)):
+        print('  [%d] %r' % (i, m.group(2)))

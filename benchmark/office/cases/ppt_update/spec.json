@@ -1,0 +1,322 @@
+{
+  "version": "ppt-six-shared-helper-hq-v4",
+  "task": "ppt_update",
+  "status": "frozen_case",
+  "name": "计量计费PPT六项文本修改与方法记忆对照",
+  "source": "benchmark/office/datasets/ppt_update/modify_test.pptx",
+  "input_sha256": "9bc84d5bc44271e2e2124fabf0e765402c4d9cd10f924ee3a6add9e78ceb85c1",
+  "slides": 14,
+  "outputs": [
+    "updated.pptx"
+  ],
+  "execution_order": [
+    "PPT-01",
+    "PPT-02",
+    "PPT-03",
+    "PPT-04",
+    "PPT-05",
+    "PPT-06"
+  ],
+  "validation": "Six independent tasks, two edits each; content, package, page order, media and download checked. Visual review excluded; execution order reviewed separately from final correctness.",
+  "delivery": "one final PPT with a registered download URL",
+  "scoring": {
+    "points_per_task": 1,
+    "max_points": 6,
+    "task_credit": "Both edits of a business task are correct in the final PPT; one point per task.",
+    "unverified": "final edit correct but stage evidence missing",
+    "overall": "Six tasks and twelve edits correct, original pages/order/media retained, final PPT delivered.",
+    "performance": "Each Q subtask passes when all its assertions pass and its verified completion is <=120 seconds from Chat Run start; continue to terminal for complete latency and Agent plus OV LLM usage.",
+    "sequence": "Retain tool and revision evidence for review; final correctness alone does not certify sequential execution."
+  },
+  "phases": {
+    "Q": {
+      "prompt": "benchmark/office/tasks/ppt_update/Q.md",
+      "prompt_sha256": "3710a12d65ec8e92ab71b723d0f1c3129c6a274a2b18124cb943e71456c77c32",
+      "tasks": [
+        {
+          "id": "PPT-01.1",
+          "task_id": "PPT-01",
+          "title": "帐单周期",
+          "slide": 3,
+          "anchor": "周帐单",
+          "old": "周",
+          "new": "日",
+          "points": 1
+        },
+        {
+          "id": "PPT-01.2",
+          "task_id": "PPT-01",
+          "title": "获取方式",
+          "slide": 3,
+          "anchor": "（只能通过邮件获取查看）",
+          "old": "只能通过邮件获取查看",
+          "new": "支持页面查询和邮件订阅",
+          "points": 1
+        },
+        {
+          "id": "PPT-02.1",
+          "task_id": "PPT-02",
+          "title": "每日价格",
+          "slide": 6,
+          "anchor": "使用一天的费用是5.5元",
+          "old": "5.",
+          "new": "6.",
+          "points": 1
+        },
+        {
+          "id": "PPT-02.2",
+          "task_id": "PPT-02",
+          "title": "整数精度",
+          "slide": 6,
+          "anchor": "整数长度小于等于10位",
+          "old": "10",
+          "new": "8",
+          "points": 1
+        },
+        {
+          "id": "PPT-03.1",
+          "task_id": "PPT-03",
+          "title": "因子上限",
+          "slide": 7,
+          "anchor": "价格因子须大于0，小于等于1000",
+          "old": "10",
+          "new": "5",
+          "points": 1
+        },
+        {
+          "id": "PPT-03.2",
+          "task_id": "PPT-03",
+          "title": "因子小数位",
+          "slide": 7,
+          "anchor": "小于等于2位小数",
+          "old": "2",
+          "new": "4",
+          "points": 1
+        },
+        {
+          "id": "PPT-04.1",
+          "task_id": "PPT-04",
+          "title": "升级目标",
+          "slide": 9,
+          "anchor": "升级到2C4G",
+          "old": "2C4",
+          "new": "4C8",
+          "points": 1
+        },
+        {
+          "id": "PPT-04.2",
+          "task_id": "PPT-04",
+          "title": "新增使用记录规格",
+          "slide": 9,
+          "anchor": "新插入2C4G的资源使用记录",
+          "old": "2C4",
+          "new": "4C8",
+          "points": 1
+        },
+        {
+          "id": "PPT-05.1",
+          "task_id": "PPT-05",
+          "title": "查询协议",
+          "slide": 10,
+          "anchor": "查询接口（HTTP/FTP）",
+          "old": "FTP",
+          "new": "HTTPS",
+          "points": 1
+        },
+        {
+          "id": "PPT-05.2",
+          "task_id": "PPT-05",
+          "title": "入库口径及表名",
+          "slide": 10,
+          "anchor": "对应月份的ResourceUsage表",
+          "old": "月份的Resource",
+          "new": "日期的Daily",
+          "points": 1
+        },
+        {
+          "id": "PPT-06.1",
+          "task_id": "PPT-06",
+          "title": "重算时间范围",
+          "slide": 13,
+          "anchor": "指定时间范围",
+          "old": "时间",
+          "new": "日期",
+          "points": 1
+        },
+        {
+          "id": "PPT-06.2",
+          "task_id": "PPT-06",
+          "title": "增加筛选维度",
+          "slide": 13,
+          "anchor": "租户、服务类型、Region、AZ，",
+          "old": "Z",
+          "new": "Z、资源标签",
+          "points": 1
+        }
+      ]
+    },
+    "H": {
+      "prompt": "benchmark/office/tasks/ppt_update/H.md",
+      "prompt_sha256": "1be86b8287531e95b37ef0f82b1cf571c1853dba629f21dcc85db2d9de88bdb7",
+      "tasks": [
+        {
+          "id": "PPT-01.1",
+          "task_id": "PPT-01",
+          "title": "帐单周期",
+          "slide": 3,
+          "anchor": "周帐单",
+          "old": "周帐单",
+          "new": "季度帐单",
+          "points": 1
+        },
+        {
+          "id": "PPT-01.2",
+          "task_id": "PPT-01",
+          "title": "获取方式",
+          "slide": 3,
+          "anchor": "（只能通过邮件获取查看）",
+          "old": "（只能通过邮件获取查看）",
+          "new": "（支持邮件获取和页面预览）",
+          "points": 1
+        },
+        {
+          "id": "PPT-02.1",
+          "task_id": "PPT-02",
+          "title": "每日价格",
+          "slide": 6,
+          "anchor": "使用一天的费用是5.5元",
+          "old": "使用一天的费用是5.5元",
+          "new": "使用一天的费用是7.5元",
+          "points": 1
+        },
+        {
+          "id": "PPT-02.2",
+          "task_id": "PPT-02",
+          "title": "整数精度",
+          "slide": 6,
+          "anchor": "整数长度小于等于10位",
+          "old": "整数长度小于等于10位",
+          "new": "整数长度小于等于9位",
+          "points": 1
+        },
+        {
+          "id": "PPT-03.1",
+          "task_id": "PPT-03",
+          "title": "因子上限",
+          "slide": 7,
+          "anchor": "价格因子须大于0，小于等于1000",
+          "old": "价格因子须大于0，小于等于1000",
+          "new": "价格因子须大于0，小于等于800",
+          "points": 1
+        },
+        {
+          "id": "PPT-03.2",
+          "task_id": "PPT-03",
+          "title": "因子小数位",
+          "slide": 7,
+          "anchor": "小于等于2位小数",
+          "old": "小于等于2位小数",
+          "new": "小于等于3位小数",
+          "points": 1
+        },
+        {
+          "id": "PPT-04.1",
+          "task_id": "PPT-04",
+          "title": "升级目标",
+          "slide": 9,
+          "anchor": "升级到2C4G",
+          "old": "升级到2C4G",
+          "new": "升级到8C16G",
+          "points": 1
+        },
+        {
+          "id": "PPT-04.2",
+          "task_id": "PPT-04",
+          "title": "新增使用记录规格",
+          "slide": 9,
+          "anchor": "新插入2C4G的资源使用记录",
+          "old": "新插入2C4G的资源使用记录",
+          "new": "新插入8C16G的资源使用记录",
+          "points": 1
+        },
+        {
+          "id": "PPT-05.1",
+          "task_id": "PPT-05",
+          "title": "查询协议",
+          "slide": 10,
+          "anchor": "查询接口（HTTP/FTP）",
+          "old": "查询接口（HTTP/FTP）",
+          "new": "查询接口（HTTP/SFTP）",
+          "points": 1
+        },
+        {
+          "id": "PPT-05.2",
+          "task_id": "PPT-05",
+          "title": "入库口径及表名",
+          "slide": 10,
+          "anchor": "对应月份的ResourceUsage表",
+          "old": "对应月份的ResourceUsage表",
+          "new": "对应季度的QuarterUsage表",
+          "points": 1
+        },
+        {
+          "id": "PPT-06.1",
+          "task_id": "PPT-06",
+          "title": "重算时间范围",
+          "slide": 13,
+          "anchor": "指定时间范围",
+          "old": "指定时间范围",
+          "new": "指定季度范围",
+          "points": 1
+        },
+        {
+          "id": "PPT-06.2",
+          "task_id": "PPT-06",
+          "title": "增加筛选维度",
+          "slide": 13,
+          "anchor": "租户、服务类型、Region、AZ，",
+          "old": "租户、服务类型、Region、AZ",
+          "new": "租户、服务类型、Region、AZ、资源组",
+          "points": 1
+        }
+      ]
+    }
+  },
+  "comparison_scope": "Both arms receive the same original PPT and helper source file. H supplies usage guidance; fresh Q receives only the helper path and business requirements. Tests method reuse, not code memorization or cross-template transfer.",
+  "isolation": "Both H and Q start from fresh copies of the original deck; Q uses a new Session/workspace and never takes the H output as its input.",
+  "failure_policy": "Record a failed subtask and its reason, roll back only its failed changes to the latest usable version, preserve successful earlier edits, then continue remaining subtasks in order.",
+  "acceptance": "Six task groups with two edits each, completed and checked in order; final modified PPT delivered. Fixed filename and stage files are not prompt requirements.",
+  "latency_budget_seconds": 120,
+  "system_prompt": "benchmark/office/tasks/ppt_update/system_prompt.md",
+  "execution_profile": "benchmark/office/cases/ppt_update/execution.json",
+  "budget": {
+    "applies_to": "Q",
+    "mode": "subtask_completion_deadline",
+    "elapsed_source": "each subtask verified completion time relative to Chat Run start",
+    "over_budget": "score each subtask independently; continue to terminal for complete latency and Agent plus OV LLM usage",
+    "includes": "Chat Run initialization, recall, model, tools and final handling",
+    "excludes": [
+      "H preparation",
+      "input upload",
+      "external artifact download checks",
+      "external grading"
+    ],
+    "policy": "benchmark/office/cases/scoring.json"
+  },
+  "output_filename_policy": "updated.pptx is preferred; accept another delivered .pptx filename",
+  "reader_contract": {
+    "search_mode": "context",
+    "ranking": "openclaw",
+    "candidate_limit": 25,
+    "recall_limit": 5,
+    "enabled": true,
+    "experience_enabled": false
+  },
+  "support_files": [
+    {
+      "source": "benchmark/office/datasets/ppt_update/edit_slide.txt",
+      "filename": "edit_slide.txt",
+      "sha256": "c72ea25ee269c15723fda6a1e76c28fad53e7abdde71aaf998e2ed5133b5bf77"
+    }
+  ]
+}
