@@ -1511,14 +1511,23 @@ class MemoryUpdater:
                 from openviking.session.memory.fact_records import merge_fact_records
 
                 previous = old_content.extra_fields.get("fact_records", []) if old_content else []
-                metadata["fact_records"] = merge_fact_records(previous, metadata.get("fact_records", []))
+                metadata["fact_records"] = merge_fact_records(
+                    previous, metadata.get("fact_records", [])
+                )
                 if memory_type == "entities":
-                    quotes = dict.fromkeys(quote for fact in metadata["fact_records"]
-                                           for quote in fact.get("source_quotes", {}).values())
+                    quotes = dict.fromkeys(
+                        quote
+                        for fact in metadata["fact_records"]
+                        for quote in fact.get("source_quotes", {}).values()
+                    )
                     metadata["content"] = "\n".join(quotes) or metadata.get("content", "")
                     if old_content:
-                        metadata["aliases"] = list(dict.fromkeys(
-                            old_content.extra_fields.get("aliases", []) + metadata.get("aliases", [])))
+                        metadata["aliases"] = list(
+                            dict.fromkeys(
+                                old_content.extra_fields.get("aliases", [])
+                                + metadata.get("aliases", [])
+                            )
+                        )
 
             metadata["version"] = next_memory_version(old_content)
 
@@ -1575,7 +1584,9 @@ class MemoryUpdater:
                 index = await load_index(viking_fs, root + "/.index/evidence.json", ctx)
                 metadata = await guard_source_update(viking_fs, metadata, uri, ctx, index=index)
                 if metadata is None:
-                    raise ConflictError("Memory sources were deleted or corrected; re-extract", resource=uri)
+                    raise ConflictError(
+                        "Memory sources were deleted or corrected; re-extract", resource=uri
+                    )
             mf = MemoryFile.from_parsed(uri=uri, parsed=metadata)
             new_full_content = MemoryFileUtils.write(
                 mf,

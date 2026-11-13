@@ -525,7 +525,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             try:
                 source_uri = uri
                 if level in (0, 1):
-                    source_uri = uri.rstrip("/") + ("/.abstract.md" if level == 0 else "/.overview.md")
+                    source_uri = uri.rstrip("/") + (
+                        "/.abstract.md" if level == 0 else "/.overview.md"
+                    )
                 content = await fs.read_file(source_uri, ctx=ctx)
             except (NotFoundError, FileNotFoundError):
                 yield False
@@ -544,7 +546,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 body = MemoryFileUtils.read(content, uri=uri).content
                 current = (
-                    MemoryUpdater._truncate_memory_abstract(LinkRenderer.strip_all_links(body or ""))
+                    MemoryUpdater._truncate_memory_abstract(
+                        LinkRenderer.strip_all_links(body or "")
+                    )
                     == legacy_abstract
                 )
             yield current
@@ -925,9 +929,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 # Write to vector database
                 try:
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
-                    extracted_memory_type = raw_upsert_options.pop(
-                        "extracted_memory_type", None
-                    )
+                    extracted_memory_type = raw_upsert_options.pop("extracted_memory_type", None)
                     # Reuse the actual vector-store ID when a semantic plan
                     # rebuilds an existing same-level record. Only genuinely new
                     # records derive an ID locally from (account, uri, level).
@@ -993,12 +995,19 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     revision = inserted_data.get("_memory_revision")
                     level = inserted_data.get("level")
                     legacy_abstract = None
-                    if (revision is None and inserted_data.get("context_type") == "memory"
-                            and "/memories/" in uri and level in (0, 1, 2)):
+                    if (
+                        revision is None
+                        and inserted_data.get("context_type") == "memory"
+                        and "/memories/" in uri
+                        and level in (0, 1, 2)
+                    ):
                         legacy_abstract = inserted_data.get("abstract") or ""
                     if revision is not None:
-                        inserted_data = {key: value for key, value in inserted_data.items()
-                                         if key != "_memory_revision"}
+                        inserted_data = {
+                            key: value
+                            for key, value in inserted_data.items()
+                            if key != "_memory_revision"
+                        }
                     async with self._memory_write_guard(
                         uri, revision, ctx, level, legacy_abstract
                     ) as current:
@@ -1006,8 +1015,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                             self._record_request_success(embedding_msg)
                             return ProcessResult.success()
-                        if (inserted_data.get("context_type") == ContextType.SKILL.value
-                                or revision is not None or legacy_abstract is not None):
+                        if (
+                            inserted_data.get("context_type") == ContextType.SKILL.value
+                            or revision is not None
+                            or legacy_abstract is not None
+                        ):
                             # Keep a memory's lease until a threaded write settles.
                             result = await run_to_completion(
                                 lambda: self._vikingdb.upsert(

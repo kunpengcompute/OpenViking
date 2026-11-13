@@ -92,6 +92,7 @@ logger = get_logger(__name__)
 
 _EVIDENCE_SPEAKER_RE = re.compile(r"^\[([^\]]+)\]:\s*(.*)$", re.DOTALL)
 
+
 async def _embed_turn_texts(
     embedder: Any,
     texts: List[str],
@@ -111,7 +112,6 @@ async def _embed_turn_texts(
         if states is not None:
             states.append(state)
     return out
-
 
 
 _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
@@ -1118,7 +1118,10 @@ class Session:
                 return False
             raise
         phase1 = meta.get("phase1", {})
-        if phase1.get("status") != "preparing" or phase1.get("retry_fingerprint") != retry_fingerprint:
+        if (
+            phase1.get("status") != "preparing"
+            or phase1.get("retry_fingerprint") != retry_fingerprint
+        ):
             return False
         try:
             failed = json.loads(
@@ -1643,28 +1646,45 @@ class Session:
                     "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
                 }
 
-            retry_fingerprint = hashlib.sha256(json.dumps({
-                "messages": [m.to_dict() for m in self._messages],
-                "archived_ids": [m.id for m in messages_to_archive],
-                "retained_ids": [m.id for m in retained_messages],
-                "memory_policy": effective_memory_policy, "event_tags": effective_event_tags,
-                "keep_recent_count": keep_recent_count, "stored_keep_recent_count": stored_keep_recent_count,
-                "retention_mode": retention_mode, "keep_turns": effective_keep_turns,
-                "token_budget": effective_token_budget, "min_tail": effective_min_tail,
-                "reset_context": reset_context, "agent_evolution_enabled": agent_evolution_enabled,
-            }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+            retry_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "messages": [m.to_dict() for m in self._messages],
+                        "archived_ids": [m.id for m in messages_to_archive],
+                        "retained_ids": [m.id for m in retained_messages],
+                        "memory_policy": effective_memory_policy,
+                        "event_tags": effective_event_tags,
+                        "keep_recent_count": keep_recent_count,
+                        "stored_keep_recent_count": stored_keep_recent_count,
+                        "retention_mode": retention_mode,
+                        "keep_turns": effective_keep_turns,
+                        "token_budget": effective_token_budget,
+                        "min_tail": effective_min_tail,
+                        "reset_context": reset_context,
+                        "agent_evolution_enabled": agent_evolution_enabled,
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
             previous_index = self._compression.compression_index
             self._compression.compression_index += 1
-            archive_uri = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+            archive_uri = (
+                f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+            )
             reuse_archive = False
             # A failed evidence append has no published extraction task. Reuse
             # only an exact matching intent; preserve any different archived raw.
             while await self._viking_fs.exists(archive_uri, ctx=self.ctx):
-                if await self._can_reuse_evidence_archive(archive_uri, retry_fingerprint, messages_to_archive):
+                if await self._can_reuse_evidence_archive(
+                    archive_uri, retry_fingerprint, messages_to_archive
+                ):
                     reuse_archive = True
                     break
                 self._compression.compression_index += 1
-                archive_uri = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+                archive_uri = (
+                    f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+                )
             original_messages = list(self._messages)
             task_id = str(uuid4())
             queue_msg = SessionCommitMsg(
@@ -1790,9 +1810,15 @@ class Session:
                 self._compression.compression_index = previous_index
                 if phase1_stage == "evidence_index":
                     from openviking.server.error_mapping import map_exception
+
                     error = map_exception(e) or InternalError("Evidence index update failed")
-                    error.details.update(stage="evidence_index", archive_uri=archive_uri,
-                                         archive_persisted=True, archived=False, live_messages_preserved=True)
+                    error.details.update(
+                        stage="evidence_index",
+                        archive_uri=archive_uri,
+                        archive_persisted=True,
+                        archived=False,
+                        live_messages_preserved=True,
+                    )
                     raise error from e
                 raise
             if reset_context:
@@ -2294,7 +2320,8 @@ class Session:
                             base_delay=_MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS,
                             max_delay=_MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS,
                             is_retryable=lambda error: (
-                                not isinstance(error, MemoryUpdateError) and is_retryable_api_error(error)
+                                not isinstance(error, MemoryUpdateError)
+                                and is_retryable_api_error(error)
                             ),
                             logger=logger,
                             operation_name=operation_name,

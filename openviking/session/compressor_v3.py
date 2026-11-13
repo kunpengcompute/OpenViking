@@ -155,9 +155,7 @@ def _memory_type_by_uri(operations: ResolvedOperations) -> dict[str, str]:
     for file_content in getattr(operations, "delete_file_contents", []) or []:
         uri = str(getattr(file_content, "uri", "") or "")
         if uri:
-            types_by_uri[uri] = str(
-                getattr(file_content, "memory_type", "") or "unknown"
-            )
+            types_by_uri[uri] = str(getattr(file_content, "memory_type", "") or "unknown")
     return types_by_uri
 
 
@@ -290,9 +288,7 @@ class SessionCompressorV3:
         vlm_config: VLMHandle | None = None,
     ) -> ExtractLoop:
         if vlm_config is None:
-            raise RuntimeError(
-                "SessionCompressorV3 requires an explicitly resolved VLM config"
-            )
+            raise RuntimeError("SessionCompressorV3 requires an explicitly resolved VLM config")
         vlm = vlm_config
         viking_fs = get_viking_fs()
         if context_provider is None:
@@ -835,7 +831,9 @@ class SessionCompressorV3:
             cases=canonical_cases,
             memory_diff=memory_diff,
             case_uri_by_name=_case_uri_by_name(canonical_cases, patch_operations, result),
-            skipped_operations=_serialize_skipped_operations(getattr(result, "skipped_operations", [])),
+            skipped_operations=_serialize_skipped_operations(
+                getattr(result, "skipped_operations", [])
+            ),
         )
 
     def _session_skill_extraction_enabled(self) -> bool:
