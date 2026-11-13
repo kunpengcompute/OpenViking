@@ -34,3 +34,30 @@ async def test_stat_uses_async_lock_lookup(monkeypatch):
 
     assert result["isLocked"] is True
     assert lock_manager.paths == [("/local/default/resources/file.txt", True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [TimeoutError("timeout"), PermissionError("denied"), ConnectionError("unavailable")]
+)
+async def test_read_preserves_backend_errors(error):
+    class ReadAGFS(_StatAGFS):
+        def read(self, *args, **kwargs):
+            raise error
+
+    fs = VikingFS(agfs=ReadAGFS())
+    with pytest.raises(type(error)):
+        await fs.read_file("viking://resources/file.txt")
+
+
+@pytest.mark.asyncio
+async def test_read_missing_file_keeps_not_found_semantics():
+    from openviking_cli.exceptions import NotFoundError
+
+    class ReadAGFS(_StatAGFS):
+        def read(self, *args, **kwargs):
+            raise FileNotFoundError("missing")
+
+    fs = VikingFS(agfs=ReadAGFS())
+    with pytest.raises(NotFoundError):
+        await fs.read_file("viking://resources/file.txt")

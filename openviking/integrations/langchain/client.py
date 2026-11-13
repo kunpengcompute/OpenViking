@@ -8,7 +8,10 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from openviking.integrations.langchain.middleware import OpenVikingCommitPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -70,14 +73,6 @@ class OpenVikingConnection:
     http_client: Any = None
     extra_headers: dict[str, str] | None = None
     auto_initialize: bool = True
-
-
-@dataclass(slots=True)
-class OpenVikingCommitPolicy:
-    """Commit behavior for OpenViking-backed agent sessions."""
-
-    mode: Literal["never", "always", "pending_tokens"] = "never"
-    pending_token_threshold: int = 8_000
 
 
 class OpenVikingClientHandle:
@@ -167,7 +162,11 @@ def apply_commit_policy(
 ) -> dict[str, Any] | None:
     """Apply the configured session commit policy."""
 
-    if policy is None or policy.mode == "never":
+    if policy is None:
+        return None
+    if policy.has_session_policy:
+        raise ValueError("Capacity/Run OpenVikingCommitPolicy requires OpenVikingContextMiddleware")
+    if policy.mode == "never":
         return None
     if policy.mode == "always":
         return call_openviking(
@@ -367,3 +366,11 @@ def get_latest_user_text(messages: Iterable[Any]) -> str:
             if text:
                 return text
     return ""
+
+
+def __getattr__(name: str) -> Any:
+    if name == "OpenVikingCommitPolicy":
+        from openviking.integrations.langchain.middleware import OpenVikingCommitPolicy
+
+        return OpenVikingCommitPolicy
+    raise AttributeError(name)

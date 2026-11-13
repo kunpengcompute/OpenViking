@@ -1,0 +1,1 @@
+"""Frozen mail case data."""

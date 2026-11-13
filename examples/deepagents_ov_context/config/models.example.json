@@ -1,0 +1,9 @@
+{
+  "api_key": "",
+  "api_base": "https://ark.cn-beijing.volces.com/api/plan/v3",
+  "chat_model": "deepseek-v4-flash",
+  "embedding_model": "doubao-embedding-vision",
+  "embedding_dimension": 1024,
+  "embedding_provider": "volcengine",
+  "embedding_input": "multimodal"
+}

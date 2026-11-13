@@ -5,7 +5,7 @@
 
 import asyncio
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -231,7 +231,7 @@ async def test_tool_result_externalization_read_and_search(client: httpx.AsyncCl
     assert part["tool_output_ref"].startswith(f"{session_uri}/tool-results/")
     assert raw not in part["tool_output"]
     assert "kind: text" in part["tool_output"]
-    assert "openviking_tool_result_search" in part["tool_output"]
+    assert "Original output is saved at the ref above." in part["tool_output"]
 
     tool_result_id = part["tool_output_ref"].rsplit("/", 1)[-1]
     read_resp = await client.get(
@@ -303,8 +303,13 @@ async def test_tool_result_externalization_respects_server_config_disabled(servi
 
 
 async def test_get_session_context_includes_incomplete_archive_messages(
-    client: httpx.AsyncClient, service
+    client: httpx.AsyncClient, service, monkeypatch
 ):
+    monkeypatch.setattr(
+        service.sessions._session_compressor,
+        "extract_long_term_memories",
+        AsyncMock(return_value=[]),
+    )
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]
 
@@ -314,7 +319,8 @@ async def test_get_session_context_includes_incomplete_archive_messages(
     )
     commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
     assert commit_resp.status_code == 200
-    await _wait_for_task(client, commit_resp.json()["result"]["task_id"])
+    task = await _wait_for_task(client, commit_resp.json()["result"]["task_id"])
+    assert task["status"] == "completed"
 
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     session = service.sessions.session(ctx, session_id)
@@ -821,7 +827,7 @@ async def test_extract_session_jsonable_regression(client: httpx.AsyncClient, se
     assert body["result"] == [{"uri": "viking://user/memories/mock.md"}]
 
 
-async def test_get_session_context_endpoint_requires_complete_summary_budget(
+async def test_get_session_context_endpoint_enforces_summary_budget_and_preserves_tool_messages(
     client: httpx.AsyncClient,
 ):
     create_resp = await client.post("/api/v1/sessions", json={})
@@ -860,9 +866,11 @@ async def test_get_session_context_endpoint_requires_complete_summary_budget(
 
     resp = await client.get(f"/api/v1/sessions/{session_id}/context?token_budget=128000")
     assert resp.status_code == 200
-    result = resp.json()["result"]
+    body = resp.json()
+    assert body["status"] == "ok"
+
+    result = body["result"]
     assert result["latest_archive_overview"]
-    assert result["latest_finished_archive_id"] == "archive_001"
     assert result["pre_archive_abstracts"] == []
     assert len(result["messages"]) == 1
     assert result["messages"][0]["role"] == "assistant"
@@ -870,6 +878,10 @@ async def test_get_session_context_endpoint_requires_complete_summary_budget(
         part["type"] == "tool" and part["tool_id"] == "tool_123"
         for part in result["messages"][0]["parts"]
     )
+    assert result["stats"]["totalArchives"] == 1
+    assert result["stats"]["includedArchives"] == 0
+    assert result["stats"]["droppedArchives"] == 1
+    assert result["stats"]["failedArchives"] == 0
 
 
 async def test_get_session_archive_endpoint_returns_archive_details(client: httpx.AsyncClient):
@@ -878,7 +890,11 @@ async def test_get_session_archive_endpoint_returns_archive_details(client: http
 
     await client.post(
         f"/api/v1/sessions/{session_id}/messages",
-        json=_message_request("user", content="archived question"),
+        json={
+            **_message_request("user", content="archived question"),
+            "message_kind": "user_query",
+            "source_message_ids": ["native-archived-question"],
+        },
     )
     await client.post(
         f"/api/v1/sessions/{session_id}/messages",
@@ -899,9 +915,13 @@ async def test_get_session_archive_endpoint_returns_archive_details(client: http
         "archived question",
         "archived answer",
     ]
+    user = body["result"]["messages"][0]
+    assert user["source_message_ids"] == ["native-archived-question"]
+    assert user["message_kind"] == "user_query"
+    assert user["id"] != "native-archived-question"
 
 
-async def test_commit_endpoint_rejects_after_failed_archive(
+async def test_commit_endpoint_allows_new_commit_after_failed_archive(
     client: httpx.AsyncClient,
     service,
 ):
@@ -929,8 +949,15 @@ async def test_commit_endpoint_rejects_after_failed_archive(
     )
     resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
 
-    assert resp.status_code == 412
+    assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "error"
-    assert body["error"]["code"] == "FAILED_PRECONDITION"
-    assert "unresolved failed archive" in body["error"]["message"]
+    assert body["status"] == "ok"
+    assert body["result"]["archived"] is True
+    second_task_id = body["result"]["task_id"]
+    assert second_task_id != task_id
+    second_task = await _wait_for_task(client, second_task_id)
+    assert second_task["status"] == "failed"
+
+    session_resp = await client.get(f"/api/v1/sessions/{session_id}")
+    assert session_resp.status_code == 200
+    assert session_resp.json()["result"]["commit_count"] == 2

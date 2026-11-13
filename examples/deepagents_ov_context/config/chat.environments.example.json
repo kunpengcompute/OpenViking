@@ -1,0 +1,10 @@
+[
+  {
+    "id": "experiment",
+    "label": "隔离实验",
+    "ov_url": "http://127.0.0.1:19461",
+    "account_id": "memory-bench",
+    "env_file": "/config/experiment.env",
+    "api_key_file": "/config/experiment-ov.key"
+  }
+]

@@ -72,6 +72,8 @@ def make_session(root: Path, **overrides: Any) -> Session:
 class SessionBatchClient:
     """Use native asynchronous writes and compression receipts."""
 
+    _initialized = True
+
     def __init__(self, session: Session) -> None:
         self.session = session
         self.requests: list[list[dict[str, Any]]] = []

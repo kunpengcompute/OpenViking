@@ -4,12 +4,14 @@
 Tests for MemoryUpdater.
 """
 
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from openviking.message import Message
-from openviking.message.part import TextPart
+from openviking.message.part import Part, TextPart, ToolPart
+from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.dataclass import (
     MemoryField,
@@ -100,6 +102,100 @@ class TestMemoryUpdater:
         assert extract_context.page_id_map is not None
         page_id = extract_context.page_id_map.get_page_id("viking://user/a/memories/profile.md")
         assert page_id == 1
+
+    @pytest.mark.parametrize("peer_id", [None, "weather-agent"])
+    def test_extract_context_event_content_skips_tool_only_messages(
+        self, peer_id: str | None
+    ) -> None:
+        messages = [
+            Message(
+                id="0",
+                role="assistant",
+                peer_id=peer_id,
+                parts=[TextPart(text="Started writing.")],
+            ),
+            Message(
+                id="1",
+                role="assistant",
+                peer_id=peer_id,
+                parts=[ToolPart(tool_name="write", tool_status="pending")],
+            ),
+            Message(
+                id="2",
+                role="user",
+                peer_id=peer_id,
+                parts=[ToolPart(tool_name="write", tool_status="completed", tool_output="OK")],
+            ),
+            Message(
+                id="3",
+                role="assistant",
+                peer_id=peer_id,
+                parts=[TextPart(text="Finished writing."), ToolPart(tool_name="write")],
+            ),
+        ]
+        original = deepcopy(messages)
+        context = ExtractContext(messages)
+        speaker = peer_id or "assistant"
+        expected = f"[{speaker}]: Started writing.\n[{speaker}]: Finished writing."
+
+        assert context.get_event_content("0-3", "Summary", 0) == expected
+        assert context.get_event_content("0,3", "Summary", 0) == expected.replace("\n", "\n...\n")
+        assert context.read_message_ranges("1-2").elements == [messages[1:3]]
+        assert messages == original
+
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.load_from_yaml(
+            str(PromptManager._get_bundled_templates_dir() / "memory" / "events.yaml")
+        )
+        rendered = MemoryFileUtils.write(
+            MemoryFile(extra_fields={"summary": "Summary", "ranges": "0-3"}),
+            content_template=registry.get("events").content_template,
+            extract_context=context,
+        )
+        assert expected in rendered
+        assert not any(line.strip() == f"[{speaker}]:" for line in rendered.splitlines())
+
+    @pytest.mark.parametrize("peer_id", [None, "weather-agent"])
+    @pytest.mark.parametrize(
+        "parts",
+        [
+            pytest.param([], id="no-parts"),
+            pytest.param([TextPart(text="")], id="empty-text"),
+            pytest.param([TextPart(text=" \t\n")], id="whitespace-text"),
+            pytest.param([ToolPart(tool_name="read", tool_status="pending")], id="tool-call"),
+            pytest.param(
+                [ToolPart(tool_name="read", tool_status="completed", tool_output="OK")],
+                id="tool-result",
+            ),
+        ],
+    )
+    def test_extract_context_event_content_skips_empty_bodies(
+        self, peer_id: str | None, parts: list[Part]
+    ) -> None:
+        context = ExtractContext([Message(id="0", role="user", peer_id=peer_id, parts=parts)])
+
+        assert context.read_message_ranges("0").pretty_print() == ""
+        assert context.get_event_content("0", "", 0) == ""
+        assert context.get_event_content("0", "Summary", 0) == "Summary"
+
+    @pytest.mark.parametrize("peer_id", [None, "weather-agent"])
+    def test_extract_context_event_content_preserves_chunks_around_tool_messages(
+        self, peer_id: str | None
+    ) -> None:
+        text = "A long source message with several sentences. " * 12
+        messages = [
+            Message(id="0", role="assistant", peer_id=peer_id, parts=[TextPart(text=text)]),
+            Message(id="1", role="assistant", peer_id=peer_id, parts=[ToolPart(tool_name="read")]),
+            Message(id="2", role="user", peer_id=peer_id, parts=[TextPart(text="Confirmed.")]),
+        ]
+        original = deepcopy(messages)
+        context = ExtractContext(messages)
+
+        assert len(context.messages) > len(messages)
+        assert context.get_event_content(f"0-{len(context.messages) - 1}", "Summary", 0) == (
+            f"[{peer_id or 'assistant'}]: {text}\n[{peer_id or 'user'}]: Confirmed."
+        )
+        assert messages == original
 
     def test_create(self):
         """Test creating a MemoryUpdater."""

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 try:
     from langchain_core.messages import SystemMessage
@@ -18,13 +18,15 @@ except ImportError as exc:  # pragma: no cover - exercised by optional import pa
     raise missing_dependency("langchain", "langchain-core") from exc
 
 from openviking.integrations.langchain.client import (
-    OpenVikingCommitPolicy,
     OpenVikingConnection,
     call_openviking,
     ensure_client,
     extract_message_text,
     get_latest_user_text,
 )
+
+if TYPE_CHECKING:
+    from openviking.integrations.langchain.middleware import OpenVikingCommitPolicy
 from openviking.integrations.langchain.history import (
     OpenVikingChatMessageHistory,
     context_parts_from_documents,

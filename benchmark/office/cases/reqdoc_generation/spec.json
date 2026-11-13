@@ -1,0 +1,138 @@
+{
+  "version": "reqdoc-independent-shared-helpers-v13",
+  "input_dir": "benchmark/office/datasets/reqdoc_generation/inputs",
+  "inputs": [
+    {
+      "filename": "business_background.md",
+      "sha256": "89eb4597b02fbbf723fecf76bf57aaa43d453bf5d0e34e92d30c14d12b6209f3"
+    },
+    {
+      "filename": "requirements_confirmed.md",
+      "sha256": "3c32fd4268ddccaa39396b2fb1fa3850549c6e5924924717318f147f12efdba4"
+    },
+    {
+      "filename": "change_log.docx",
+      "sha256": "02a342b1e6b45fcc35da1d73e2c56bb06bffb575d0626f6a12a3a1d31f2a1d20"
+    },
+    {
+      "filename": "api_contract.json",
+      "sha256": "61a9d97e953e7d5656513767a6f82673b9e413e74b9e0aa126c40c89f6ca7e92"
+    },
+    {
+      "filename": "metrics.xlsx",
+      "sha256": "44725db7ae4ffb20025b587d7c02ab4bb2682d4bf7fa3cdc21e232f898238a86"
+    },
+    {
+      "filename": "prototype.pdf",
+      "sha256": "97e987fcd326ff9fbca19a3f0b4356e31ce205f11089432b2f3ff54eced70a03"
+    },
+    {
+      "filename": "record_helpers.py",
+      "sha256": "f65c22209b8dfdd08ee5116396d376749af09013abf41546c032e79fc8701649"
+    }
+  ],
+  "output": "requirements.md",
+  "phases": {
+    "Q": {
+      "prompt": "benchmark/office/tasks/reqdoc_generation/Q.md",
+      "sha256": "da7dfacc7b089614c2a1ac1b84c970a32a237c977e012914753b7849e55c180d"
+    },
+    "H": {
+      "prompt": "benchmark/office/tasks/reqdoc_generation/H.md",
+      "sha256": "512cbfe6192a9ac31460ecf84c72fb40e1795c4f8375d177f3bf5f60d2e41724"
+    }
+  },
+  "ordinary_policy": {
+    "self": {
+      "enabled": true
+    },
+    "peer": {
+      "enabled": true
+    },
+    "memory_types": [
+      "profile",
+      "preferences",
+      "entities",
+      "events"
+    ]
+  },
+  "rubric_version": "reqdoc-independent-chapters-v11",
+  "task_scope": {
+    "RD01": {
+      "chapters": [
+        1
+      ]
+    },
+    "RD02": {
+      "chapters": [
+        2
+      ]
+    },
+    "RD03": {
+      "chapters": [
+        3
+      ]
+    },
+    "RD04": {
+      "chapters": [
+        4
+      ]
+    },
+    "RD05": {
+      "chapters": [
+        5
+      ]
+    },
+    "RD06": {
+      "chapters": [
+        6
+      ]
+    }
+  },
+  "task_checkpoint_counts": {
+    "RD01": 4,
+    "RD02": 4,
+    "RD03": 5,
+    "RD04": 4,
+    "RD05": 5,
+    "RD06": 5
+  },
+  "closing": {
+    "after": "RD06",
+    "actions": [
+      "核对文档与计算证据",
+      "汇总问题及影响",
+      "文档交付与完成情况总结"
+    ],
+    "latency_bucket": "closing",
+    "part_of_subtasks": false,
+    "scoring": "交付检查独立于六项内容评分",
+    "repair_document": false,
+    "report_issues": true
+  },
+  "data_task_artifacts": {
+    "RD05": {
+      "script": "tmp/rd05_market_metric.py",
+      "json": "tmp/market_metric.json",
+      "section": "5"
+    },
+    "RD06": {
+      "script": "tmp/rd06_install_metric.py",
+      "json": "tmp/install_metric.json",
+      "section": "6"
+    }
+  },
+  "delivery_policy": {
+    "actual_document_download_required": true,
+    "markdown_format_required": false,
+    "link_must_be_first": false
+  },
+  "budget": {
+    "policy": "benchmark/office/cases/scoring.json",
+    "applies_to": "Q",
+    "mode": "subtask_completion_deadline",
+    "seconds": 550,
+    "success": "All checkpoints for a chapter pass and its verified completion time from Chat Run start is <=550 seconds; delivery is scored separately.",
+    "over_budget": "Continue to terminal; preserve full latency and Agent plus OV LLM usage."
+  }
+}

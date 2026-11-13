@@ -1,0 +1,81 @@
+name: ${COMPOSE_PROJECT_NAME:-ov-context}
+
+x-runtime: &runtime
+  network_mode: host
+  init: true
+  user: "${OV_UID:-1000}:${OV_GID:-1000}"
+  environment: &environment
+    OV_CONFIG_DIR: /config
+    OV_DATA_DIR: /data
+    OV_CHAT_OV_PORT: "${OV_CHAT_OV_PORT:-1933}"
+    OV_CHAT_PORT: "${OV_CHAT_PORT:-1934}"
+    OV_CHAT_OV_URL: "http://127.0.0.1:${OV_CHAT_OV_PORT:-1933}"
+    OV_CHAT_URL: "http://127.0.0.1:${OV_CHAT_PORT:-1934}"
+  volumes:
+    - ${OV_DEPLOY_HOME:?Set OV_DEPLOY_HOME}/config:/config:ro
+
+services:
+  ov:
+    <<: *runtime
+    image: ${OV_IMAGE:-ov-context-server:local}
+    build:
+      context: ../../..
+      dockerfile: examples/deepagents_ov_context/docker/Dockerfile
+      target: ov
+      network: ${OV_BUILD_NETWORK:-default}
+      args:
+        BUILD_JOBS: "${BUILD_JOBS:-4}"
+    command: [ov]
+    volumes:
+      - ${OV_DEPLOY_HOME}/config:/config:ro
+      - ${OV_DEPLOY_HOME}/data/ov:/data/ov
+    mem_limit: ${OV_MEMORY:-2g}
+    cpus: ${OV_CPUS:-2}
+    cpuset: ${OV_CPUSET:-}
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -m, examples.deepagents_ov_context.docker.runtime, health, ov]
+      interval: 15s
+      timeout: 5s
+      start_period: 45s
+      retries: 6
+
+  chat:
+    <<: *runtime
+    user: "0:0"
+    environment:
+      <<: *environment
+      OV_RUN_UID: "${OV_UID:-1000}"
+      OV_RUN_GID: "${OV_GID:-1000}"
+      OV_CASES_ENABLED: "${OV_CASES_ENABLED:-false}"
+      OV_CASE_PAGE_PORT: "${OV_CASE_PAGE_PORT:-19482}"
+      OV_CASE_IMAP_PORT: "${OV_CASE_IMAP_PORT:-19493}"
+      OV_CASE_WEBMAIL_PORT: "${OV_CASE_WEBMAIL_PORT:-19480}"
+    image: ${OV_CHAT_IMAGE:-ov-context-chat:local}
+    build:
+      context: ../../..
+      dockerfile: examples/deepagents_ov_context/docker/Dockerfile
+      target: chat
+      network: ${OV_BUILD_NETWORK:-default}
+      args:
+        BUILD_JOBS: "${BUILD_JOBS:-4}"
+    command: [chat]
+    depends_on:
+      ov:
+        condition: service_healthy
+    volumes:
+      - ${OV_DEPLOY_HOME}/config:/config:ro
+      - ${OV_DEPLOY_HOME}/data/chat:/data/chat
+      - ${OV_DEPLOY_HOME}/data/cases:/data/cases
+      - ${OV_DEPLOY_HOME}/result:/opt/openviking/result
+    shm_size: 1g
+    mem_limit: ${OV_CHAT_MEMORY:-8g}
+    cpus: ${OV_CHAT_CPUS:-8}
+    cpuset: ${OV_CHAT_CPUSET:-}
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -m, examples.deepagents_ov_context.docker.runtime, health, chat]
+      interval: 15s
+      timeout: 10s
+      start_period: 45s
+      retries: 6

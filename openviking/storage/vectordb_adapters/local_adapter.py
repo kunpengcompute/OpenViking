@@ -55,3 +55,37 @@ class LocalCollectionAdapter(CollectionAdapter):
         if collection_path:
             os.makedirs(collection_path, exist_ok=True)
         return get_or_create_local_collection(meta_data=meta, path=collection_path)
+
+    def create_collection(
+        self,
+        name: str,
+        schema: Dict[str, Any],
+        *,
+        distance: str,
+        sparse_weight: float,
+        index_name: str,
+    ) -> bool:
+        if not self.collection_exists():
+            return super().create_collection(
+                name, schema, distance=distance, sparse_weight=sparse_weight, index_name=index_name
+            )
+        collection = self.get_collection()
+        if not collection.has_index(index_name):
+            # Existing rows may outlive an interrupted first index creation.
+            # Rebuild from persisted candidates; never drop their collection.
+            meta = collection.get_meta_data()
+            scalar_fields = self._sanitize_scalar_index_fields(
+                scalar_index_fields=meta.get("ScalarIndex", []),
+                fields_meta=meta.get("Fields", []),
+            )
+            collection.create_index(
+                index_name,
+                self._build_default_index_meta(
+                    index_name=index_name,
+                    distance=distance,
+                    use_sparse=sparse_weight > 0.0,
+                    sparse_weight=sparse_weight,
+                    scalar_index_fields=scalar_fields,
+                ),
+            )
+        return False

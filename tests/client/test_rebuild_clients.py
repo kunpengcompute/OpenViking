@@ -141,17 +141,23 @@ async def test_local_client_reindex_forwards_to_service():
 
 async def test_local_client_batch_add_messages_forwards_to_session():
     class FakeSession:
+        session_id = "batch-session"
+
         def __init__(self):
             self.messages = []
 
-        def add_messages(self, specs):
+        @property
+        def meta(self):
+            return SimpleNamespace(pending_tokens=2)
+
+        async def add_messages_async(self, specs):
             self.messages.extend(specs)
             return specs
 
     fake_session = FakeSession()
 
     class FakeSessions:
-        async def get(self, session_id, ctx, auto_create=False):
+        async def open(self, session_id, ctx, auto_create=False):
             assert session_id == "batch-session"
             assert ctx is client._ctx
             assert auto_create is True
@@ -160,6 +166,7 @@ async def test_local_client_batch_add_messages_forwards_to_session():
     client = LocalClient.__new__(LocalClient)
     client._service = SimpleNamespace(sessions=FakeSessions())
     client._ctx = SimpleNamespace(user=SimpleNamespace(user_id="user-1"))
+    client._legacy_agent_id = None
 
     result = await LocalClient.batch_add_messages(
         client,
@@ -175,7 +182,13 @@ async def test_local_client_batch_add_messages_forwards_to_session():
         ],
     )
 
-    assert result == {"session_id": "batch-session", "message_count": 2, "added": 2}
+    assert result == {
+        "session_id": "batch-session",
+        "message_count": 2,
+        "added": 2,
+        "tool_views": [],
+        "pending_tokens": 2,
+    }
     assert fake_session.messages[0]["role"] == "user"
     assert fake_session.messages[0]["peer_id"] == "explicit-user"
     assert fake_session.messages[0]["created_at"] == "2026-05-28T00:00:00+00:00"
@@ -190,20 +203,18 @@ async def test_local_client_add_message_accepts_image_parts():
         def __init__(self):
             self.messages = []
 
-        def add_message(self, role, parts, peer_id=None, created_at=None):
-            self.messages.append(
-                {
-                    "role": role,
-                    "parts": parts,
-                    "peer_id": peer_id,
-                    "created_at": created_at,
-                }
-            )
+        @property
+        def meta(self):
+            return SimpleNamespace(pending_tokens=1)
+
+        async def add_messages_async(self, specs):
+            self.messages.extend(specs)
+            return specs
 
     fake_session = FakeSession()
 
     class FakeSessions:
-        async def get(self, session_id, ctx, auto_create=False):
+        async def open(self, session_id, ctx, auto_create=False):
             assert session_id == "image-session"
             assert ctx is client._ctx
             assert auto_create is True
@@ -213,6 +224,7 @@ async def test_local_client_add_message_accepts_image_parts():
     client._service = SimpleNamespace(sessions=FakeSessions())
     client._ctx = SimpleNamespace(user=SimpleNamespace(user_id="user-1"))
 
+    client._legacy_agent_id = None
     result = await LocalClient.add_message(
         client,
         "image-session",
@@ -223,7 +235,7 @@ async def test_local_client_add_message_accepts_image_parts():
         ],
     )
 
-    assert result == {"session_id": "image-session", "message_count": 1}
+    assert result == {"session_id": "image-session", "message_count": 1, "pending_tokens": 1}
     assert isinstance(fake_session.messages[0]["parts"][0], TextPart)
     assert isinstance(fake_session.messages[0]["parts"][1], ImagePart)
     assert fake_session.messages[0]["parts"][1].url == "https://example.com/image.png"

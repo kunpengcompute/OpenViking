@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Union
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
 
-from ..base import ToolCall, VLMResponse
+from ..base import ToolCall, VLMResponse, raise_for_incomplete_completion
 from .openai_vlm import OpenAIVLM
 
 logger = get_logger(__name__)
@@ -48,6 +48,7 @@ class VolcEngineVLM(OpenAIVLM):
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from Chat Completions response. Returns str or VLMResponse based on has_tools."""
         choice = response.choices[0]
+        raise_for_incomplete_completion(choice.finish_reason)
         message = choice.message
         if hasattr(message, "tool_calls") and message.tool_calls:
             tracer.info(f"message.tool_calls={message.tool_calls}")

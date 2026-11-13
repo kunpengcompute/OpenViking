@@ -7,13 +7,14 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from openviking.integrations import _message_content
-from openviking.integrations.langchain.ov_context import writer
+from openviking.integrations.langchain.ov_context import reader, writer
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter
 from tests.ov_context_support.message_examples import exchange
 
 
 def test_writer_codec_is_the_shared_entry_point() -> None:
     assert writer.encode_tool_content is _message_content.encode_tool_content
+    assert reader.decode_tool_content is _message_content.decode_tool_content
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), object()])

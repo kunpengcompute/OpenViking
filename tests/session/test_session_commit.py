@@ -518,3 +518,29 @@ class TestCommit:
         assert task_result["status"] == "completed"
         redo_log.write_pending.assert_not_called()
         redo_log.mark_done.assert_not_called()
+
+
+class TestStrictExtractionCommit:
+    async def test_extraction_failure_is_not_an_empty_success(self, client):
+        session = client.session(session_id="strict_extraction_failure")
+        session.add_message("user", [TextPart("Remember the current task")])
+        session._meta.memory_policy = {"memory_types": ["profile"]}
+        await session._save_meta()
+        session._generate_archive_summary_async = AsyncMock(return_value="Test summary")
+
+        async def compressor_with_default_swallowing(*args, strict_extract_errors=False, **kwargs):
+            if strict_extract_errors:
+                raise RuntimeError("synthetic extraction output limit")
+            return []
+
+        session._session_compressor.extract_long_term_memories = compressor_with_default_swallowing
+        receipt = await session.commit_async()
+        task = await _wait_for_task(receipt["task_id"])
+        assert task["status"] == "failed"
+        marker = json.loads(
+            await session._viking_fs.read_file(
+                f"{receipt['archive_uri']}/.failed.json", ctx=session.ctx
+            )
+        )
+        assert marker["stage"] == "memory_extraction"
+        assert "synthetic extraction output limit" in marker["error"]

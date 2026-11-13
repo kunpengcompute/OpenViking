@@ -11,6 +11,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from openviking.integrations.langchain.ov_context import (
+    AsyncMemoryClient,
     ContextAssembler,
     ContextBudgetExceeded,
     ContextHistoryBudgetError,
@@ -18,11 +19,8 @@ from openviking.integrations.langchain.ov_context import (
     ContextSnapshot,
     OVContext,
     OVContextConfig,
-    OVMessageWriter,
-)
-from openviking.integrations.ov_memoryRetrieve import (
-    AsyncMemoryClient,
     OVContextReader,
+    OVMessageWriter,
 )
 from openviking.message import Message, TextPart
 from openviking_cli.client.identity import OVIdentity

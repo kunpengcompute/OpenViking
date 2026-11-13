@@ -39,6 +39,7 @@ class MemoryIsolationHandler:
         allowed_memory_types: Optional[Set[str]] = None,
         allow_self: bool = True,
         allowed_peer_ids: Optional[Set[str]] = None,
+        session_owned: bool = False,
     ):
         self.ctx = ctx
         self._extract_context = extract_context
@@ -48,8 +49,13 @@ class MemoryIsolationHandler:
             else None
         )
         self.allow_self = bool(allow_self)
-        self.allowed_peer_ids = {item for item in allowed_peer_ids or set() if item}
+        self.allowed_peer_ids = (
+            set() if session_owned else {item for item in allowed_peer_ids or set() if item}
+        )
         self.allow_peer = bool(self.allowed_peer_ids)
+        # Execution memories describe the authenticated user's session. A source
+        # message's peer is provenance, not the owner of the resulting experience.
+        self.session_owned = session_owned
 
     def prepare_messages(self) -> None:
         """No-op hook kept for the extraction pipeline."""
@@ -148,6 +154,9 @@ class MemoryIsolationHandler:
         peer_ids = set()
         for msg_group in getattr(msg_range, "elements", []) or []:
             for msg in msg_group:
+                if self.session_owned:
+                    include_self = include_self or self.allow_self
+                    continue
                 peer_id = getattr(msg, "peer_id", None)
                 if peer_id:
                     if self._can_write_peer(peer_id):
@@ -170,6 +179,8 @@ class MemoryIsolationHandler:
 
         user_id = self.ctx.user.user_id
         operation.memory_fields["user_id"] = user_id
+        if self.session_owned:
+            operation.memory_fields.pop("peer_id", None)
 
         peer_ids_to_write: List[str] = []
         include_self = False

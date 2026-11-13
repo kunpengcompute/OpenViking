@@ -12,9 +12,10 @@ from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.session import Session
 from openviking.session.tool_result_store import ToolResultStore
 from openviking_cli.exceptions import NotFoundError
+from tests.unit.session.test_message_commit_lock import MemoryFS, install_session_locks
 
 
-class MemoryVikingFS:
+class MemoryVikingFS(MemoryFS):
     def __init__(self):
         self.files = {}
 
@@ -43,7 +44,8 @@ class MemoryVikingFS:
 
 
 @pytest.fixture(autouse=True)
-def _drain_background_tasks():
+def _drain_background_tasks(monkeypatch):
+    install_session_locks(monkeypatch)
     yield
 
 
@@ -165,7 +167,7 @@ async def test_externalized_tool_output_uses_typed_synopsis_stub(session: Sessio
     assert "kind: json" in part.tool_output
     assert "Synopsis:" in part.tool_output
     assert "users" in part.tool_output
-    assert "openviking_tool_result_search" in part.tool_output
+    assert "Original output is saved at the ref above." in part.tool_output
     assert raw not in part.tool_output
 
     tool_result_id = part.tool_output_ref.rsplit("/", 1)[-1]
@@ -349,7 +351,7 @@ async def test_assistant_turn_budget_externalizes_multiple_largest_outputs(
 ):
     session._tool_output_externalization_config = _small_config(
         threshold_chars=1200,
-        assistant_turn_inline_budget_chars=1600,
+        assistant_turn_inline_budget_chars=1200,
         assistant_turn_preview_budget_chars=120,
         preview_chars=12,
     )
@@ -387,6 +389,7 @@ async def test_assistant_turn_budget_externalizes_multiple_largest_outputs(
     assert by_id["call_c"].tool_output_truncated is False
     assert by_id["call_a"].tool_output_externalized_reason == "turn_budget"
     assert by_id["call_b"].tool_output_externalized_reason == "turn_budget"
+    assert sum(len(part.tool_output or "") for part in parts) <= 1200
 
 
 async def test_assistant_turn_budget_skips_externalization_when_stub_is_larger(session: Session):
@@ -424,7 +427,7 @@ async def test_assistant_turn_budget_skips_externalization_when_stub_is_larger(s
 async def test_assistant_turn_budget_uses_rendered_stub_length(session: Session):
     session._tool_output_externalization_config = _small_config(
         threshold_chars=1200,
-        assistant_turn_inline_budget_chars=1600,
+        assistant_turn_inline_budget_chars=1200,
         assistant_turn_preview_budget_chars=120,
         preview_chars=12,
     )
@@ -478,7 +481,9 @@ async def test_assistant_turn_budget_uses_rendered_stub_length(session: Session)
     assert by_id["call_a"].tool_output_truncated is True
     assert by_id["call_b"].tool_output_truncated is True
     assert by_id["call_c"].tool_output_truncated is False
-    assert single_externalized_total > 1600
+    # The neutral navigation text is shorter; still require two rendered stubs.
+    assert single_externalized_total > 1200
+    assert sum(len(part.tool_output or "") for part in parts) <= 1200
     assert sum(len(part.tool_output or "") for part in parts) < single_externalized_total
 
 
@@ -691,11 +696,11 @@ async def test_tool_result_search_uses_raw_payload_not_stub_helper_text(session:
     ).get_tool_parts()[0]
     tool_result_id = part.tool_output_ref.rsplit("/", 1)[-1]
 
-    assert "openviking_tool_result_read" in part.tool_output
+    assert "Original output is saved at the ref above." in part.tool_output
     raw_match = await session.search_tool_result(tool_result_id, query="needle")
     helper_match = await session.search_tool_result(
         tool_result_id,
-        query="openviking_tool_result_read",
+        query="Original output is saved at the ref above.",
     )
 
     assert len(raw_match["matches"]) == 1

@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """LockContext — async context manager for acquiring/releasing path locks."""
 
-from typing import Optional
+from typing import Any, Optional
 
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.transaction.lock_handle import LockHandle
 from openviking.storage.transaction.lock_lease import OwnedLockLease
-from openviking.storage.transaction.lock_manager import LockManager
+from openviking.storage.transaction.lock_manager import LOCK_TIMEOUT_DEFAULT, LockManager
 
 
 class LockContext:
@@ -25,6 +25,7 @@ class LockContext:
         mv_dst_path: Optional[str] = None,
         src_is_dir: bool = True,
         handle: Optional[LockHandle] = None,
+        timeout: Any = LOCK_TIMEOUT_DEFAULT,
     ):
         self._manager = lock_manager
         self._paths = paths
@@ -36,6 +37,7 @@ class LockContext:
         self._locks_before: list[str] = []
         self._acquired_lock_paths: list[str] = []
         self._owned_lease: Optional[OwnedLockLease] = None
+        self._timeout_kwargs = {} if timeout is LOCK_TIMEOUT_DEFAULT else {"timeout": timeout}
 
     async def __aenter__(self) -> LockHandle:
         if self._handle is None:
@@ -45,11 +47,15 @@ class LockContext:
 
         if self._lock_mode == "tree":
             for path in self._paths:
-                success = await self._manager.acquire_tree(self._handle, path)
+                success = await self._manager.acquire_tree(
+                    self._handle, path, **self._timeout_kwargs
+                )
                 if not success:
                     break
         elif self._lock_mode == "exact":
-            success = await self._manager.acquire_exact_path_batch(self._handle, self._paths)
+            success = await self._manager.acquire_exact_path_batch(
+                self._handle, self._paths, **self._timeout_kwargs
+            )
         elif self._lock_mode == "mv":
             if self._mv_dst_path is None:
                 raise LockAcquisitionError("mv lock mode requires mv_dst_path")
@@ -58,6 +64,7 @@ class LockContext:
                 self._paths[0],
                 self._mv_dst_path,
                 src_is_dir=self._src_is_dir,
+                **self._timeout_kwargs,
             )
         else:
             raise LockAcquisitionError(f"Unsupported lock mode: {self._lock_mode}")

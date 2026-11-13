@@ -12,6 +12,28 @@ MessageContent = str | list[str | dict[str, Any]]
 LANGCHAIN_CONTENT_MIME = "application/vnd.langchain.message-content+json"
 
 
+def has_image_blocks(content: MessageContent) -> bool:
+    """Recognize multimodal blocks without inspecting or copying image bytes."""
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") in {"image", "image_url", "input_image"}
+        for block in content
+    )
+
+
+def tool_output_has_images(output: str, mime: str) -> bool:
+    """Exclude images from text externalization, including encoded tool blocks."""
+    media_type = mime.partition(";")[0].strip().lower()
+    if media_type.startswith("image/"):
+        return True
+    if media_type not in {LANGCHAIN_CONTENT_MIME, "application/json"}:
+        return False
+    try:
+        content = json.loads(output)
+    except (TypeError, ValueError):
+        return False
+    return has_image_blocks(content)
+
+
 def normalize_image_block(block: dict[str, Any]) -> dict[str, Any]:
     """Use the same URL/data-URL representation without modifying source blocks."""
     kind = block.get("type")

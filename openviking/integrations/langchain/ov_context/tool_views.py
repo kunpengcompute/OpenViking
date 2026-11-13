@@ -9,6 +9,8 @@ from typing import Any, Mapping
 
 from langchain_core.messages import BaseMessage, ToolMessage
 
+from openviking.integrations._message_content import has_image_blocks
+
 BACKTRACKING_TOOLS = (
     "openviking_tool_result_read",
     "openviking_tool_result_search_many",
@@ -62,5 +64,9 @@ def apply_tool_views(
             logger.warning("Ignoring OV tool view with invalid call ID, output or reference")
             continue
         applied.add(key)
-        if index not in protected_indices and output != message.content:
+        if (
+            index not in protected_indices
+            and not has_image_blocks(message.content)
+            and output != message.content
+        ):
             model_messages[index] = message.model_copy(update={"content": output})

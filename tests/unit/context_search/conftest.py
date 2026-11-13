@@ -7,6 +7,8 @@ import socket
 
 import pytest
 
+from tests.ov_context_support.recall_api import api as api
+
 
 @pytest.fixture(autouse=True)
 def block_network(monkeypatch):

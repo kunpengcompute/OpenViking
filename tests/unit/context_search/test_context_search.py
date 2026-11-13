@@ -1,204 +1,25 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Offline contracts through the SDK, router and search service; Reader tests land separately."""
+"""Offline contracts through the real reader, SDK, router and search service."""
 
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import httpx
 import pytest
-import pytest_asyncio
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 
 from openviking.client.local import LocalClient
-from openviking.integrations.ov_memoryRetrieve import MemoryReaderConfig, OVContextReader
-from openviking.models.embedder.base import EmbedResult, embed_compat
+from openviking.models.embedder.base import embed_compat
 from openviking.models.embedder.query_cache import query_embed_cache_scope
 from openviking.retrieve.intent_analyzer import IntentAnalyzer
-from openviking.server.auth import get_request_context
-from openviking.server.identity import RequestContext, Role
-from openviking.server.routers import search as search_router
-from openviking.service.search_service import SearchService
-from openviking.storage.expr import And, Eq, Or, PathScope, RawDSL
 from openviking.utils.token_estimation import estimate_text_tokens
-from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.client.identity import OVIdentity
 from openviking_cli.client.sync_http import SyncHTTPClient
-from openviking_cli.exceptions import InvalidArgumentError, OpenVikingError, PermissionDeniedError
+from openviking_cli.exceptions import InvalidArgumentError, PermissionDeniedError
 from openviking_cli.retrieve.context import ContextSearchOptions, RecallPolicy
 from openviking_cli.retrieve.types import ContextType, FindResult, MatchedContext
-from openviking_cli.session.user_id import UserIdentifier
-
-
-class Embedder:
-    def __init__(self):
-        self.calls = 0
-        self.fail = False
-        self.release = asyncio.Event()
-        self.release.set()
-        self.started = asyncio.Event()
-        self.cancelled = 0
-
-    def prepare_embedding_input(self, text):
-        return text
-
-    async def embed_async(self, text, *, is_query):
-        self.calls += 1
-        self.started.set()
-        try:
-            await self.release.wait()
-            await asyncio.sleep(0)
-            if self.fail:
-                raise RuntimeError("fixture model unavailable")
-            return EmbedResult(dense_vector=[1.0, 0.0])
-        except asyncio.CancelledError:
-            self.cancelled += 1
-            raise
-
-
-def context(user="alice"):
-    return RequestContext(UserIdentifier("tenant", user), Role.USER, actor_peer_id="assistant")
-
-
-def matches(expr, item):
-    if expr is None:
-        return True
-    if isinstance(expr, And):
-        return all(matches(e, item) for e in expr.conds)
-    if isinstance(expr, Or):
-        return any(matches(e, item) for e in expr.conds)
-    if isinstance(expr, PathScope):
-        return item.uri == expr.path or item.uri.startswith(expr.path.rstrip("/") + "/")
-    if isinstance(expr, Eq):
-        return getattr(item, expr.field) == expr.value
-    if isinstance(expr, RawDSL):
-        expr = expr.payload
-    if expr["op"] == "contains":
-        return expr["substring"] in getattr(item, expr["field"])
-    if expr["op"] == "must":
-        return getattr(item, expr["field"]) in expr["conds"]
-    if expr["op"] == "and":
-        return all(matches(e, item) for e in expr["conds"])
-    raise AssertionError(expr)
-
-
-class FixtureFS:
-    def __init__(self):
-        self.embedder = Embedder()
-        self.calls = []
-        self.reads = []
-        self.error = None
-        self.read_error = None
-        self.search = AsyncMock(side_effect=AssertionError("Context must not enter session search"))
-        self.categories = {
-            "events": 6,
-            "entities": 2,
-            "preferences": 2,
-            "experiences": 2,
-            "cases": 1,
-        }
-        self.extra_items = []
-        self.body = "## Situation\nAn API timed out.\n\n## Approach\nRetry once using the recorded request ID.\n\n## Reflect\nCheck the outcome."
-
-    async def find(self, query, *, ctx, target_uri, limit, filter=None, **kwargs):
-        self.calls.append((query, ctx, target_uri, limit, filter, kwargs))
-        await embed_compat(self.embedder, query, is_query=True)
-        if self.error:
-            raise self.error
-        roots = [target_uri] if isinstance(target_uri, str) else target_uri
-        roots = [
-            r.replace("viking://user/memories", f"viking://user/{ctx.user.user_id}/memories")
-            for r in roots
-            if r
-        ]
-        items = []
-        for cat, count in self.categories.items():
-            for n in range(count):
-                uri = f"viking://user/{ctx.user.user_id}/memories/{cat}/{n}.md"
-                item = MatchedContext(
-                    uri=uri,
-                    context_type=ContextType.MEMORY,
-                    category=cat,
-                    score=(0.95 if cat == "events" else 0.6) - n / 100,
-                    abstract=f"{cat} fact {n}",
-                )
-                items.append(item)
-        items.extend(self.extra_items)
-        items = [
-            item
-            for item in items
-            if (
-                not roots
-                or any(
-                    item.uri == root or item.uri.startswith(root.rstrip("/") + "/")
-                    for root in roots
-                )
-            )
-            and matches(filter, item)
-        ]
-        items.sort(key=lambda i: -i.score)
-        selected = items[:limit]
-        return FindResult(
-            memories=[i for i in selected if i.context_type == ContextType.MEMORY],
-            resources=[i for i in selected if i.context_type == ContextType.RESOURCE],
-            skills=[i for i in selected if i.context_type == ContextType.SKILL],
-        )
-
-    async def read(self, uri, *, ctx):
-        self.reads.append((uri, ctx))
-        if self.read_error:
-            raise self.read_error
-        return self.body.encode()
-
-
-@pytest_asyncio.fixture
-async def api(monkeypatch):
-    monkeypatch.setattr(
-        IntentAnalyzer,
-        "analyze",
-        AsyncMock(side_effect=AssertionError("Intent analysis forbidden")),
-    )
-    fs = FixtureFS()
-    service = SimpleNamespace(
-        search=SearchService(fs),
-        sessions=SimpleNamespace(
-            session=AsyncMock(side_effect=AssertionError("Session access forbidden"))
-        ),
-    )
-    monkeypatch.setattr(search_router, "get_service", lambda: service)
-    app = FastAPI()
-    app.include_router(search_router.router)
-
-    async def identity(request: Request):
-        return context(request.headers.get("X-OpenViking-User", "alice"))
-
-    app.dependency_overrides[get_request_context] = identity
-
-    @app.exception_handler(OpenVikingError)
-    async def error_handler(request, exc):
-        return JSONResponse(
-            status_code=403 if isinstance(exc, PermissionDeniedError) else 400,
-            content={"status": "error", "error": {"code": exc.code, "message": str(exc)}},
-        )
-
-    transport = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture")
-    sdk = AsyncHTTPClient(
-        url="http://fixture",
-        user="alice",
-        account="tenant",
-        auth_mode="trusted",
-        profile_enabled=False,
-        http_client=transport,
-    )
-    await sdk.initialize()
-    try:
-        yield fs, service, sdk
-    finally:
-        await sdk.close()
-        await transport.aclose()
+from tests.ov_context_support.recall_api import Embedder, context, hit
 
 
 async def test_context_with_session_id_bypasses_history_on_server_and_local(api):
@@ -521,17 +342,6 @@ def test_sync_sdk_forwards_context_options(monkeypatch):
     assert sdk.search("q", mode="context", quotas={"events": 1}, max_tokens=500) is expected
     assert asynchronous.search.call_args.kwargs["mode"] == "context"
     assert asynchronous.search.call_args.kwargs["max_tokens"] == 500
-
-
-def hit(uri, context_type=ContextType.MEMORY, score=0.6, *, level=2, category=""):
-    return MatchedContext(
-        uri=uri,
-        context_type=context_type,
-        category=category,
-        score=score,
-        abstract=f"fact {uri}",
-        level=level,
-    )
 
 
 async def test_resource_scopes_and_type_filter_are_applied_before_top_k(api):
@@ -951,237 +761,27 @@ async def test_list_mode_rejects_context_only_options_without_retrieving(api, op
     fs.search.assert_not_called()
 
 
-@pytest.mark.parametrize("config", [None, MemoryReaderConfig()])
-async def test_reader_default_context_has_one_find_one_embedding_no_session(
-    api, monkeypatch, config
-):
-    fs, service, sdk = api
-    search = AsyncMock(wraps=sdk.search)
-    monkeypatch.setattr(sdk, "search", search)
-    monkeypatch.setattr(
-        sdk, "find", AsyncMock(side_effect=AssertionError("Default must use search"))
+async def test_find_multiple_paths_shares_one_embedding_and_combined_limit(api):
+    fs, _, sdk = api
+    roots = [f"viking://user/alice/memories/{category}" for category in ("events", "preferences")]
+    result = await sdk.find(
+        "原始问题",
+        target_uri=roots,
+        limit=2,
+        identity=OVIdentity("tenant", "alice", "assistant"),
     )
-    reader = OVContextReader(sdk) if config is None else OVContextReader(sdk, config)
-    assert reader.config.search_mode == "context"
-    result = await reader.recall("  original query  ", session_id="ignored-session")
-    assert result.status == "success" and result.count == 5
     assert len(fs.calls) == 1 and fs.embedder.calls == 1
-    assert fs.calls[0][0] == "  original query  "
-    assert fs.calls[0][2] == "viking://user/memories" and fs.calls[0][3] == 20
-    assert not fs.reads and len(result.content) <= 4000
-    search.assert_awaited_once()
-    assert search.await_args.kwargs["mode"] == "context"
-    sdk.find.assert_not_awaited()
-    service.sessions.session.assert_not_called()
-    fs.search.assert_not_called()
-    IntentAnalyzer.analyze.assert_not_called()
+    assert fs.calls[0][2] == roots
+    assert len(result.memories) == 2
+    assert all(item.category == "events" for item in result.memories)
 
 
-async def test_reader_four_buckets_share_embedding_and_read_complete_experience(api):
-    fs, service, sdk = api
-    cfg = MemoryReaderConfig(
-        search_mode="context",
-        experience_enabled=True,
-        recall_quotas={"events": 2, "entities": 1, "preferences": 1, "experiences": 1},
-    )
-    result = await OVContextReader(sdk, cfg).recall("hello", session_id="ignored")
-    assert result.status == "success" and result.count == 5
-    assert len(fs.calls) == 8 and fs.embedder.calls == 1
-    assert "recorded request ID" in result.content
-    assert 'type="experiences"' in result.content
-    assert all("/experiences/" in uri for uri, _ in fs.reads)
-    assert all(call[0] == "hello" for call in fs.calls)
-    service.sessions.session.assert_not_called()
-
-
-async def test_reader_custom_scopes_and_other_memory_types_are_preserved(api):
+async def test_find_multiple_paths_propagates_authentication_failure(api):
     fs, _, sdk = api
-    cfg = MemoryReaderConfig(
-        search_mode="context", target_uris=("viking://user/alice/memories/cases",)
-    )
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.count == 1 and "/cases/0.md" in result.content
-    assert fs.calls[0][2] == cfg.target_uris[0]
-
-
-async def test_reader_multiple_reader_scopes_share_one_embedding(api):
-    fs, _, sdk = api
-    cfg = MemoryReaderConfig(
-        search_mode="context",
-        target_uris=(
-            "viking://user/alice/memories/cases",
-            "viking://user/alice/memories/preferences",
-        ),
-    )
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.count == 3
-    assert len(fs.calls) == 2 and fs.embedder.calls == 1
-
-
-async def test_reader_context_scope_failure_can_return_other_scope_results(api, monkeypatch):
-    fs, _, sdk = api
-    original = fs.find
-
-    async def find(query, *, target_uri, **kwargs):
-        if target_uri.endswith("/unavailable"):
-            raise RuntimeError("offline scope")
-        return await original(query, target_uri=target_uri, **kwargs)
-
-    monkeypatch.setattr(fs, "find", find)
-    cfg = MemoryReaderConfig(
-        search_mode="context",
-        target_uris=(
-            "viking://user/alice/memories/unavailable",
-            "viking://user/alice/memories/cases",
-        ),
-    )
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.status == "success" and result.count == 1
-
-
-async def test_reader_auth_errors_are_raised_but_optional_failures_are_diagnosed(api):
-    fs, _, sdk = api
-    reader = OVContextReader(sdk, MemoryReaderConfig(search_mode="context"))
-    fs.error = PermissionDeniedError("forbidden")
+    fs.error = PermissionDeniedError("blocked")
     with pytest.raises(PermissionDeniedError):
-        await reader.recall("q")
-    fs.error = RuntimeError("unavailable")
-    assert (await reader.recall("q")).status == "error"
-
-
-async def test_reader_timeout_cleans_up_shared_embedding(api):
-    fs, _, sdk = api
-    fs.embedder.release.clear()
-    cfg = MemoryReaderConfig(
-        search_mode="context", recall_timeout=0.03, recall_quotas={"events": 1, "preferences": 1}
-    )
-    assert (await OVContextReader(sdk, cfg).recall("q")).status == "timeout"
-    for _ in range(20):
-        await asyncio.sleep(0)
-    assert fs.embedder.cancelled == 1
-
-
-async def test_reader_memories_quota_rejected_at_reader_sdk_service_and_http(api):
-    fs, service, sdk = api
-    from openviking_cli.exceptions import InvalidArgumentError
-
-    with pytest.raises(ValueError):
-        MemoryReaderConfig(search_mode="context", recall_quotas={"memories": 1})
-    with pytest.raises(ValueError):
-        await sdk.search("q", mode="context", quotas={"memories": 1})
-    with pytest.raises(InvalidArgumentError):
-        await service.search.search("q", ctx=context(), mode="context", quotas={"memories": 1})
-    response = await sdk._http.post(
-        "http://fixture/api/v1/search/search",
-        json={"query": "q", "mode": "context", "quotas": {"memories": 1}},
-    )
-    assert response.status_code == 422
-    assert not fs.calls and fs.embedder.calls == 0
-    assert ContextSearchOptions(mode="context", detail={"memories": "abstract"}).detail
-
-
-async def test_reader_recalls_all_six_buckets_with_local_skill_roots(api):
-    fs, _, sdk = api
-    fs.extra_items = [
-        hit("viking://user/alice/resources/guide.md", ContextType.RESOURCE),
-        hit("viking://user/alice/skills/deploy/SKILL.md", ContextType.SKILL),
-        hit("viking://user/alice/memories/skills/usage.md"),
-        hit("viking://user/bob/skills/private/SKILL.md", ContextType.SKILL, 0.99),
-    ]
-    quotas = dict.fromkeys(
-        ("events", "entities", "preferences", "experiences", "resources", "skills"), 1
-    )
-    cfg = MemoryReaderConfig(search_mode="context", recall_quotas=quotas, recall_limit=1)
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.status == "success" and result.count == 6
-    for category in quotas:
-        assert f'type="{category}"' in result.content
-    assert "usage.md" not in result.content and "/bob/" not in result.content
-    targets = {c[2] for c in fs.calls}
-    assert "viking://user/alice/skills" in targets
-    assert "viking://agent/skills" not in targets
-    assert fs.embedder.calls == 1
-
-
-async def test_reader_quota_scope_prevents_named_and_nested_category_starvation(api):
-    fs, _, sdk = api
-    fs.categories = {"events": 50, "preferences": 1}
-    fs.extra_items = [
-        hit(f"viking://user/alice/memories/custom/preferences/{i}.md", score=0.99)
-        for i in range(50)
-    ]
-    cfg = MemoryReaderConfig(
-        search_mode="context", candidate_limit=20, recall_quotas={"preferences": 1}
-    )
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.count == 1 and "/memories/preferences/0.md" in result.content
-    assert all(c[2].endswith("/memories/preferences") for c in fs.calls)
-
-
-@pytest.mark.parametrize(
-    "target", ["viking://user/alice/memories", "viking://user/alice/memories/cases"]
-)
-async def test_reader_explicit_memory_scope_never_expands_to_resources_or_skills(api, target):
-    fs, _, sdk = api
-    cfg = MemoryReaderConfig(
-        search_mode="context",
-        target_uris=(target,),
-        recall_quotas={"resources": 1, "skills": 1},
-    )
-    assert (await OVContextReader(sdk, cfg).recall("q")).status == "empty"
-    assert not fs.calls
-
-
-async def test_reader_quotas_override_legacy_switches_and_counts_but_preserve_budgets(api):
-    _, _, sdk = api
-    cfg = MemoryReaderConfig(
-        search_mode="context",
-        enabled=False,
-        experience_enabled=False,
-        recall_limit=0,
-        experience_limit=0,
-        candidate_limit=1,
-        experience_candidate_limit=1,
-        recall_quotas={"events": 6, "experiences": 2},
-        recall_max_tokens=8000,
-    )
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.count == 8
-    limited = MemoryReaderConfig(
-        search_mode="context",
-        recall_quotas={"events": 6},
-        max_injected_chars=1,
-    )
-    assert (await OVContextReader(sdk, limited).recall("q")).count == 0
-
-
-async def test_reader_flat_recall_keeps_other_memory_category_but_skips_profile_and_preset_root(
-    api,
-):
-    fs, _, sdk = api
-    fs.categories = {"trajectories": 1, "tools": 1, "skills": 1, "custom": 1}
-    root = "viking://user/alice/memories"
-    fs.extra_items = [hit(f"{root}/{name}.md") for name in ("profile", "identity", "soul")]
-    fs.extra_items += [
-        hit(f"{root}/{name}.md", level=level)
-        for name, level in ((".abstract", 0), (".overview", 1))
-    ]
-    fs.extra_items += [hit(f"{root}/custom/experiences/nested.md")]
-    cfg = MemoryReaderConfig(
-        search_mode="context",
-        recall_limit=20,
-        recall_detail={"memories": "abstract"},
-    )
-    result = await OVContextReader(sdk, cfg).recall("q")
-    assert result.count == 7
-    assert "profile.md" not in result.content
-    assert "/memories/.abstract.md" not in result.content
-    assert "/memories/.overview.md" not in result.content
-    assert result.content.count('type="memories"') == 7
-
-
-async def test_reader_explicit_empty_reader_scope_disables_quota_search(api):
-    fs, _, sdk = api
-    cfg = MemoryReaderConfig(search_mode="context", target_uris=(), recall_quotas={"events": 1})
-    assert (await OVContextReader(sdk, cfg).recall("q")).status == "empty"
-    assert not fs.calls
+        await sdk.find(
+            "q",
+            target_uri=["viking://user/memories", "viking://user/peers/assistant/memories"],
+            identity=OVIdentity("tenant", "alice", "assistant"),
+        )

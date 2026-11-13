@@ -25,8 +25,8 @@ from .context_guide import BATCH_SEARCH_GUIDANCE as BATCH_SEARCH_GUIDANCE
 from .context_guide import GUIDE as GUIDE
 from .context_guide import RULES as RULES
 from .context_guide import build_context_guide
-from .contracts import ContextSnapshot
 from .errors import ContextBudgetExceeded, ContextReadError
+from .reader import ContextSnapshot
 from .state import OVContext
 
 INJECTED = "ov_context_injected"

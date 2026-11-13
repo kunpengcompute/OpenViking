@@ -1,0 +1,22 @@
+{
+  "version": "office-subtask-budget-v1",
+  "applies_to": "Q",
+  "mode": "subtask_completion_deadline",
+  "clock": "seconds from Chat Run start to each subtask's verified completion",
+  "task_count": 6,
+  "preparation_task_counts": {
+    "mail": 3
+  },
+  "budget_seconds": {
+    "schedule": 450,
+    "timesheet": 300,
+    "mail": 550,
+    "ppt_update": 120,
+    "reqdoc_generation": 550
+  },
+  "success": "All assertions for the subtask pass and its completion time is <= budget_seconds; six equally weighted subtasks per valid run.",
+  "cumulative_latency": "For the first k subtasks, max(t_1, ..., t_k); unknown or failed earlier subtasks make this cumulative time unknown.",
+  "delivery": "Whole-run status and final delivery are recorded separately from subtask success.",
+  "over_budget": "Continue to terminal; retain complete run latency and Agent plus OV LLM usage, including late and failed samples.",
+  "repetitions": 3
+}

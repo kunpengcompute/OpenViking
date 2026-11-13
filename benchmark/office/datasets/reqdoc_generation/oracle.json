@@ -1,0 +1,59 @@
+{
+  "schema_version": 3,
+  "notice": "固定模拟业务；评分端专用，不上传Agent。事实证据模式仅作有限筛查；人工核对引用、否定、条件、验收可执行性后才能签核。",
+  "facts": [
+    {"id":"V3-F01","severity":"major","conclusion":"对话生成后手动下载、登记市场和安装割裂；创建者与工作区使用者需要资产与使用闭环，收益未量化","sources":["BG-01","BG-02"],"patterns":["手动|搬运","市场","工作区"]},
+    {"id":"V3-F02","severity":"major","conclusion":"卡片同时提供下载和添加个人Skill；两者不同，点击添加后根据解析结果进入新建或更新","sources":["P-01","API-01"],"patterns":["卡片","下载","添加","新建","更新"]},
+    {"id":"V3-F03","severity":"critical","conclusion":"当前用户内以包内大小写敏感skill_identifier判断；不同标识新建，相同标识新增版本，不按名称或跨用户合并","sources":["DEC-01","API-01"],"patterns":["不同.{0,10}标识.{0,12}新建|标识不同.{0,12}新建","相同.{0,10}标识.{0,16}(新增版本|新版本)|标识相同.{0,16}(新增版本|新版本)","大小写","当前用户"]},
+    {"id":"V3-F04","severity":"major","conclusion":"新建名称可改且默认文件名去.zip，名称1-40字符，包10MiB；标识与文件名只读；固定1.0.0且无版本输入框","sources":["API-02","P-02"],"patterns":["名称","文件名","只读","1.0.0","1.{0,3}40","10.{0,3}MiB"]},
+    {"id":"V3-F05","severity":"critical","conclusion":"更新名称默认已有市场名且可改，版本必填三段数字SemVer、无前导零及后缀、大于最新版本；旧版本保留","sources":["API-03","P-03"],"patterns":["版本.{0,10}必填","SemVer|三段数字","大于.{0,8}最新","已有.{0,8}(名称|市场名)|市场.{0,8}名称","(保留|不覆盖).{0,8}旧"]},
+    {"id":"V3-F06","severity":"critical","conclusion":"本期新建默认开启安装，更新默认关闭；安装默认值的最终决议优先于旧版两者均开启的方案","sources":["DEC-02","MT-02","P-02","P-03"],"patterns":["新建.{0,20}默认.{0,8}(开启|启用|勾选)","更新.{0,20}默认.{0,8}(关闭|不勾选)"]},
+    {"id":"V3-F07","severity":"critical","conclusion":"先保存市场再按用户安装选择请求工作区；市场保存成功不等于已安装；关闭时不安装且原工作区版本不变","sources":["DEC-03","API-04","P-04"],"patterns":["先.{0,12}(保存|市场).{0,20}再.{0,20}安装","(不等于|不代表).{0,12}(安装|已安装)","(关闭|未选择).{0,24}不.{0,8}安装"]},
+    {"id":"V3-F08","severity":"critical","conclusion":"普通可写工作区安装返回200才为已安装；受控工作区202为等待审批，不能提示已安装","sources":["API-04","P-04","MT-02"],"patterns":["200","202","(待审批|等待审批)","(不等于|不代表|不能|不得).{0,16}已安装"]},
+    {"id":"V3-F09","severity":"major","conclusion":"待审批保留市场和原工作区版本，提供查看审批入口，不重复提交安装；审批引擎实现及自动回调不在范围","sources":["DEC-05","API-04","P-04"],"patterns":["(待审批|等待审批)","保留.{0,12}市场","(保留|保持).{0,12}(原|旧).{0,8}工作区","查看审批","不.{0,8}重复.{0,8}(提交|安装)"]},
+    {"id":"V3-F10","severity":"critical","conclusion":"安装失败保留市场和原工作区版本；503可重试安装，403需先恢复权限；重试不重复创建市场版本","sources":["DEC-03","API-05","P-05"],"patterns":["503","403","重试安装","权限","不.{0,8}重复.{0,8}(创建|新增)"]},
+    {"id":"V3-F11","severity":"critical","conclusion":"市场失败不调用安装且保留表单；409版本冲突需刷新并重填，不覆盖、不自动递增","sources":["API-03","API-05","P-05"],"patterns":["市场.{0,12}失败.{0,20}不.{0,8}安装","保留.{0,8}表单","409","刷新","不覆盖|不得覆盖","不.{0,8}自动递增"]},
+    {"id":"V3-F12","severity":"major","conclusion":"提交中禁用按钮；取消无副作用；相同幂等键及相同载荷重放返回同一保存版本","sources":["API-02","API-03","P-02","P-03"],"patterns":["禁用","取消","幂等","同一.{0,8}版本"]},
+    {"id":"V3-F13","severity":"critical","conclusion":"范围仅个人市场和当前工作区，排除公共发布、跨用户共享、批量迁移、其他工作区自动升级、审批引擎和DOCX交付","sources":["DEC-01","DEC-05"],"patterns":["(排除|不含|不包含|不做).{0,20}公共","跨用户","批量迁移","其他工作区","审批引擎","DOCX"]},
+    {"id":"V3-F14","severity":"critical","conclusion":"签署决议高于API高于最终原型高于历史会议；旧方案为历史，不能采用名称判重、覆盖旧版或更新默认开启","sources":["SRC-01","MT-01","MT-02","DEC-02"],"patterns":["优先级","决议","API|接口","原型","历史|废弃"]},
+    {"id":"V3-F15","severity":"major","conclusion":"M-01有效意图30，成功保存24，80%，目标至少92%；排除取消、测试及周期外意图","sources":["M-01","MET-00","DEC-04"],"patterns":["M-01","24.{0,8}30|30.{0,20}24","80\\s*[%％]","92\\s*[%％]","取消","测试","周期"]},
+    {"id":"V3-F16","severity":"major","conclusion":"M-02首次终态安装12成功/16终态=75%，目标至少96%；两条待审批不入分母，重试不混入首次","sources":["M-02","API-04","DEC-04"],"patterns":["M-02","12.{0,8}16|16.{0,20}12","75\\s*[%％]","96\\s*[%％]","首次","审批","重试"]},
+    {"id":"V3-F17","severity":"major","conclusion":"M-03取24次市场保存成功耗时，排序第12、13项260及280平均为270秒，目标不超过150秒","sources":["M-03","MET-00","DEC-04"],"patterns":["M-03","24","260","280","270\\s*(秒|s)","150\\s*(秒|s)"]},
+    {"id":"V3-F18","severity":"major","conclusion":"M-04仅手动重试安装，3成功/4终态=75%，目标至少85%；重试成功不回填首次安装成功率","sources":["M-04","M-02","DEC-04"],"patterns":["M-04","3.{0,8}4|4.{0,15}3","75\\s*[%％]","85\\s*[%％]","首次","重试"]},
+    {"id":"V3-F19","severity":"major","conclusion":"M-05满意度无采集，基准待测、目标待确认，不能把缺失填0","sources":["M-05","Q-03","DEC-04"],"patterns":["M-05","满意度","待测|未采集|未测量","待确认"]},
+    {"id":"V3-F20","severity":"major","conclusion":"统计区间2026-10-01含至10-08不含，Asia/Shanghai；先按期末截断和意图口径过滤、按event_id去重，再按逻辑尝试最大seq取状态","sources":["MET-00","M-01","M-02"],"patterns":["2026-10-01","10-08","Asia/Shanghai|上海时区|北京时间","event_id","seq","去重"]},
+    {"id":"V3-F21","severity":"major","conclusion":"Q-01接口时限、Q-02重试上限/审批时限、Q-03满意度目标/基准未给，列待确认或待测并继续成稿","sources":["Q-01","Q-02","Q-03"],"patterns":["Q-01","Q-02","Q-03","待确认","待测"]},
+    {"id":"V3-F22","severity":"major","conclusion":"预研覆盖鉴权隔离、包解析、并发幂等、状态区分、安装原子替换及事件埋点，API仅模拟只读不调用","sources":["BG-02","API-00","API-04","MET-00"],"patterns":["鉴权","隔离","幂等","原子","埋点|事件","(不调用|无需调用|仅供阅读)"]},
+    {"id":"V3-F23","severity":"major","conclusion":"验收需可执行覆盖新建/更新默认差异、保存失败、取消、关闭安装、200/202、403/503、冲突和重复提交","sources":["DEC-02","API-04","API-05","P-02","P-05"],"patterns":["验收","新建","更新","202","403","503","取消","冲突","重复"]},
+    {"id":"V3-F24","severity":"major","conclusion":"指标验收保留原始数据口径和排除理由，关键结论引用至少两种资料；正文表达完整，缺失项不能编造","sources":["SRC-01","MET-00","DEC-04"],"patterns":["来源","口径","排除","待确认|待测"]}
+  ],
+  "metrics": [
+    {"id":"M-01","baseline":80,"target":92,"baseline_relation":"eq","target_relation":"ge","unit":"%","numerator":24,"denominator":30,"formula":"24/30*100","sources":["M-01","MET-00","DEC-04"]},
+    {"id":"M-02","baseline":75,"target":96,"baseline_relation":"eq","target_relation":"ge","unit":"%","numerator":12,"denominator":16,"formula":"12/(12+4)*100","sources":["M-02","API-04","DEC-04"]},
+    {"id":"M-03","baseline":270,"target":150,"baseline_relation":"eq","target_relation":"le","unit":"秒","sample_count":24,"middle_values":[260,280],"formula":"(260+280)/2","sources":["M-03","MET-00","DEC-04"]},
+    {"id":"M-04","baseline":75,"target":85,"baseline_relation":"eq","target_relation":"ge","unit":"%","numerator":3,"denominator":4,"formula":"3/4*100","sources":["M-04","M-02","DEC-04"]},
+    {"id":"M-05","baseline":null,"target":null,"unit":"%","sources":["M-05","Q-03","DEC-04"]}
+  ],
+  "data_audit": {
+    "eligible_intents":"I001..I030",
+    "excluded_intents":{"I031":"cancelled","I032":"is_test","I033":"before period","I034":"at exclusive end","I035":"cancelled"},
+    "market_success_intents":"I001..I024",
+    "market_failed_intents":"I025..I030",
+    "first_install_success":"A001..A012",
+    "first_install_failed":"A015..A018",
+    "first_install_pending_excluded":["A013","A014"],
+    "retry_success":["R015","R016","R018"],
+    "retry_failed":["R017"],
+    "superseded":["E-S024-1","E-A012-1"],
+    "after_period_excluded":["E-A014-3"],
+    "duplicate_event_ids":["E-S001-2","E-A001-2","E-R015-1","E-S024-2"]
+  },
+  "source_families":{"background":"BG-","decisions":"DEC-","meeting":"MT-","api":"API-","metrics":"M-","prototype":"P-"},
+  "human_rubric": [
+    {"id":"H01","dimension":"事实与条件一致性","instruction":"逐项核对V3-F01..24，尤其新建/更新默认差异和200/202/403/503；同一结论在正文、流程与验收间必须一致。"},
+    {"id":"H02","dimension":"跨资料推导与引用","instruction":"核对每个关键结论的资料是否真正支持它；检查角色、状态、恢复、字段是否完成关联，不能只堆标识。"},
+    {"id":"H03","dimension":"可执行验收","instruction":"逐分支检查前置、操作、可观察结果；市场保存成功、安装成功、待审批不得混淆。"},
+    {"id":"H04","dimension":"指标独立复算","instruction":"用事件台账独立复算纳入/排除、去重、seq、周期、首次/重试、p50；确认目标来源与空值处理。"},
+    {"id":"H05","dimension":"清晰完整与不编造","instruction":"正文完整成稿、适度篇幅，不重复铺陈；缺失时限和满意度列待确认/待测；任何数值与规则必须有依据。"}
+  ]
+}

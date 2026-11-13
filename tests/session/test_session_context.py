@@ -40,6 +40,17 @@ def _install_fake_embedder(monkeypatch):
 
 
 def _install_fake_vlm(monkeypatch):
+    from openviking.session.compressor_v2 import SessionCompressorV2
+
+    async def no_long_term_extraction(self, *args, **kwargs):
+        return []
+
+    async def no_execution_extraction(self, *args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(SessionCompressorV2, "extract_long_term_memories", no_long_term_extraction)
+    monkeypatch.setattr(SessionCompressorV2, "extract_execution_memories", no_execution_extraction)
+
     async def _fake_get_completion(self, prompt, thinking=False, max_retries=0):
         return "# Test Summary\n\nFake summary for testing.\n\n## Details\nTest content."
 
@@ -306,6 +317,11 @@ class TestGetContextForSearch:
         ]
 
         first_gate.set()
+        await _wait_for_task(result1["task_id"])
+        # A successor parked behind a pending archive is dispatched by recovery.
+        from openviking.session.commit_recovery import recover_pending
+
+        recovery_task = asyncio.create_task(recover_pending(session))
         await asyncio.wait_for(second_started.wait(), timeout=5.0)
 
         first_overview = await session._viking_fs.read_file(
@@ -320,6 +336,7 @@ class TestGetContextForSearch:
         ]
 
         second_gate.set()
+        await asyncio.wait_for(recovery_task, timeout=5.0)
         await _wait_for_task(result1["task_id"])
         await _wait_for_task(result2["task_id"])
 
@@ -334,6 +351,64 @@ class TestGetContextForSearch:
 
 class TestGetSessionContext:
     """Test get_session_context"""
+
+    @pytest.mark.parametrize("failed", [False, True])
+    async def test_terminal_version_tracks_background_success_or_failure(
+        self, client: AsyncOpenViking, monkeypatch, failed: bool
+    ):
+        session = client.session(session_id="terminal_background_test")
+        session.add_message("user", [TextPart("First turn")])
+        first = await session.commit_async()
+        await _wait_for_task(first["task_id"])
+        old_overview = await session._viking_fs.read_file(
+            f"{first['archive_uri']}/.overview.md", ctx=session.ctx
+        )
+
+        gate = asyncio.Event()
+
+        async def gated_extract(*args, **kwargs):
+            await gate.wait()
+            if failed:
+                raise RuntimeError("synthetic terminal failure")
+            return []
+
+        async def new_summary(*args, **kwargs):
+            return "# New summary\n\nSecond turn"
+
+        monkeypatch.setattr(
+            session._session_compressor, "extract_long_term_memories", gated_extract
+        )
+        monkeypatch.setattr(session, "_generate_archive_summary_async", new_summary)
+        session.add_message("user", [TextPart("Second turn")])
+        second = await session.commit_async()
+        session.add_message("user", [TextPart("Current question")])
+
+        try:
+            meta = await client.get_session(session.session_id)
+            assert meta["commit_count"] == 2
+            assert meta["latest_finished_archive_id"] == "archive_001"
+            before = await session.get_session_context()
+            assert before["latest_finished_archive_id"] == "archive_001"
+            assert before["latest_archive_overview"] == old_overview
+            assert [m["parts"][0]["text"] for m in before["messages"]] == [
+                "Second turn",
+                "Current question",
+            ]
+        finally:
+            gate.set()
+
+        task = await _wait_for_task(second["task_id"])
+        assert task["status"] == ("failed" if failed else "completed")
+        meta = await client.get_session(session.session_id)
+        assert meta["latest_finished_archive_id"] == "archive_002"
+        after = await session.get_session_context()
+        assert after["latest_finished_archive_id"] == "archive_002"
+        assert after["latest_archive_overview"] == (
+            old_overview if failed else "# New summary\n\nSecond turn"
+        )
+        assert [m["parts"][0]["text"] for m in after["messages"]] == (
+            ["Second turn", "Current question"] if failed else ["Current question"]
+        )
 
     async def test_get_session_context_returns_latest_archive_overview_and_history(
         self, client: AsyncOpenViking, monkeypatch
@@ -395,10 +470,10 @@ class TestGetSessionContext:
         assert context["stats"]["activeTokens"] == session.messages[0].estimated_tokens
         assert context["stats"]["activeTokens"] > _estimate_tokens("Executing tool...")
 
-    async def test_get_session_context_reads_latest_overview_and_all_archive_abstracts(
+    async def test_get_session_context_returns_complete_latest_overview(
         self, client: AsyncOpenViking, monkeypatch
     ):
-        """Overview is only read for the latest archive; abstracts are returned for all archives."""
+        """The model view contains the complete latest overview and recent messages."""
         session = client.session(session_id="assemble_lazy_read_test")
         summaries = [
             "# Summary\n\n" + ("A" * 80),
@@ -442,13 +517,9 @@ class TestGetSessionContext:
         context = await session.get_session_context(token_budget=token_budget)
 
         assert context["latest_archive_overview"] == newest_summary
-        assert context["pre_archive_abstracts"] == [
-            {"archive_id": "archive_003", "abstract": "# Summary"},
-            {"archive_id": "archive_002", "abstract": "# Summary"},
-            {"archive_id": "archive_001", "abstract": "# Summary"},
-        ]
-        assert context["stats"]["includedArchives"] == 3
-        assert context["stats"]["droppedArchives"] == 0
+        assert context["pre_archive_abstracts"] == []
+        assert context["stats"]["includedArchives"] == 0
+        assert context["stats"]["droppedArchives"] == 3
 
         overview_reads = [u for u in read_uris if u.endswith(".overview.md")]
         abstract_reads = [u for u in read_uris if u.endswith(".abstract.md")]
@@ -462,7 +533,7 @@ class TestGetSessionContext:
             "Oldest archive overview should not be read"
         )
 
-    async def test_get_session_context_drops_oldest_pre_archive_abstracts_first(
+    async def test_get_session_context_budget_covers_summary_and_recent_messages(
         self, client: AsyncOpenViking, monkeypatch
     ):
         session = client.session(session_id="assemble_trim_oldest_abstracts_test")
@@ -487,22 +558,17 @@ class TestGetSessionContext:
         session.add_message("user", [TextPart("active tail")])
 
         newest_summary = "# Summary\n\n" + ("C" * 80)
-        previous_abstract = "# Summary"
         active_tokens = sum(m.estimated_tokens for m in session.messages)
-        token_budget = (
-            active_tokens + _estimate_tokens(newest_summary) + _estimate_tokens(previous_abstract)
-        )
+        token_budget = active_tokens + _estimate_tokens(newest_summary)
 
         context = await session.get_session_context(token_budget=token_budget)
 
         assert context["latest_archive_overview"] == newest_summary
-        assert context["pre_archive_abstracts"] == [
-            {"archive_id": "archive_003", "abstract": "# Summary"}
-        ]
+        assert context["pre_archive_abstracts"] == []
         assert context["estimatedTokens"] == token_budget
         assert context["stats"]["totalArchives"] == 3
-        assert context["stats"]["includedArchives"] == 1
-        assert context["stats"]["droppedArchives"] == 2
+        assert context["stats"]["includedArchives"] == 0
+        assert context["stats"]["droppedArchives"] == 3
 
     async def test_get_session_context_falls_back_to_older_completed_archive(
         self, client: AsyncOpenViking, monkeypatch
@@ -540,15 +606,13 @@ class TestGetSessionContext:
         context = await session.get_session_context(token_budget=128_000)
 
         assert context["latest_archive_overview"] == "# Session Summary\n\narchive one"
-        assert context["pre_archive_abstracts"] == [
-            {"archive_id": "archive_001", "abstract": "# Session Summary"}
-        ]
+        assert context["pre_archive_abstracts"] == []
         assert context["stats"]["totalArchives"] == 2
-        assert context["stats"]["includedArchives"] == 1
-        assert context["stats"]["droppedArchives"] == 0
+        assert context["stats"]["includedArchives"] == 0
+        assert context["stats"]["droppedArchives"] == 1
         assert context["stats"]["failedArchives"] == 1
 
-    async def test_get_session_context_budget_trim_drops_latest_archive_abstract(
+    async def test_get_session_context_rejects_summary_larger_than_budget(
         self, client: AsyncOpenViking, monkeypatch
     ):
         session = client.session(session_id="assemble_trim_id_test")
@@ -563,12 +627,10 @@ class TestGetSessionContext:
         result = await session.commit_async()
         await _wait_for_task(result["task_id"])
 
-        context = await session.get_session_context(token_budget=1)
+        from openviking_cli.exceptions import ResourceExhaustedError
 
-        assert context["latest_archive_overview"] == ""
-        assert context["pre_archive_abstracts"] == []
-        assert context["stats"]["includedArchives"] == 0
-        assert context["stats"]["droppedArchives"] == 1
+        with pytest.raises(ResourceExhaustedError):
+            await session.get_session_context(token_budget=1)
 
 
 class TestGetSessionArchive:

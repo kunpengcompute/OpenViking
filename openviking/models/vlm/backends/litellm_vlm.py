@@ -19,7 +19,7 @@ from openviking.telemetry import tracer
 from openviking.utils.model_retry import retry_async, retry_sync
 from openviking_cli.utils import get_logger
 
-from ..base import ToolCall, VLMBase, VLMResponse
+from ..base import ToolCall, VLMBase, VLMResponse, raise_for_incomplete_completion
 
 logger = get_logger(__name__)
 
@@ -328,6 +328,7 @@ class LiteLLMVLMProvider(VLMBase):
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from LiteLLM response. Returns str or VLMResponse based on has_tools."""
         choice = response.choices[0]
+        raise_for_incomplete_completion(choice.finish_reason)
         message = choice.message
 
         if has_tools:

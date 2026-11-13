@@ -23,6 +23,7 @@ from langchain_core.messages import (
 from openviking.integrations._message_content import (
     MessageContent,
     encode_tool_content,
+    has_image_blocks,
     normalize_image_block,
 )
 from openviking_cli.client.identity import OVIdentity
@@ -38,6 +39,7 @@ class WriteResult:
 
     model_messages keeps native LangChain types and metadata; a tool's content
     may be replaced by a short view supplied by the external implementation.
+    Image-bearing tool results retain the complete native content-block list.
     write_index is the next index in the original graph list, not an OV count.
     """
 
@@ -56,6 +58,13 @@ class MessageWriterBase(Protocol):
     Do not mutate raw_messages. Preserve native metadata and tool-call pairing.
     On failure or an unknown write outcome, raise instead of advancing the
     cursor. Retries and OV payload conversion belong to the implementation.
+
+    Tool-cycle batching additionally requires an optional synchronous
+    ``validate(messages, *, identity, peer_id) -> None`` method. It must reuse
+    the writer's local encoding/serialization checks, raise on invalid input,
+    and perform no I/O or mutation. This is a capability, not a required
+    Protocol member: writers without it keep immediate writes. Validation
+    cannot guarantee later server acceptance and must run again during write.
     """
 
     async def write(
@@ -143,6 +152,17 @@ class IdentityBatchMessageClient(Protocol):
     ) -> dict[str, Any]: ...
 
 
+@dataclass
+class _PreparedWrite:
+    end: int
+    specs: list[dict[str, Any]]
+    model_messages: list[BaseMessage]
+    positions: dict[tuple[int, int], int]
+    protected: set[int]
+    spec_ends: list[int]
+    model_ends: list[int]
+
+
 class OVMessageWriter(MessageWriterBase):
     """Borrow an initialized async OV client; keep no per-session progress.
 
@@ -155,16 +175,24 @@ class OVMessageWriter(MessageWriterBase):
         self.client = client
         self.config = config or WriterConfig()
 
-    async def write(
+    def validate(
         self,
-        session_id: str,
-        raw_messages: Sequence[BaseMessage],
-        write_index: int,
-        run_id: str = "session",
+        messages: Sequence[BaseMessage],
         *,
         identity: OVIdentity | None = None,
         peer_id: str | None = None,
-    ) -> WriteResult:
+    ) -> None:
+        """Check local encoding without I/O or changing messages and progress."""
+        self._prepare(messages, 0, identity=identity, peer_id=peer_id)
+
+    def _prepare(
+        self,
+        raw_messages: Sequence[BaseMessage],
+        write_index: int,
+        *,
+        identity: OVIdentity | None = None,
+        peer_id: str | None = None,
+    ) -> _PreparedWrite:
         if identity is not None:
             if not isinstance(identity, OVIdentity):
                 raise TypeError("identity must be an OVIdentity")
@@ -173,7 +201,7 @@ class OVMessageWriter(MessageWriterBase):
         if type(write_index) is not int or not 0 <= write_index <= end:
             raise ValueError("Invalid raw message cursor; restore the original graph history")
         if write_index == end:
-            return WriteResult([], end, 0)
+            return _PreparedWrite(end, [], [], {}, set(), [], [])
         snapshot = list(raw_messages[:end])
         calls = {
             call["id"]: call
@@ -219,7 +247,9 @@ class OVMessageWriter(MessageWriterBase):
                         raise ValueError("Tool result has no matching assistant call")
                     output, mime = encode_tool_content(item.content)
                     positions[(len(specs), len(parts))] = len(model_messages)
-                    if call["name"] in self.config.backtracking_tools:
+                    if call["name"] in self.config.backtracking_tools or has_image_blocks(
+                        item.content
+                    ):
                         protected.add(len(model_messages))
                     parts.append(
                         {
@@ -271,6 +301,24 @@ class OVMessageWriter(MessageWriterBase):
         # Validate every outgoing spec before any batch is persisted. User source
         # IDs cross the boundary; other native metadata remains local.
         json.dumps({"messages": specs}, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return _PreparedWrite(
+            end, specs, model_messages, positions, protected, spec_ends, model_ends
+        )
+
+    async def write(
+        self,
+        session_id: str,
+        raw_messages: Sequence[BaseMessage],
+        write_index: int,
+        run_id: str = "session",
+        *,
+        identity: OVIdentity | None = None,
+        peer_id: str | None = None,
+    ) -> WriteResult:
+        prepared = self._prepare(raw_messages, write_index, identity=identity, peer_id=peer_id)
+        end, specs, model_messages = prepared.end, prepared.specs, prepared.model_messages
+        positions, protected = prepared.positions, prepared.protected
+        spec_ends, model_ends = prepared.spec_ends, prepared.model_ends
 
         confirmed_index, confirmed_models = write_index, 0
         pending_tokens = None

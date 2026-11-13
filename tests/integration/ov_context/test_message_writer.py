@@ -16,7 +16,10 @@ from langchain_core.messages import (
 )
 
 from openviking.integrations._message_content import LANGCHAIN_CONTENT_MIME
+from openviking.integrations.langchain.client import OpenVikingConnection
+from openviking.integrations.langchain.ov_context import OVContext, OVContextConfig
 from openviking.integrations.langchain.ov_context.errors import IncompleteWriteError
+from openviking.integrations.langchain.ov_context.session_engine import SessionEngine
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter, WriterConfig
 from tests.ov_context_support.message_examples import exchange
 from tests.ov_context_support.writer import SessionBatchClient, make_session
@@ -256,6 +259,27 @@ async def test_partial_batches_report_confirmed_prefix_without_retry():
     assert (result.write_index, result.written_count) == (1, 1)
     assert result.model_messages[0] is raw[0]
     assert client.batch_add_messages.await_count == 2
+
+
+async def test_existing_session_engine_accepts_real_writer_and_keeps_state_on_failure(tmp_path):
+    session = make_session(tmp_path)
+    client = SessionBatchClient(session)
+    engine = SessionEngine(
+        OpenVikingConnection(client=client),
+        OVContextConfig(),
+        None,
+        None,
+        message_writer=OVMessageWriter(client),
+    )
+    raw = exchange(["result " * 1000])
+    context = OVContext(session.session_id, owner=("a", "u", "test-peer", session.session_id))
+    await engine.write(context, raw, identity=context.identity)
+    assert context.write_index == 3 and context.messages[-1].content != raw[-1].content
+    before = deepcopy(context)
+    client.batch_add_messages = AsyncMock(side_effect=OSError("failed"))
+    with pytest.raises(OSError):
+        await engine.write(context, raw + [AIMessage(content="final")], identity=context.identity)
+    assert context == before
 
 
 async def test_shared_writer_keeps_sessions_independent(tmp_path):

@@ -268,10 +268,6 @@ async def test_sdk_commit_session_keeps_telemetry_as_second_positional_argument(
     calls = []
 
     class _FakeHTTP:
-        async def request(self, method, url, **kwargs):
-            assert method == "POST"
-            return await self.post(httpx.URL(url).path, kwargs["json"])
-
         async def post(self, path, json):
             calls.append((path, json))
             return httpx.Response(

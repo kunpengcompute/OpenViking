@@ -204,7 +204,7 @@ OpenViking 原生已经支持 tool result preview。原有链路能够在 sessio
 
 `text` 类型明确不接 LLM，只做 deterministic fallback。摘录采用固定上限，不受 `preview_chars` 影响。
 
-日志样式输出也归入 `text`。如果需要定位错误/警告行，优先通过 stub 中的 ref 使用 `openviking_tool_result_search` 搜索原始 payload，避免仅靠关键字把普通文档误判成日志。
+日志样式输出也归入 `text`。如果需要定位错误/警告行，优先通过 stub 中的 ref 使用当前插件提供的原文搜索工具，避免仅靠关键字把普通文档误判成日志。
 
 输出重点：
 
@@ -267,13 +267,15 @@ OpenViking 原生已经支持 tool result preview。原有链路能够在 sessio
 2. `Structure`
 3. `Notable items`
 4. `Sample`
-5. `Explore`
+有 `ref` 时，末尾追加不绑定客户端工具名的提示：
 
-其中 `Explore` 会提示模型使用：
+```text
+Original output is saved at the ref above. Retrieve it with the available OV tools only if needed.
+```
 
-1. `openviking_tool_result_search`
-2. `openviking_tool_result_read`
-3. `openviking_tool_result_list`
+具体工具名称和参数由接入插件的工具描述与系统提示提供。LangChain 插件使用
+`openviking_tool_result_search_many(ref, queries, limit)`，支持同一原文的1—4个关键词；
+单关键词也传入单元素数组。搜索、读取和列表的服务端接口保持不变。
 
 ---
 

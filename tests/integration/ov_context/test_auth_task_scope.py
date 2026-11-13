@@ -1,4 +1,4 @@
-"""Real server auth and task routes with the production SDK."""
+"""Real server auth and task routes with the production SDK and recovery engine."""
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -10,6 +10,9 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 
+from openviking.integrations.langchain.client import OpenVikingConnection
+from openviking.integrations.langchain.ov_context import OVContext, OVContextConfig
+from openviking.integrations.langchain.ov_context.session_engine import SessionEngine
 from openviking.server.auth import get_request_context
 from openviking.server.identity import AuthMode, RequestContext, ResolvedIdentity, Role
 from openviking.server.routers import tasks as tasks_router
@@ -132,6 +135,42 @@ async def test_assertion_modes_keep_per_request_identity(monkeypatch, mode):
                 identity.actor_peer_id,
             )
         assert dict(pool.headers) == defaults
+
+
+@pytest.mark.parametrize("foreign_count", [1, 2])
+@pytest.mark.parametrize("own_task", [False, True])
+async def test_dev_root_direct_task_lookup_only_reads_exact_owner_session(
+    monkeypatch, foreign_count, own_task
+):
+    app, tracker = app_for("dev", monkeypatch)
+    bob = None
+    for _ in range(foreign_count):
+        bob = await tracker.create(
+            "session_commit", "same-session", account_id="account-a", user_id="bob"
+        )
+    await tracker.create("session_commit", "same-session", account_id="account-b", user_id="alice")
+    await tracker.create("session_commit", "other-session", account_id="account-a", user_id="alice")
+    alice = (
+        await tracker.create(
+            "session_commit", "same-session", account_id="account-a", user_id="alice"
+        )
+        if own_task
+        else None
+    )
+    async with sdk_for(app, auth_mode="dev") as (sdk, _):
+        engine = SessionEngine(OpenVikingConnection(client=sdk), OVContextConfig(), None, None)
+        context = OVContext(
+            "same-session",
+            owner=("account-a", "alice", "mail", "same-session"),
+            context_status="ready",
+        )
+        assert not hasattr(engine, "restore_progress")
+        assert context.pending_commit is None
+        assert bob is not None
+        assert await sdk.get_task(bob.task_id, identity=context.identity) is None
+        if alice:
+            saved = await sdk.get_task(alice.task_id, identity=context.identity)
+            assert saved is not None and saved["task_id"] == alice.task_id
 
 
 async def test_nonroot_cannot_query_another_task_owner(monkeypatch):

@@ -1,19 +1,6 @@
-"""Minimal assembly fixture independent of Reader, Commit and Hook orchestration."""
+"""OVContext module tests use controlled responses and reject real network I/O."""
 
-import pytest
-from langchain.agents.middleware.types import ModelRequest
-from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import HumanMessage
-
-from openviking.integrations.langchain.ov_context import RunIdentity
-
-
-@pytest.fixture
-def env():
-    request = ModelRequest(
-        model=FakeListChatModel(responses=["done"]),
-        messages=[HumanMessage(id="m1", content="Read the mail")],
-        tools=[],
-        model_settings={},
-    )
-    return None, None, None, RunIdentity("a", "u", "p", "s", "r"), request, []
+from tests.ov_context_support.fixtures import env as env
+from tests.ov_context_support.reader_fixtures import block_network as block_network
+from tests.ov_context_support.reader_fixtures import client as client
+from tests.ov_context_support.recall_api import api as api

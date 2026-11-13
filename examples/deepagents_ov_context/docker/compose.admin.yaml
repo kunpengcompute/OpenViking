@@ -1,0 +1,13 @@
+# One-off commands reuse the Chat image with writable configuration and data.
+services:
+  chat:
+    user: "${OV_UID:-1000}:${OV_GID:-1000}"
+    volumes:
+      - type: bind
+        source: ${OV_DEPLOY_HOME}/config
+        target: /config
+        read_only: false
+      - type: bind
+        source: ${OV_DEPLOY_HOME}/data
+        target: /data
+        read_only: false

@@ -53,11 +53,14 @@ else
         gate)
             targets=(tests/unit)
             for path in tests/integration/ov_context tests/client/test_http_request_identity.py \
-                        tests/integration/langchain_langgraph/test_smoke.py; do
+                        tests/integration/langchain_langgraph/test_smoke.py benchmark/office/tests; do
                 [[ ! -e "$path" ]] || targets+=("$path")
             done
             ;;
-        full) targets=(tests) ;;
+        full)
+            targets=(tests)
+            [[ ! -d benchmark/office/tests ]] || targets+=(benchmark/office/tests)
+            ;;
         *) echo 'ERROR: UT_SCOPE 必须为 unit、gate 或 full' >&2; exit 2 ;;
     esac
 fi

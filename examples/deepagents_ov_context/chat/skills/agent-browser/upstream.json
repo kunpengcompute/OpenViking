@@ -1,0 +1,13 @@
+{
+  "version": "0.27.1",
+  "files": {
+    "SKILL.md": {
+      "source": "https://raw.githubusercontent.com/vercel-labs/agent-browser/v0.27.1/skills/agent-browser/SKILL.md",
+      "sha256": "00709861067d0cbb634609778b1be0469de6d6cef5293fcd24cbd469faaae42c"
+    },
+    "LICENSE": {
+      "source": "https://raw.githubusercontent.com/vercel-labs/agent-browser/v0.27.1/LICENSE",
+      "sha256": "014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff"
+    }
+  }
+}

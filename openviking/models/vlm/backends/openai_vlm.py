@@ -20,7 +20,7 @@ except ImportError:
 
 from openviking.utils.model_retry import retry_async, retry_sync
 
-from ..base import ToolCall, VLMBase, VLMResponse
+from ..base import ToolCall, VLMBase, VLMResponse, raise_for_incomplete_completion
 from ..registry import DEFAULT_AZURE_API_VERSION
 
 logger = get_logger(__name__)
@@ -192,6 +192,7 @@ class OpenAIVLM(VLMBase):
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from OpenAI response. Returns str or VLMResponse based on has_tools."""
         choice = response.choices[0]
+        raise_for_incomplete_completion(choice.finish_reason)
         message = choice.message
         tracer.info(f"result={message.content}")
         if has_tools:
