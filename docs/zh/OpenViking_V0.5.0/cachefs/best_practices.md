@@ -47,7 +47,7 @@ docker run -d --name ov-cache-redis -p 127.0.0.1:6379:6379 \
 
 ### 2.2 从 v0.5.0 基线应用补丁并安装
 
-准备 Python 3.11+、Git、Rust/Cargo（至少 1.91.1）、CMake 和 C/C++ 构建工具。特性补丁位于本交付仓库的 [patches/OpenViking_V0.5.0/cachefs-query-cache.patch](../../../patches/OpenViking_V0.5.0/cachefs-query-cache.patch)，对应 [PR #20](https://gitcode.com/boostkit/OpenViking/pull/20) 的 CacheFS 修改，源提交为 `0c7153840f625305486092a05d522b76a610bf23`。
+准备 Python 3.11+、Git、Rust/Cargo（至少 1.91.1）、CMake 和 C/C++ 构建工具。特性补丁位于本交付仓库的 [patches/OpenViking_V0.5.0/cachefs-query-cache.patch](../../../../patches/OpenViking_V0.5.0/cachefs-query-cache.patch)，对应 [PR #20](https://gitcode.com/boostkit/OpenViking/pull/20) 的 CacheFS 修改，源提交为 `0c7153840f625305486092a05d522b76a610bf23`。
 
 补丁以官方 `v0.5.0` 标签（commit `20f9c11362ad16193b0daa4a414e1095061af427`）为目标，合并了 9 个特性文件的最终差异，不包含 PR 中的基线导入、GitCode CI 和文档集成改动。先将补丁保存在待安装源码目录之外，再执行：
 
