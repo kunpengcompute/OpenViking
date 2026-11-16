@@ -13,6 +13,7 @@ submitted to the process-global StreamingPolicyTrainer.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -122,6 +123,13 @@ def _apply_event_search_tags(
             op.search_tags = list(tags)
 
 
+def _deterministic_extract_enabled() -> bool:
+    configured = get_openviking_config().memory.deterministic_extract_enabled
+    if configured is not None:
+        return configured
+    return os.environ.get("OV_DETERMINISTIC_EXTRACT", "1") != "0"
+
+
 def _initialize_extraction_telemetry() -> None:
     telemetry = get_current_telemetry()
     for name in (
@@ -147,9 +155,7 @@ def _memory_type_by_uri(operations: ResolvedOperations) -> dict[str, str]:
     for file_content in getattr(operations, "delete_file_contents", []) or []:
         uri = str(getattr(file_content, "uri", "") or "")
         if uri:
-            types_by_uri[uri] = str(
-                getattr(file_content, "memory_type", "") or "unknown"
-            )
+            types_by_uri[uri] = str(getattr(file_content, "memory_type", "") or "unknown")
     return types_by_uri
 
 
@@ -282,9 +288,7 @@ class SessionCompressorV3:
         vlm_config: VLMHandle | None = None,
     ) -> ExtractLoop:
         if vlm_config is None:
-            raise RuntimeError(
-                "SessionCompressorV3 requires an explicitly resolved VLM config"
-            )
+            raise RuntimeError("SessionCompressorV3 requires an explicitly resolved VLM config")
         vlm = vlm_config
         viking_fs = get_viking_fs()
         if context_provider is None:
@@ -701,9 +705,7 @@ class SessionCompressorV3:
             )
 
         if self.vlm_resolver is None:
-            raise RuntimeError(
-                "SessionCompressorV3 requires a VLM resolver for account-owned work"
-            )
+            raise RuntimeError("SessionCompressorV3 requires a VLM resolver for account-owned work")
         vlm_config = await self.vlm_resolver.get_vlm(ctx.account_id)
         context_provider = SessionExtractContextProvider(
             messages=messages,
@@ -728,16 +730,36 @@ class SessionCompressorV3:
         isolation_handler.prepare_messages()
         context_provider._isolation_handler = isolation_handler
 
-        orchestrator = self._get_or_create_react(
-            ctx=ctx,
-            messages=messages,
-            latest_archive_overview=latest_archive_overview,
-            isolation_handler=isolation_handler,
-            transaction_handle=None,
-            context_provider=context_provider,
-            vlm_config=vlm_config,
-        )
-        operations, _tools_used = await orchestrator.run()
+        if _deterministic_extract_enabled():
+            from openviking.session.memory.deterministic_extractor import (
+                DeterministicMemoryExtractor,
+            )
+
+            memory_config = get_openviking_config().memory
+            extractor = DeterministicMemoryExtractor(
+                registry=registry,
+                viking_fs=viking_fs,
+                ner_model=memory_config.spacy_model_zh,
+                ner_model_en=memory_config.spacy_model_en,
+                isolation_handler=isolation_handler,
+            )
+            operations = await extractor.extract(
+                messages=extract_context.messages,
+                ctx=ctx,
+                allowed_memory_types=allowed_memory_types,
+                extract_context=extract_context,
+            )
+        else:
+            orchestrator = self._get_or_create_react(
+                ctx=ctx,
+                messages=messages,
+                latest_archive_overview=latest_archive_overview,
+                isolation_handler=isolation_handler,
+                transaction_handle=None,
+                context_provider=context_provider,
+                vlm_config=vlm_config,
+            )
+            operations, _tools_used = await orchestrator.run()
         if operations is None:
             tracer.info("[v3_patch_merge] No memory operations generated")
             return _V3ExtractionResult()
@@ -782,6 +804,10 @@ class SessionCompressorV3:
         result = update_result.apply_result
         patch_operations = update_result.operations
         _report_extraction_telemetry(result, patch_operations)
+        if strict_extract_errors and result is not None and result.errors:
+            from openviking.session.memory.memory_updater import MemoryUpdateError
+
+            raise MemoryUpdateError(result)
 
         memory_diff = None
         if archive_uri and viking_fs and result is not None:

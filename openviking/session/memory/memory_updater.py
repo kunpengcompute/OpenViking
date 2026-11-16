@@ -9,6 +9,8 @@ to the storage system.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 from openviking.core.context import ContextLevel
 from openviking.message import Message
 from openviking.message.part import TextPart
+from openviking.pyagfs.exceptions import AGFSConnectionError, AGFSIoError, AGFSTimeoutError
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
     MemoryFile,
@@ -48,6 +51,7 @@ from openviking.telemetry import tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.tracer import get_trace_id
 from openviking.utils.ingest_options import IngestOptions
+from openviking.utils.model_retry import retry_async
 from openviking.utils.tags import merge_search_tags
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import ConflictError, NotFoundError
@@ -744,6 +748,30 @@ class MemoryUpdateResult:
         )
 
 
+class MemoryReadError(Exception):
+    """A fresh upsert read failed before this target could be written."""
+
+    def __init__(self, uri: str, cause: Exception):
+        super().__init__(f"Failed to refresh memory {uri}: {cause}")
+        self.retryable = isinstance(
+            cause,
+            (TimeoutError, ConnectionError, AGFSConnectionError, AGFSTimeoutError, AGFSIoError),
+        ) or (
+            isinstance(cause, OSError)
+            and cause.errno in {errno.EAGAIN, errno.EBUSY, errno.EINTR, errno.EIO}
+        )
+
+
+class MemoryUpdateError(Exception):
+    """A strict extraction failed, possibly after writing some memories."""
+
+    def __init__(self, result: MemoryUpdateResult):
+        super().__init__(
+            f"Memory update failed ({result.summary()}): "
+            + "; ".join(f"{uri}: {error}" for uri, error in result.errors)
+        )
+
+
 def _same_batch_delete_conflict_key(uri: str) -> str:
     """Return a conservative key for detecting same-batch upsert/delete URI conflicts.
 
@@ -768,12 +796,14 @@ class MemoryUpdater:
         registry: Optional[MemoryTypeRegistry] = None,
         vikingdb=None,
         transaction_handle: Any = None,
+        strict_index_errors: bool = False,
     ):
         """Create a memory updater with an optional pathlock transaction handle."""
         self._viking_fs = None
         self._registry = registry
         self._vikingdb = vikingdb
         self._transaction_handle = transaction_handle
+        self._strict_index_errors = strict_index_errors
 
     def _get_viking_fs(self):
         """Get or create VikingFS instance."""
@@ -835,6 +865,7 @@ class MemoryUpdater:
                 ctx,
                 uri_memory_type_map={uri: memory_type} if memory_type else {},
                 ingest_options=ingest_options,
+                raise_on_enqueue_failure=True,
             )
             return attempted > 0
         except Exception:
@@ -1074,6 +1105,7 @@ class MemoryUpdater:
             extract_context=extract_context,
             uri_memory_type_map=uri_memory_type_map,
             search_tags_by_uri=effective_search_tags_by_uri,
+            raise_on_enqueue_failure=self._strict_index_errors,
         )
 
         # Apply links to endpoint files not covered by upsert_operations
@@ -1104,13 +1136,16 @@ class MemoryUpdater:
             )
 
         for dir, memory_type in dirs.items():
-            await self.generate_overview(
+            generated = await self.generate_overview(
                 memory_type,
                 dir,
                 ctx,
                 extract_context,
                 lease_ref=self._transaction_handle,
             )
+            schema = self._registry.get(memory_type)
+            if self._strict_index_errors and schema and schema.overview_template and not generated:
+                raise RuntimeError(f"Failed to refresh memory overview: {dir}")
 
         return result
 
@@ -1362,6 +1397,14 @@ class MemoryUpdater:
         """Apply upsert operation from a flat model."""
         viking_fs = self._get_viking_fs()
 
+        async def read_fresh_memory(uri: str):
+            try:
+                return await viking_fs.read_file(uri, ctx=ctx)
+            except (ConflictError, NotFoundError, FileNotFoundError):
+                raise
+            except Exception as exc:
+                raise MemoryReadError(uri, exc) from exc
+
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
         # Process each URI independently
@@ -1374,7 +1417,18 @@ class MemoryUpdater:
             # so consecutive patches to the same URI see each other's changes.
             old_content: Optional[MemoryFile] = None
             try:
-                content = await viking_fs.read_file(uri, ctx=ctx)
+                content = await retry_async(
+                    lambda uri=uri: read_fresh_memory(uri),
+                    max_retries=1,
+                    base_delay=0.1,
+                    max_delay=0.3,
+                    jitter=False,
+                    is_retryable=lambda error: (
+                        isinstance(error, MemoryReadError) and error.retryable
+                    ),
+                    logger=logger,
+                    operation_name=f"fresh memory read {uri}",
+                )
                 if is_uri_migration:
                     raise ConflictError(
                         f"Memory rename target already exists: {uri}",
@@ -1382,16 +1436,8 @@ class MemoryUpdater:
                     )
                 if content:
                     old_content = MemoryFileUtils.read(content, uri=uri)
-            except ConflictError:
-                raise
             except (NotFoundError, FileNotFoundError):
                 # File doesn't exist yet, that's okay
-                pass
-            except Exception:
-                if is_uri_migration:
-                    raise
-                # Preserve the legacy in-place update fallback to the prefetched
-                # snapshot when a fresh disk read is unavailable.
                 pass
             if is_uri_migration:
                 try:
@@ -1402,7 +1448,7 @@ class MemoryUpdater:
                         f"Memory rename source no longer exists: {source_content.uri}",
                         resource=source_content.uri,
                     ) from None
-            # Fall back to pre-fetched content if disk read failed
+            # Reuse the prefetched source only when no content was found.
             if old_content is None:
                 old_content = source_content
 
@@ -1461,6 +1507,28 @@ class MemoryUpdater:
                     if key not in schema_field_names and key not in metadata and val is not None:
                         metadata[key] = val
 
+            if resolved_op.memory_fields.get("extraction_method") == "deterministic":
+                from openviking.session.memory.fact_records import merge_fact_records
+
+                previous = old_content.extra_fields.get("fact_records", []) if old_content else []
+                metadata["fact_records"] = merge_fact_records(
+                    previous, metadata.get("fact_records", [])
+                )
+                if memory_type == "entities":
+                    quotes = dict.fromkeys(
+                        quote
+                        for fact in metadata["fact_records"]
+                        for quote in fact.get("source_quotes", {}).values()
+                    )
+                    metadata["content"] = "\n".join(quotes) or metadata.get("content", "")
+                    if old_content:
+                        metadata["aliases"] = list(
+                            dict.fromkeys(
+                                old_content.extra_fields.get("aliases", [])
+                                + metadata.get("aliases", [])
+                            )
+                        )
+
             metadata["version"] = next_memory_version(old_content)
 
             # Handle links/backlinks fields: merge with existing
@@ -1507,6 +1575,18 @@ class MemoryUpdater:
                 elif existing_backlinks:
                     metadata["backlinks"] = existing_backlinks
 
+            if metadata.get("fact_records") or metadata.get("source_turn_ids"):
+                from openviking.retrieve.evidence_retriever import load_index
+                from openviking.session.memory.source_cleanup import guard_source_update
+
+                metadata["memory_type"] = memory_type
+                root = uri.split("/peers/", 1)[0].split("/memories/", 1)[0]
+                index = await load_index(viking_fs, root + "/.index/evidence.json", ctx)
+                metadata = await guard_source_update(viking_fs, metadata, uri, ctx, index=index)
+                if metadata is None:
+                    raise ConflictError(
+                        "Memory sources were deleted or corrected; re-extract", resource=uri
+                    )
             mf = MemoryFile.from_parsed(uri=uri, parsed=metadata)
             new_full_content = MemoryFileUtils.write(
                 mf,
@@ -1749,6 +1829,7 @@ class MemoryUpdater:
         uri_memory_type_map: Dict[str, str] = None,
         search_tags_by_uri: Dict[str, List[str]] = None,
         ingest_options: Any = None,
+        raise_on_enqueue_failure: bool = False,
     ) -> int:
         """Vectorize written and edited memory files.
 
@@ -1847,6 +1928,9 @@ class MemoryUpdater:
                 # Convert to embedding msg and enqueue
                 embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
                 if embedding_msg:
+                    embedding_msg.context_data["_memory_revision"] = hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest()
                     if getattr(ingest_options, "search_tags", None) is not None:
                         embedding_msg.context_data["search_tags"] = list(ingest_options.search_tags)
                         embedding_msg.context_data["_upsert_options"] = {
@@ -1869,7 +1953,6 @@ class MemoryUpdater:
                         request_wait_tracker.register_embedding_root(
                             embedding_msg.telemetry_id, embedding_msg.id
                         )
-                    attempted_count += 1
                     try:
                         enqueued = await self._vikingdb.enqueue_embedding_msg(embedding_msg)
                     except Exception as e:
@@ -1886,10 +1969,17 @@ class MemoryUpdater:
                             embedding_msg.id,
                             "embedding enqueue returned false",
                         )
+                    if not enqueued:
+                        if raise_on_enqueue_failure:
+                            raise RuntimeError(f"Failed to enqueue memory for vectorization: {uri}")
+                        continue
+                    attempted_count += 1
                     logger.debug(f"Enqueued memory for vectorization: {uri}")
 
             except Exception as e:
                 tracer.error(f"Failed to vectorize memory {uri}: {e}")
+                if raise_on_enqueue_failure:
+                    raise
         return attempted_count
 
     @staticmethod
@@ -2011,6 +2101,8 @@ class MemoryUpdater:
                 )
             except Exception as e:
                 tracer.error(f"Failed to parse {file_path}: {e}")
+                if self._strict_index_errors:
+                    raise
                 continue
 
         if not items:
@@ -2056,14 +2148,27 @@ class MemoryUpdater:
             )
             from openviking.utils.embedding_utils import vectorize_directory_meta
 
-            await vectorize_directory_meta(
+            enqueued_levels = await vectorize_directory_meta(
                 uri=directory,
                 abstract="",
                 overview=rendered,
                 context_type="memory",
                 ctx=ctx,
                 include_abstract=False,
+                scalar_overrides={
+                    int(ContextLevel.OVERVIEW.value): {
+                        "_memory_revision": hashlib.sha256(
+                            (await viking_fs.read_file(overview_path, ctx=ctx)).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                },
             )
+            if (
+                self._strict_index_errors
+                and self._vikingdb is not None
+                and int(ContextLevel.OVERVIEW.value) not in enqueued_levels
+            ):
+                raise RuntimeError("Memory overview embedding was not enqueued")
             return True
         except Exception as e:
             tracer.error(f"Failed to write overview {overview_path}: {e}")

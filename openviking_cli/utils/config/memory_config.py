@@ -85,6 +85,19 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    evidence_graph_write_enabled: bool = Field(
+        default=False,
+        description="Build deterministic entity/time graph windows at archive commit.",
+    )
+    deterministic_extract_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Use deterministic facts/entities/events extraction when true, or ReAct "
+            "when false. When unset, use OV_DETERMINISTIC_EXTRACT (default: enabled)."
+        ),
+    )
+    spacy_model_zh: str = Field(default="zh_core_web_sm", min_length=1)
+    spacy_model_en: str = Field(default="en_core_web_sm", min_length=1)
     extraction_output_format: Literal["json", "python"] = Field(
         default="python",
         description=(

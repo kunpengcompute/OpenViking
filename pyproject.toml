@@ -89,6 +89,9 @@ dependencies = [
 
 
 [project.optional-dependencies]
+deterministic = [
+    "spacy>=3.7,<4",
+]
 gateway = [
     "aiohttp>=3.13.3",
     "async-timeout>=5.0.1",

@@ -328,7 +328,10 @@ class StreamingMemoryUpdater:
         merge_ops: list[ResolvedOperation] = []
         for op in list(operations.upsert_operations or []):
             schema = registry.get(op.memory_type)
-            if op.uris and getattr(schema, "operation_mode", None) == "add_only":
+            if op.uris and (
+                getattr(schema, "operation_mode", None) == "add_only"
+                or op.memory_fields.get("extraction_method") == "deterministic"
+            ):
                 append_ops.append(op)
             else:
                 merge_ops.append(op)
@@ -508,6 +511,7 @@ class StreamingMemoryUpdater:
                     registry=request.memory_registry or self.registry,
                     vikingdb=self.vikingdb,
                     transaction_handle=lease,
+                    strict_index_errors=request.strict_extract_errors,
                 )
                 return await updater.apply_operations(
                     operations,
@@ -1027,8 +1031,7 @@ async def merge_one_memory_type_operations(
     )
     if vlm_resolver is None:
         raise RuntimeError(
-            "merge_one_memory_type_operations requires a VLM resolver "
-            "for account-owned work"
+            "merge_one_memory_type_operations requires a VLM resolver for account-owned work"
         )
     vlm_config = await vlm_resolver.get_vlm(ctx.account_id)
     provider = PatchMergeContextProvider(

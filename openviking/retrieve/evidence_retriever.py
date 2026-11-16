@@ -1,0 +1,683 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Authorized persistent evidence snapshots and their source lifecycle."""
+
+import json
+import logging
+import math
+import re
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional, Set
+
+from openviking.retrieve.evidence_features import EventNode, extract_keys, parse_episode_key
+from openviking.retrieve.evidence_ranking import EvidenceRanking
+
+logger = logging.getLogger(__name__)
+
+
+class EvidenceIndex(EvidenceRanking):
+    """Lexical + entity inverted index over raw session turns.
+    Layout on disk (``{user_space}/.index/evidence.json``)::
+        {
+          "version": 2,
+          "episodes": {
+            "sample0_s2": {
+              "session": "s2",
+              "turns": [
+                {"episode": "sample0_s2", "turn": 0, "speaker": "...",
+                 "text": "...", "date": "...", "uri": "viking://user/.../sample0_s2_c1",
+                 "keys": [...], "ents": [...], "emb": [...384 floats...]},
+                ...
+              ]
+            }
+          }
+        }
+    ``emb`` is optional: version-1 indexes and turns written without an
+    embedder simply lack it, and retrieval degrades to the four-channel path.
+    Inverted maps are rebuilt from episodes at load time (kept in-memory only,
+    not persisted, to avoid drift).
+    """
+
+    VERSION = 5
+    DEFAULT_EPI_WINDOW = 4
+    DEFAULT_TOP_K = 15
+    DEFAULT_SEM_ANCHOR_TOP = 3
+    DEFAULT_CLOSURE_RADIUS = 1
+
+    def __init__(self) -> None:
+        self._episodes: Dict[str, Dict[str, Any]] = {}
+        self._lex_inv: Dict[str, Set[str]] = defaultdict(set)  # key -> turn id
+        self._ent_inv: Dict[str, Set[str]] = defaultdict(set)  # entity -> turn id
+        self._turn_keys: Dict[str, Set[str]] = {}  # turn id -> keys
+        self._turn_by_id: Dict[str, Dict[str, Any]] = {}  # turn id -> turn dict
+        self._source_inv: Dict[str, Set[str]] = defaultdict(set)
+        # Durable revocations also reject stale, already-running extractions.
+        self.source_invalidations: Dict[str, str] = {}
+        self.pending_memory_cleanup: List[str] = []
+        self.pending_source_updates: List[str] = []
+        self._n_turns = 0
+        self._dirty = False
+        from openviking.retrieve.evidence_graph import empty_graph
+
+        self.graph = empty_graph()
+        self.graph_unavailable = False
+        self._graph_inv: Dict[str, List[str]] = defaultdict(list)
+        self._graph_adj_inv: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # Event hyperedge layer (probe phase, Option A: derived from cards at
+        # load time). Empty by default; retrieve(use_events=True) only acts
+        # when events are attached, so the default output stays byte-identical.
+        self._events: List[EventNode] = []
+        self._event_by_id: Dict[str, EventNode] = {}
+
+    # -- events (probe phase: deterministic card parsing) ------------------
+    # -- identity helpers ------------------------------------------------
+    @staticmethod
+    def _turn_id(episode: str, turn: int) -> str:
+        return f"{episode}:{turn}"
+
+    @staticmethod
+    def _turn_label(turn: Dict[str, Any]) -> str:
+        return f"{turn['episode'].rsplit('_', 1)[-1]}:{turn['turn']}"  # s2:7
+
+    # -- build (write-time incremental) ----------------------------------
+    def append_chunk(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        user_space: str = "",
+        embeddings: Optional[List[Optional[List[float]]]] = None,
+        *,
+        archive_uri: Optional[str] = None,
+        graph_enabled: bool = False,
+        embedding_states: Optional[List[dict]] = None,
+    ) -> bool:
+        """Incrementally index one archived chunk (called after commit).
+        ``messages`` must be the archived message list, each with
+        ``{"speaker": ..., "text": ..., "date": ...}``. The session_id encodes
+        the episode + chunk index so multiple chunks of one episode merge into
+        a single contiguous turn list.
+        ``embeddings`` optionally aligns with ``messages`` (same order): the
+        dense vector for each message's text, or None for texts that were not
+        embedded. Stored as the turn's ``emb`` field for the ALG-A semantic
+        channel. Missing embeddings degrade retrieval to four channels.
+        Ordinary sessions append by stable message identity; encoded imports retain turn numbering.
+        """
+        parsed = parse_episode_key(session_id)
+        episode_key, session_label, chunk_idx = parsed or (session_id, session_id, 1)
+        episode = self._episodes.setdefault(
+            episode_key,
+            {"session": session_label, "turns": []},
+        )
+        session_uri = self._chunk_uri(user_space, session_id)
+        base = (
+            (chunk_idx - 1) * 8
+            if parsed
+            else max((t["turn"] for t in episode["turns"]), default=-1) + 1
+        )
+        # A second archive of the same encoded chunk still needs fresh IDs.
+        prior_same_session = [t["turn"] for t in episode["turns"] if t["uri"] == session_uri]
+        if prior_same_session:
+            base = max(base, max(prior_same_session) + 1)
+        new_ids: List[str] = []
+        for i, m in enumerate(messages):
+            text = m.get("text", "")
+            speaker = m.get("speaker", "")
+            date = m.get("date", "")
+            if not text:
+                continue
+            if m.get("id") and self._source_inv.get(m["id"]):
+                continue
+            turn_no = base + i if parsed else base
+            tid = self._turn_id(episode_key, turn_no)
+            if tid in self._turn_by_id:
+                # Already indexed (duplicate append / re-import of the same
+                # chunk). Skip so the episode window and inverted maps stay
+                # exactly one copy per turn.
+                continue
+            ents, keys = extract_keys(text)
+            turn = {
+                "episode": episode_key,
+                "turn": turn_no,
+                "speaker": speaker,
+                "role": m.get("role", ""),
+                "text": text,
+                "date": date,
+                "uri": self._chunk_uri(user_space, session_id),
+                "keys": sorted(keys),
+                "ents": sorted(ents),
+            }
+            if m.get("id"):
+                turn["source_id"] = m["id"]
+            if embeddings is not None and i < len(embeddings):
+                emb = embeddings[i]
+                if emb:
+                    turn["emb"] = [float(v) for v in emb]
+            if embedding_states and i < len(embedding_states):
+                turn["embedding_state"] = dict(embedding_states[i])
+            episode["turns"].append(turn)
+            self._index_turn(turn)
+            new_ids.append(tid)
+            self._n_turns += 1
+            if not parsed:
+                base += 1
+        if graph_enabled and archive_uri and new_ids:
+            try:
+                self._add_graph_window(archive_uri, session_uri, episode_key, new_ids)
+            except Exception:
+                logger.exception("[evidence] graph window build failed; raw turns retained")
+                if archive_uri not in self.graph["pending_archive_uris"]:
+                    self.graph["pending_archive_uris"].append(archive_uri)
+                self.graph_unavailable = True
+        if new_ids:
+            self._dirty = True
+        return True
+
+    def _add_graph_window(
+        self, archive_uri: str, session_uri: str, episode: str, turn_ids: List[str]
+    ) -> None:
+        from openviking.retrieve.evidence_graph import build_edges, parse_recorded_time, window_id
+
+        wid = window_id(archive_uri)
+        previous = self.graph["windows"].get(wid)
+        ids = list(dict.fromkeys((previous or {}).get("turn_ids", []) + turn_ids))
+        dates = sorted(
+            filter(None, (parse_recorded_time(self._turn_by_id[t].get("date", "")) for t in ids))
+        )
+        window = {
+            "window_id": wid,
+            "archive_uri": archive_uri,
+            "session_uri": session_uri,
+            "episode": episode,
+            "turn_ids": ids,
+            "when_start": dates[0] if dates else None,
+            "when_end": dates[-1] if dates else None,
+        }
+        self.graph["windows"][wid] = window
+        try:
+            patch = build_edges(self, [wid])
+        except Exception:
+            if previous is None:
+                self.graph["windows"].pop(wid, None)
+            else:
+                self.graph["windows"][wid] = previous
+            raise
+        self.graph.update(patch)
+        self._rebuild_graph_inverses()
+
+    def _rebuild_graph_inverses(self) -> None:
+        self._graph_inv = defaultdict(list)
+        self._graph_adj_inv = defaultdict(list)
+        for edge_key, edge in self.graph["appears_in"].items():
+            self._graph_inv[edge["entity_key"]].append(edge_key)
+        for edge in self.graph["adjacent"].values():
+            self._graph_adj_inv[edge["from_window_id"]].append(edge)
+            self._graph_adj_inv[edge["to_window_id"]].append(edge)
+
+    def graph_diagnostics(self) -> Dict[str, Any]:
+        """Counts only; never expose graph snippets through query diagnostics."""
+        return {
+            "window_count": len(self.graph["windows"]),
+            "edge_count": len(self.graph["appears_in"]),
+            "adjacent_count": len(self.graph["adjacent"]),
+            "truncated_window_count": sum(
+                bool(w.get("entity_truncated")) for w in self.graph["windows"].values()
+            ),
+            "conflict_edge_count": sum(
+                bool(e.get("conflict_categories")) for e in self.graph["appears_in"].values()
+            ),
+            "pending_window_count": len(self.graph["pending_archive_uris"]),
+            "unavailable": self.graph_unavailable,
+        }
+
+    def embedding_diagnostics(self) -> Dict[str, Any]:
+        turns = list(self._turn_by_id.values())
+        ready = sum(bool(t.get("emb")) for t in turns)
+        return {
+            "total": len(turns),
+            "ready": ready,
+            "missing_embedding": len(turns) - ready,
+            "vector_coverage": ready / len(turns) if turns else 1.0,
+            "pending_embedding": sum(
+                not t.get("emb") and t.get("embedding_state", {}).get("status") == "pending"
+                for t in turns
+            ),
+            "failed_embedding": sum(
+                not t.get("emb") and t.get("embedding_state", {}).get("status") == "failed"
+                for t in turns
+            ),
+        }
+
+    def rebuild_graph(self, archive_groups: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Rebuild only from unambiguous source IDs supplied by an authorized caller."""
+        from openviking.retrieve.evidence_graph import empty_graph
+
+        old_graph = self.graph
+        self.graph = empty_graph()
+        built = skipped = 0
+        assigned: Set[str] = set()
+        for group in archive_groups:
+            source_ids = group.get("source_ids", [])
+            if not source_ids:
+                continue
+            matches = [self._source_inv.get(source, set()) for source in source_ids]
+            if any(len(found) != 1 for found in matches):
+                if group.get("archive_uri"):
+                    self.graph["pending_archive_uris"].append(group["archive_uri"])
+                skipped += 1
+                continue
+            tids = list(dict.fromkeys(next(iter(found)) for found in matches))
+            if any(tid in assigned for tid in tids):
+                if group.get("archive_uri"):
+                    self.graph["pending_archive_uris"].append(group["archive_uri"])
+                skipped += 1
+                continue
+            session_uri = group.get("session_uri", "").rstrip("/")
+            archive_uri = group.get("archive_uri", "")
+            if not archive_uri.startswith(session_uri + "/") or any(
+                self._turn_by_id[tid]["uri"].rstrip("/") != session_uri for tid in tids
+            ):
+                if archive_uri:
+                    self.graph["pending_archive_uris"].append(archive_uri)
+                skipped += 1
+                continue
+            self._add_graph_window(
+                archive_uri, session_uri, self._turn_by_id[tids[0]]["episode"], tids
+            )
+            assigned.update(tids)
+            built += 1
+        skipped += len(set(self._turn_by_id) - assigned)
+        self.graph["needs_rebuild"] = bool(skipped)
+        if self.graph != old_graph:
+            self._dirty = True
+        self.graph_unavailable = bool(skipped)
+        return {"built": built, "skipped": skipped}
+
+    def _index_turn(self, turn: Dict[str, Any]) -> None:
+        tid = self._turn_id(turn["episode"], turn["turn"])
+        keys = set(turn["keys"])
+        ents = set(turn["ents"])
+        self._turn_keys[tid] = keys
+        self._turn_by_id[tid] = turn
+        if turn.get("source_id"):
+            self._source_inv[turn["source_id"]].add(tid)
+        for k in keys:
+            self._lex_inv[k].add(tid)
+        for e in ents:
+            self._ent_inv[e].add(tid)
+
+    def resolve_sources(self, source_ids: List[str]) -> List[Dict[str, Any]]:
+        """Resolve exact original message identities; ambiguous identities fail closed."""
+        tids = []
+        for source_id in source_ids:
+            matches = self._source_inv.get(source_id, set())
+            if len(matches) != 1:
+                return []
+            tids.extend(matches)
+        return self.get_turns(list(dict.fromkeys(tids)))
+
+    @staticmethod
+    def _chunk_uri(user_space: str, session_id: str) -> str:
+        if not user_space:
+            return f"viking://user/{session_id}"
+        return f"{user_space.rstrip('/')}/sessions/{session_id}"
+
+    # -- serialization ---------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.VERSION,
+            "episodes": self._episodes,
+            "graph": self.graph,
+            "source_invalidations": self.source_invalidations,
+            "pending_memory_cleanup": self.pending_memory_cleanup,
+            "pending_source_updates": self.pending_source_updates,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EvidenceIndex":
+        index = cls()
+        invalidations = data.get("source_invalidations", {})
+        pending = data.get("pending_memory_cleanup", [])
+        updates = data.get("pending_source_updates", [])
+        if (
+            not isinstance(invalidations, dict)
+            or any(
+                not isinstance(k, str) or not isinstance(v, str) for k, v in invalidations.items()
+            )
+            or not isinstance(pending, list)
+            or any(not isinstance(uri, str) for uri in pending)
+            or not isinstance(updates, list)
+            or any(not isinstance(sid, str) for sid in updates)
+        ):
+            raise ValueError("Invalid source lifecycle state")
+        index.source_invalidations = dict(invalidations)
+        index.pending_memory_cleanup = list(pending)
+        index.pending_source_updates = list(updates)
+        episodes = data.get("episodes", {}) if isinstance(data, dict) else {}
+        for episode_key, ep in episodes.items():
+            if not isinstance(ep, dict):
+                continue
+            # Keep the episode dict as-is (keys/ents stay JSON-safe lists);
+            # _index_turn converts to sets for the inverted maps.
+            index._episodes[episode_key] = ep
+            turns = ep.get("turns", []) if isinstance(ep.get("turns"), list) else []
+            for turn in turns:
+                index._index_turn(turn)
+                index._n_turns += 1
+        if data.get("version") not in {4, cls.VERSION}:
+            index.graph["needs_rebuild"] = True
+            index.graph_unavailable = True
+        if data.get("version") in {4, cls.VERSION}:
+            try:
+                graph = data["graph"]
+                if not isinstance(graph, dict) or any(
+                    not isinstance(graph.get(k), dict)
+                    for k in ("windows", "appears_in", "adjacent")
+                ):
+                    raise ValueError("Invalid graph")
+                for wid, window in graph["windows"].items():
+                    from openviking.retrieve.evidence_graph import window_id
+
+                    if (
+                        not isinstance(window, dict)
+                        or window.get("window_id") != wid
+                        or not isinstance(window.get("turn_ids"), list)
+                        or not isinstance(window.get("session_uri"), str)
+                        or not isinstance(window.get("archive_uri"), str)
+                        or not window["archive_uri"].startswith(
+                            window["session_uri"].rstrip("/") + "/history/"
+                        )
+                        or window_id(window["archive_uri"]) != wid
+                        or not all(
+                            tid in index._turn_by_id
+                            and index._turn_by_id[tid]["uri"].rstrip("/")
+                            == window["session_uri"].rstrip("/")
+                            for tid in window["turn_ids"]
+                        )
+                    ):
+                        raise ValueError("Invalid graph window")
+                pending = graph.get("pending_archive_uris", [])
+                if not isinstance(pending, list) or any(
+                    not isinstance(uri, str) for uri in pending
+                ):
+                    raise ValueError("Invalid pending graph windows")
+                if type(graph.get("needs_rebuild", False)) is not bool:
+                    raise ValueError("Invalid graph rebuild flag")
+                for edge in graph["appears_in"].values():
+                    if (
+                        not isinstance(edge, dict)
+                        or edge.get("window_id") not in graph["windows"]
+                        or not isinstance(edge.get("entity_key"), str)
+                        or not isinstance(edge.get("category"), str)
+                        or not isinstance(edge.get("canonical"), str)
+                        or edge["entity_key"] != edge["category"] + ":" + edge["canonical"]
+                        or not isinstance(edge.get("snippet"), str)
+                        or len(edge["snippet"]) > 120
+                        or type(edge.get("weight")) not in (int, float)
+                        or not math.isfinite(edge["weight"])
+                        or not 0 <= edge["weight"] <= 1
+                        or not isinstance(edge.get("signals"), list)
+                        or any(not isinstance(signal, str) for signal in edge["signals"])
+                        or not isinstance(edge.get("turn_ids"), list)
+                        or any(
+                            tid not in graph["windows"][edge["window_id"]]["turn_ids"]
+                            for tid in edge["turn_ids"]
+                        )
+                        or not isinstance(edge.get("source_ids"), list)
+                        or set(edge["source_ids"])
+                        != {
+                            index._turn_by_id[tid]["source_id"]
+                            for tid in edge["turn_ids"]
+                            if index._turn_by_id[tid].get("source_id")
+                        }
+                    ):
+                        raise ValueError("Invalid graph edge")
+                for edge in graph["adjacent"].values():
+                    if (
+                        not isinstance(edge, dict)
+                        or edge.get("from_window_id") not in graph["windows"]
+                        or edge.get("to_window_id") not in graph["windows"]
+                        or type(edge.get("weight")) not in (int, float)
+                        or not math.isfinite(edge["weight"])
+                        or not 0 <= edge["weight"] <= 1
+                    ):
+                        raise ValueError("Invalid adjacent edge")
+                index.graph = graph
+                index.graph_unavailable = bool(pending or graph.get("needs_rebuild"))
+                index._rebuild_graph_inverses()
+            except (KeyError, TypeError, ValueError):
+                index.graph["needs_rebuild"] = True
+                index.graph_unavailable = True
+        return index
+
+    def remove_session(self, session_uri: str) -> int:
+        """Remove one session's copies, including a single chunk of an episode."""
+        episodes = {}
+        removed = 0
+        for key, episode in self._episodes.items():
+            turns = [t for t in episode["turns"] if t["uri"].rstrip("/") != session_uri.rstrip("/")]
+            removed += len(episode["turns"]) - len(turns)
+            if turns:
+                episodes[key] = dict(episode, turns=turns)
+        if removed:
+            # Rebuild all lookup maps so lexical, semantic and source-ID paths
+            # cannot retain a deleted turn in memory.
+            surviving = {
+                wid: window
+                for wid, window in self.graph["windows"].items()
+                if window["session_uri"].rstrip("/") != session_uri.rstrip("/")
+            }
+            pending = [
+                uri
+                for uri in self.graph["pending_archive_uris"]
+                if not uri.startswith(session_uri.rstrip("/") + "/")
+            ]
+            surviving_edges = {
+                key: edge
+                for key, edge in self.graph["appears_in"].items()
+                if edge["window_id"] in surviving
+            }
+            rebuilt = type(self).from_dict(
+                {
+                    "version": self.VERSION,
+                    "episodes": episodes,
+                    "source_invalidations": self.source_invalidations,
+                    "pending_memory_cleanup": self.pending_memory_cleanup,
+                    "pending_source_updates": self.pending_source_updates,
+                    "graph": {
+                        "windows": surviving,
+                        "appears_in": surviving_edges,
+                        "adjacent": {},
+                        "pending_archive_uris": pending,
+                        "needs_rebuild": self.graph.get("needs_rebuild", False),
+                    },
+                }
+            )
+            from openviking.retrieve.evidence_graph import build_edges
+
+            rebuilt.graph.update(build_edges(rebuilt, []))
+            rebuilt._rebuild_graph_inverses()
+            self.__dict__.update(rebuilt.__dict__)
+            self._dirty = True
+        return removed
+
+    def invalidate_sources(self, source_ids: List[str], session_uri: str) -> None:
+        for source_id in source_ids:
+            self.source_invalidations[source_id] = session_uri
+        self._dirty = True
+
+    def replace_source(
+        self,
+        source_id: str,
+        text: str,
+        speaker: str,
+        date: str,
+        embedding=None,
+        embedding_state=None,
+    ) -> None:
+        """Replace one unambiguous turn without changing its graph membership."""
+        turns = self.resolve_sources([source_id])
+        if len(turns) != 1:
+            raise ValueError("Source message is missing or ambiguous")
+        turn = self._turn_by_id[self._turn_id(turns[0]["episode"], turns[0]["turn"])]
+        ents, keys = extract_keys(text)
+        turn.update(text=text, speaker=speaker, date=date, ents=sorted(ents), keys=sorted(keys))
+        turn.pop("emb", None)
+        turn.pop("embedding_state", None)
+        if embedding:
+            turn["emb"] = list(embedding)
+        if embedding_state:
+            turn["embedding_state"] = dict(embedding_state)
+        rebuilt = type(self).from_dict(self.to_dict())
+        for window in list(rebuilt.graph["windows"].values()):
+            if source_id in {
+                rebuilt._turn_by_id[tid].get("source_id") for tid in window["turn_ids"]
+            }:
+                rebuilt._add_graph_window(
+                    window["archive_uri"],
+                    window["session_uri"],
+                    window["episode"],
+                    window["turn_ids"],
+                )
+        self.__dict__.update(rebuilt.__dict__)
+        self._dirty = True
+
+    async def save(self, viking_fs: Any, uri: str, ctx: Any, *, lease_ref=None) -> None:
+        """Persist while the caller holds the index read/modify/write lease."""
+        if not self._dirty:
+            return
+        payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=1)
+        await viking_fs.write_file(
+            uri=uri, content=payload.encode("utf-8"), ctx=ctx, lease_ref=lease_ref
+        )
+        self._dirty = False
+
+    @classmethod
+    async def load(cls, viking_fs: Any, uri: str, ctx: Any) -> "EvidenceIndex":
+        try:
+            content = await viking_fs.read_file(uri=uri, ctx=ctx)
+        except Exception as exc:
+            from openviking.session.archive_store import is_storage_not_found
+
+            if is_storage_not_found(exc):
+                return cls()
+            raise
+        data = json.loads(content)
+        # Reject incomplete/unknown snapshots rather than silently dropping
+        # records and saving the resulting partial index on the next append.
+        if (
+            not isinstance(data, dict)
+            or data.get("version") not in {1, 2, 3, 4, cls.VERSION}
+            or not isinstance(data.get("episodes"), dict)
+        ):
+            raise ValueError("Invalid evidence index header")
+        for key, episode in data["episodes"].items():
+            if (
+                not isinstance(episode, dict)
+                or not isinstance(episode.get("turns"), list)
+                or not isinstance(episode.get("session"), str)
+            ):
+                raise ValueError("Invalid evidence episode")
+            seen = set()
+            for turn in episode["turns"]:
+                if (
+                    not isinstance(turn, dict)
+                    or turn.get("episode") != key
+                    or type(turn.get("turn")) is not int
+                    or turn["turn"] < 0
+                    or turn["turn"] in seen
+                    or any(not isinstance(turn.get(f), str) for f in ("text", "speaker", "uri"))
+                    or any(
+                        not isinstance(turn.get(f), list)
+                        or any(not isinstance(v, str) for v in turn[f])
+                        for f in ("keys", "ents")
+                    )
+                ):
+                    raise ValueError("Invalid evidence turn")
+                seen.add(turn["turn"])
+        return cls.from_dict(data)
+
+    # -- retrieval -------------------------------------------------------
+
+
+@asynccontextmanager
+async def evidence_index_lock(viking_fs: Any, uri: str, ctx: Any):
+    """Serialize the entire read/modify/write across workers and accounts."""
+    path = viking_fs._uri_to_path(uri, ctx=ctx)
+    agfs = viking_fs._async_agfs
+    lease = await agfs.pathlock_acquire_exact(path, timeout_secs=30)
+    try:
+        yield lease
+    finally:
+        await agfs.pathlock_release(lease)
+
+
+async def rebuild_graph_from_archives(
+    viking_fs: Any, user_uri: str, ctx: Any, *, dry_run: bool = True
+) -> Dict[str, int]:
+    """Rebuild derived graph through request-authorized archive reads.
+
+    Archive listing occurs before the evidence lease; the lease then reloads
+    the current index so concurrent deletion cannot resurrect removed turns.
+    An archive whose source IDs no longer map uniquely is skipped.
+    """
+    user_uri = user_uri.rstrip("/")
+
+    def names(items):
+        return [item.get("name") if isinstance(item, dict) else item for item in items]
+
+    groups = []
+    for session_id in names(await viking_fs.ls(f"{user_uri}/sessions", ctx=ctx)):
+        if not isinstance(session_id, str) or session_id in ("", ".", "..") or "/" in session_id:
+            continue
+        session_uri = f"{user_uri}/sessions/{session_id}"
+        for archive_id in names(await viking_fs.ls(f"{session_uri}/history", ctx=ctx)):
+            if not isinstance(archive_id, str) or not re.fullmatch(r"archive_\d+", archive_id):
+                continue
+            archive_uri = f"{session_uri}/history/{archive_id}"
+            content = await viking_fs.read_file(f"{archive_uri}/messages.jsonl", ctx=ctx)
+            source_ids = []
+            text = content.decode("utf-8") if isinstance(content, bytes) else content
+            for line in text.splitlines():
+                if line.strip():
+                    message = json.loads(line)
+                    parts = message.get("parts")
+                    if isinstance(parts, list) and not any(
+                        isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+                        for part in parts
+                    ):
+                        continue
+                    source = message.get("id")
+                    if not isinstance(source, str) or not source:
+                        raise ValueError(f"Archive message lacks source ID: {archive_uri}")
+                    source_ids.append(source)
+            groups.append(
+                {"archive_uri": archive_uri, "session_uri": session_uri, "source_ids": source_ids}
+            )
+    index_uri = f"{user_uri}/.index/evidence.json"
+    async with evidence_index_lock(viking_fs, index_uri, ctx) as lease:
+        index = await EvidenceIndex.load(viking_fs, index_uri, ctx)
+        before = {(tid, turn["text"]) for tid, turn in index._turn_by_id.items()}
+        report = index.rebuild_graph(groups)
+        if {(tid, turn["text"]) for tid, turn in index._turn_by_id.items()} != before:
+            raise ValueError("Graph rebuild changed raw evidence")
+        if not dry_run:
+            await index.save(viking_fs, index_uri, ctx, lease_ref=lease)
+        return dict(report, archive_count=len(groups), dry_run=dry_run)
+
+
+async def load_index(viking_fs: Any, uri: str, ctx: Any, *, allow_pending=False) -> "EvidenceIndex":
+    """Read with current authorization and current persisted state.
+
+    Mutable URI-only caches can leak across accounts or bypass revocation.
+    The session commit hook serializes read->append->save; loading fresh also
+    prevents stale snapshots from overwriting another caller's appended turns.
+    """
+    index = await EvidenceIndex.load(viking_fs, uri, ctx)
+    if index.pending_source_updates and not allow_pending:
+        from openviking_cli.exceptions import ConflictError
+
+        raise ConflictError(
+            "Source correction is incomplete; retry the correction before using this index"
+        )
+    return index
