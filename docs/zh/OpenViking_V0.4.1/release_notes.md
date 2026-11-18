@@ -15,7 +15,7 @@
 
 | 操作系统                    | CPU类型          | 编译器        |
 | ----------------------- | -------------- | ---------- |
-| openEuler 24.03 LTS SP3 | 鲲鹏920 7282C处理器 | GCC 12.3.1 |
+| openEuler 24.03 LTS SP3 | 鲲鹏 920B 7282C（ARM64） | GCC 12.3.1 |
 
 ## 版本使用注意事项
 
@@ -31,16 +31,18 @@
 
 ### 遗留问题
 
+无。
+
 ## 版本配套文档
 
 ### v1.0.0 版本配套文档
 
 | 文档名称 | 内容简介 | 交付形式 |
 |---|---|---|
-| [《版本说明书》](./release_notes.md) | 本文档提供鲲鹏OpenViking的版本发布信息。 | 开源仓 |
-| [《OpenViking 接入 DeepAgents 实现上下文管理》](./deepagents_context_management.md) | 本文档提供OpenViking 接入 DeepAgents 的上下文管理特性使用指导。 | 开源仓 |
-| [《部署指南》](./deployment_guide.md) | 本文档提供鲲鹏OpenViking的安装使用指导。 | 开源仓 |
-| [《快速入门》](./quick_start.md) | 本文档提供OpenViking 接入 DeepAgents 的上下文管理快速入门指导。 | 开源仓 |
+| [《版本说明书》](./release_notes.md) | 本文档提供鲲鹏 OpenViking 的版本发布信息。 | 开源仓 |
+| [《OpenViking 接入 DeepAgents 实现上下文管理》](./deepagents_context_management.md) | 本文档提供 OpenViking 接入 DeepAgents 的上下文管理特性使用指导。 | 开源仓 |
+| [《部署指南》](./deployment_guide.md) | 本文档提供鲲鹏 OpenViking 的安装使用指导。 | 开源仓 |
+| [《快速入门》](./quick_start.md) | 本文档提供 OpenViking 接入 DeepAgents 的上下文管理快速入门指导。 | 开源仓 |
 
 ### 获取文档的方法
 

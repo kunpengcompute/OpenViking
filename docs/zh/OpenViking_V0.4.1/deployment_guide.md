@@ -4,7 +4,7 @@
 
 ## 1. 环境与配套
 
-- 运行平台：鲲鹏 ARM64，openEuler 24.03 LTS SP3。
+- 运行平台：鲲鹏 920B 7282C（ARM64），openEuler 24.03 LTS SP3。
 - OV 服务起配：1 个物理核、2 GiB 内存、20 GiB 本地 SSD 持久化空间；按消息、工具原文和记忆增长量扩容。
 - 镜像构建建议：4 个物理核、8 GiB 内存、30 GiB 可用空间。构建过程使用 C/C++、Rust 和 Python 工具链。
 - 网络：部署环境可访问源码、镜像及软件包源；运行环境可访问配套的生成模型与 Embedding 服务。
@@ -144,10 +144,13 @@ docker run -d --name openviking-context --restart unless-stopped \
   -v "$OV_HOME/config:/config:ro" \
   -v "$OV_HOME/data:/data" \
   openviking-context:0.4.1
-curl --fail --silent http://127.0.0.1:1933/health
+curl --fail --silent --show-error http://127.0.0.1:1933/health
+curl --fail --silent --show-error http://127.0.0.1:1933/ready
 docker logs --tail 100 openviking-context
 ```
 
+确认结果：两个接口均返回 HTTP 200。`/health` 返回 JSON 中的 `status` 为 `ok`、`healthy` 为 `true`；`/ready` 返回 JSON 中的 `status` 为 `ready`，表示基础组件已就绪。`/ready` 返回 HTTP 503 时，根据响应中的 `reason` 或 `checks` 及容器日志排查。
+
 `--cpus=2` 为逻辑 CPU 时间配额。按物理核分配时，通过 `lscpu -e=CPU,CORE,SOCKET` 选择同一物理核对应的逻辑 CPU，并增加 `--cpuset-cpus=所选CPU列表`。跨主机访问时，将发布地址设置为应用可达的内网地址，并通过网络访问控制和 HTTPS 入口提供服务。
 
-健康检查成功只说明服务可用；模型访问、写入、提交和召回由 Quick Start 验证。
+`/health` 验证进程存活，`/ready` 验证基础组件就绪；模型访问、写入、提交和召回由 Quick Start 验证。
