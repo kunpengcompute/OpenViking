@@ -23,6 +23,9 @@ if [[ -n "${OV_PATCH_SOURCE_TREE:-}" ]]; then
     source_cache="$(cd -- "$OV_PATCH_SOURCE_TREE" && pwd)"
     git -C "$source_tree" fetch --quiet --depth=1 --no-tags -- "$source_cache" "$base_ref"
 else
+    git config --global \
+        url."http://git-cdn-service.git-cdn.svc.cluster.local:8000/".insteadOf \
+        "https://github.com/"
     git -C "$source_tree" fetch --quiet --depth=1 --no-tags -- \
         "$(manifest_value base_repository)" "refs/tags/$(manifest_value base_tag)"
 fi
