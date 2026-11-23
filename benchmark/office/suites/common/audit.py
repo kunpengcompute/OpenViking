@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .files_config import write_json
-from .timing import scoring_policy
+from .policy import acceptance_policy
 
 EXPERIMENT = re.compile(
     r"office-auto--(schedule|timesheet|mail|ppt_update|reqdoc_generation)--([HQ])"
@@ -36,13 +36,24 @@ class RunAudit:
 
             spec, source = load_case()
             self.reference = {"spec": spec, "source": self.blob(source.read_bytes())}
+        elif case == "reqdoc_generation":
+            from benchmark.office.cases.reqdoc_generation.files import load_case
+
+            spec, _ = load_case()
+            self.reference["spec"] = spec
+        elif case in {"mail", "timesheet"}:
+            from benchmark.office.datasets.mail import data as mail_data
+            from benchmark.office.datasets.timesheet import data as timesheet_data
+
+            dataset = mail_data if case == "mail" else timesheet_data
+            self.reference.update(targets=dataset.goals(phase), dataset_version=dataset.VERSION)
         write_json(
             folder / "manifest.json",
             {
                 "case": case,
                 "phase": phase,
                 "reference": self.reference,
-                "scoring_policy": scoring_policy(case),
+                "acceptance_policy": acceptance_policy(case),
                 "schema_version": 1,
             },
         )

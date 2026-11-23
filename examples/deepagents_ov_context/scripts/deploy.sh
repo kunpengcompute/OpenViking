@@ -219,7 +219,7 @@ case "$command" in
       python -m examples.deepagents_ov_context.scripts.check browser \
         --tools "$OV_CHAT_TOOLS" --chrome "$OV_CHAT_CHROME"
       args+=(--agent-browser "$OV_CHAT_TOOLS/node_modules/.bin/agent-browser"
-             --browser-executable "$OV_CHAT_CHROME" --thinking --max-tokens 16384 --recursion-limit 1000)
+             --browser-executable "$OV_CHAT_CHROME" --max-tokens 16384 --recursion-limit 1000)
       if [[ -n "${OV_CHAT_BROWSER_PROXY:-}" ]]; then args+=(--browser-proxy "$OV_CHAT_BROWSER_PROXY"); fi
     else
       args+=(--max-tokens 2048)

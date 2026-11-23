@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import json
 import logging
 import math
 import shutil
@@ -59,6 +58,7 @@ from examples.deepagents_ov_context.chat.config import (
     load_commit_defaults,
     load_context_config,
     load_model_call_timeout,
+    load_model_thinking,
     load_ov_policy,
     load_reader_config,
     load_service_api_key,
@@ -210,7 +210,7 @@ class ChatSettings:
     browser_executable: Path | None = None
     browser_proxy: str | None = None
     recursion_limit: int = 24
-    thinking: bool = False
+    thinking: bool = field(default_factory=load_model_thinking)
     enable_todos: bool = field(default_factory=load_todo_enabled)
     pptx_skill: Path | None = None
     skill_node_modules: Path | None = None
@@ -306,7 +306,6 @@ class ChatRuntime:
         self.saver = checkpointer
         self.active: dict[str, ActiveRun] = {}
         self.restoring: set[str] = set()
-        self.benchmark_jobs: dict[tuple[str, str], asyncio.Task] = {}
         self.ov_http = httpx.AsyncClient(
             timeout=self.settings.ov_policy.wait_budget, trust_env=False
         )
@@ -335,13 +334,9 @@ class ChatRuntime:
             max_retries=0,
             async_call_timeout_seconds=settings.model_call_timeout_seconds,
             model_kwargs={"parallel_tool_calls": False} if settings.agent_browser else {},
-            extra_body=(
-                {
-                    "thinking": {"type": "enabled" if settings.thinking else "disabled"},
-                }
-                if "volces.com" in model.api_base
-                else None
-            ),
+            extra_body={
+                "thinking": {"type": "enabled" if settings.thinking else "disabled"},
+            },
         )
 
     def environment(self, environment_id: str = "daily") -> ChatEnvironment:
@@ -381,6 +376,7 @@ class ChatRuntime:
             commit_config=load_commit_defaults(environment.env_file),
             ov_policy=load_ov_policy(environment.env_file),
             enable_todos=load_todo_enabled(environment.env_file),
+            thinking=load_model_thinking(environment.env_file),
             model_call_timeout_seconds=load_model_call_timeout(environment.env_file),
         )
 
@@ -786,14 +782,11 @@ class ChatRuntime:
             or profile.thinking is not None
         ):
             extra = dict(model.extra_body or {})
-            if "volces.com" in self.model_config.api_base:
-                extra["thinking"] = {
-                    "type": "enabled"
-                    if (
-                        profile.thinking if profile.thinking is not None else self.settings.thinking
-                    )
-                    else "disabled"
-                }
+            extra["thinking"] = {
+                "type": "enabled"
+                if (profile.thinking if profile.thinking is not None else self.settings.thinking)
+                else "disabled"
+            }
             model = model.model_copy(update={"max_tokens": max_tokens, "extra_body": extra})
         office_skills = (
             snapshot.execution["office_skills"] if snapshot else self.settings.office_skills
@@ -1288,9 +1281,6 @@ class ChatRuntime:
 
     async def close(self) -> None:
         tasks = []
-        for task in self.benchmark_jobs.values():
-            task.cancel()
-            tasks.append(task)
         for run in self.active.values():
             run.cancel_requested = True
             if run.task is not None:
@@ -1391,7 +1381,7 @@ def create_app(settings: ChatSettings) -> FastAPI:
         defaults = runtime().environment_defaults(environment)
         return {
             "modes": ["current", "baseline", "context_only", "ordinary", "experience"],
-            "automatic_benchmark": True,
+            "benchmark_evidence": True,
             "environment_id": environment.id,
             "account_id": environment.account_id,
             "model": runtime().model_config.chat_model,
@@ -1531,41 +1521,19 @@ def create_app(settings: ChatSettings) -> FastAPI:
         rt.store.get(session_id)
         return rt.store.history.get(session_id, run_id)
 
-    @app.post("/api/sessions/{session_id}/runs/{run_id}/benchmark")
-    async def benchmark_grade(session_id: str, run_id: str) -> dict[str, Any]:
-        from benchmark.office.suites.common.automatic import evaluate_audit
-        from benchmark.office.suites.common.document_judge import DocumentJudge
+    @app.get("/api/sessions/{session_id}/runs/{run_id}/benchmark/evidence")
+    async def benchmark_evidence(session_id: str, run_id: str) -> dict[str, Any]:
+        from benchmark.office.suites.common.evidence import export_evidence
 
         rt = runtime()
         rt.store.get(session_id)
         trace = rt.store.history.get(session_id, run_id)
         if trace.statistics.status == "running" or session_id in rt.active:
-            raise HTTPException(409, "Benchmark grading requires a terminal Run")
+            raise HTTPException(409, "Benchmark evidence requires a terminal Run")
         folder = rt.settings.data_dir / "benchmark" / session_id / run_id
         if not (folder / "manifest.json").is_file():
-            raise HTTPException(404, "This Run has no automatic benchmark snapshots")
-        if (folder / "grade.json").is_file():
-            return json.loads((folder / "grade.json").read_text())
-
-        async def grade():
-            manifest = json.loads((folder / "manifest.json").read_text())
-            judge = (
-                DocumentJudge(rt.settings.model_config)
-                if manifest["case"] == "reqdoc_generation"
-                else None
-            )
-            try:
-                return await evaluate_audit(folder, trace.statistics.model_dump(), judge=judge)
-            finally:
-                if judge is not None:
-                    await judge.close()
-
-        key = (session_id, run_id)
-        if key not in rt.benchmark_jobs:
-            task = asyncio.create_task(grade())
-            rt.benchmark_jobs[key] = task
-            task.add_done_callback(lambda finished: rt.benchmark_jobs.pop(key, None))
-        return await asyncio.shield(rt.benchmark_jobs[key])
+            raise HTTPException(404, "This Run has no benchmark snapshots")
+        return await asyncio.to_thread(export_evidence, folder, trace.statistics.model_dump())
 
     @app.get("/api/sessions/{session_id}/state")
     async def graph_state(session_id: str) -> dict[str, Any]:
@@ -1769,7 +1737,12 @@ def main() -> None:
         type=int,
         help="Override OV_CONTEXT__RETRY_ATTEMPTS for transient OV failures; 0 disables retries",
     )
-    parser.add_argument("--thinking", action="store_true", help="Enable Ark model thinking")
+    parser.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override CHAT_MODEL__THINKING for the Agent model",
+    )
     parser.add_argument("--pptx-skill", type=Path, help="Installed Anthropic pptx Skill directory")
     parser.add_argument(
         "--office-skills", action="store_true", help="Enable bundled office and data Skills"
@@ -1791,7 +1764,7 @@ def main() -> None:
         browser_executable=args.browser_executable,
         browser_proxy=args.browser_proxy,
         recursion_limit=args.recursion_limit,
-        thinking=args.thinking,
+        thinking=args.thinking if args.thinking is not None else load_model_thinking(args.env_file),
         enable_todos=load_todo_enabled(args.env_file),
         model_call_timeout_seconds=load_model_call_timeout(args.env_file),
         pptx_skill=args.pptx_skill,

@@ -17,10 +17,6 @@ def test_office_admin_loads_dataset_assets_and_business_modules():
     assert callable(datasets.load("cases.schedule.data").inventory)
     assert callable(datasets.load("cases.timesheet.data").inventory)
     assert callable(datasets.load("cases.timesheet.app").handle)
-    assert callable(datasets.load("cases.mail.data").check_export)
-    assert callable(datasets.load("suites.schedule.scoring").check_at_deadline)
-    assert callable(datasets.load("suites.timesheet.scoring").check)
-    assert callable(datasets.load("suites.mail.scoring").check_export)
     assert callable(datasets.load("admin.mail").seed)
 
 
@@ -31,6 +27,7 @@ def test_office_admin_loads_dataset_assets_and_business_modules():
         "tasks",
         "cases.page_layer",
         "suites.run",
+        "evaluation.collect",
     ],
 )
 def test_office_cli_entry_point_help(module):
@@ -67,6 +64,11 @@ def test_removed_benchmark_entry_files_are_absent():
         "suites/schedule/run.py",
         "suites/evaluation/run.py",
         "suites/integration/run.py",
+        "suites/common/automatic.py",
+        "suites/common/document_judge.py",
+        "suites/common/timing.py",
+        "suites/ppt_update/scoring.py",
+        "suites/reqdoc_generation/scoring.py",
     ):
         assert not (PROJECT_ROOT / "benchmark/office" / relative).is_file()
 
@@ -132,5 +134,5 @@ def test_retired_memory_suite_is_absent_from_delivery():
     assert not (root / "memory_comparison").exists()
     assert not (PROJECT_ROOT / "tests/st/ov_context/validate_components.py").exists()
     assert (root / "common/chat.py").is_file()
-    assert (PROJECT_ROOT / "benchmark/office/cases/ppt_update/scoring.py").is_file()
-    assert (PROJECT_ROOT / "benchmark/office/suites/reqdoc_generation/scoring.py").is_file()
+    assert (PROJECT_ROOT / "benchmark/office/cases/ppt_update/package.py").is_file()
+    assert (PROJECT_ROOT / "benchmark/office/evaluation/AI_REVIEW_PROMPT.md").is_file()

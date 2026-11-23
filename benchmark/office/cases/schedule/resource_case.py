@@ -134,7 +134,6 @@ def check(ref, after):
         completed=sum(x["completed"] for x in result["items"]),
         resource_background_unchanged=unchanged,
     )
-    result["completion_rate"] = result["completed"] / 4
     result["all_backend_requirements_met"] = (
         result["completed"] == 4
         and result["new_event_count"] == 4

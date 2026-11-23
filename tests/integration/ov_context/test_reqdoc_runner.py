@@ -7,6 +7,7 @@ import json
 import pytest
 
 from benchmark.office.suites.reqdoc_generation.run import category
+from benchmark.paths import OFFICE_ROOT, PROJECT_ROOT
 
 
 def test_strict_ordinary_category():
@@ -14,6 +15,43 @@ def test_strict_ordinary_category():
     assert category("viking://user/u/memories/preferences/x.md") == "preferences"
     assert category("viking://user/u/memories/experiences/x.md") == "experiences"
     assert category("viking://user/u/memories/identity.md") == "template_or_unknown"
+
+
+@pytest.mark.parametrize(
+    "prompt_phase,recall_count,accepted", [("H", 0, True), ("Q", 0, False), ("H", 1, False)]
+)
+async def test_h_gate_checks_real_task_and_empty_recall_through_sse(
+    tmp_path, prompt_phase, recall_count, accepted
+):
+    import httpx
+
+    from benchmark.office.suites.common.chat import chat_events
+    from benchmark.office.suites.reqdoc_generation.run import FirstInputGate
+
+    spec = json.loads((OFFICE_ROOT / "cases/reqdoc_generation/spec.json").read_text())
+    prompt = (PROJECT_ROOT / spec["phases"][prompt_phase]["prompt"]).read_text()
+    events = [
+        ("stage", {"name": "memory_recall_result", "count": recall_count}),
+        ("model_input", {"messages": [{"type": "human", "content": prompt}]}),
+        ("done", {}),
+    ]
+    response = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://test/api/chat"),
+        text="".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events),
+    )
+    gate = FirstInputGate("H", "current", {}, tmp_path)
+    journal = tmp_path / "stream-events.json"
+    if accepted:
+        received = await chat_events(response, journal, on_event=gate)
+        gate.finish()
+        assert received[-1]["event"] == "done"
+    else:
+        with pytest.raises(ValueError, match="First model input"):
+            await chat_events(response, journal, on_event=gate)
+    result = json.loads((tmp_path / "first-input-gate.json").read_text())
+    assert result["passed"] is accepted
+    assert (tmp_path / "first-human-input.txt").read_text() == prompt
 
 
 def test_run_without_model_input_fails_comparison_gate(tmp_path):

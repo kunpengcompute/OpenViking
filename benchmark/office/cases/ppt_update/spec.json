@@ -301,7 +301,7 @@
       "external artifact download checks",
       "external grading"
     ],
-    "policy": "benchmark/office/cases/scoring.json"
+    "policy": "benchmark/office/evaluation/policy.json"
   },
   "output_filename_policy": "updated.pptx is preferred; accept another delivered .pptx filename",
   "reader_contract": {

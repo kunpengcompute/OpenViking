@@ -21,12 +21,13 @@ def prepared_sdk(body):
 
 def automatic_trace():
     return {
+        "run_id": "h-run",
         "events": [
             {
                 "event": "stage",
                 "data": {"name": "context.commit", "status": "accepted", "task_id": "t"},
             }
-        ]
+        ],
     }
 
 
@@ -41,7 +42,7 @@ async def test_method_summary_without_code_is_frozen_and_injected(tmp_path):
     frozen = json.loads((tmp_path / "frozen-memory.json").read_text())
     acceptance = json.loads((tmp_path / "memory-acceptance.json").read_text())
     assert frozen["fingerprint"] == pool
-    assert frozen["artifact_acceptance"]["passed"] is True
+    assert frozen["memory_integrity"]["passed"] is True
     assert acceptance["body_hashes_match"] and acceptance["pool_unchanged"]
     sdk.commit_session.assert_not_called()
     gate = FirstInputGate(tmp_path, "Q task", "rules", "Q", "ordinary")
@@ -91,16 +92,17 @@ async def test_q_rejects_unaccepted_h_before_creating_a_session(tmp_path, accept
     saved = tmp_path / "saved.json"
     record = {"fingerprint": {"uri": "hash"}}
     if acceptance is not None:
-        record["artifact_acceptance"] = acceptance
+        record["memory_integrity"] = acceptance
     saved.write_text(json.dumps(record))
     args = SimpleNamespace(
         spec=PROJECT_ROOT / "benchmark/office/cases/ppt_update/spec.json",
         phase="Q",
         mode="ordinary",
         expected_memory=saved,
+        preparation_review=None,
         output=tmp_path / "Q",
     )
-    with pytest.raises(ValueError, match="artifact acceptance"):
+    with pytest.raises(ValueError, match="preparation-review"):
         await run(args)
     assert not args.output.exists()
 
@@ -146,3 +148,33 @@ def test_case_rejects_helper_names_not_accepted_by_chat_before_run():
     spec["support_files"][0]["filename"] = "edit_slide.py.txt"
     with pytest.raises(ValueError, match="filename"):
         CaseContract.from_case(spec)
+
+
+@pytest.mark.parametrize("change", ["run", "contract", "decision", "evidence"])
+def test_q_requires_review_of_the_actual_h_run(tmp_path, change):
+    from benchmark.office.suites.ppt_update.gates import CaseContract
+
+    contract = CaseContract.from_case()
+    frozen = {
+        "preparation_run_id": "h-run",
+        "memory_integrity": {"passed": True, "contract_sha256": contract.sha256},
+    }
+    review = {
+        "run_id": "h-run",
+        "contract_sha256": contract.sha256,
+        "decision": "passed",
+        "evidence": ["H/review.json"],
+    }
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(review))
+    assert contract.require_reviewed(frozen, path) == review
+    key, value = {
+        "run": ("run_id", "another-run"),
+        "contract": ("contract_sha256", "another-contract"),
+        "decision": ("decision", "unknown"),
+        "evidence": ("evidence", []),
+    }[change]
+    review[key] = value
+    path.write_text(json.dumps(review))
+    with pytest.raises(ValueError, match="matching Run"):
+        contract.require_reviewed(frozen, path)

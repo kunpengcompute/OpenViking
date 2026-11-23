@@ -1,4 +1,4 @@
-"""Six-goal booking with per-item verification and optional deadline scoring."""
+"""Six-goal booking fixtures and reference data for evidence review."""
 
 import json
 from pathlib import Path

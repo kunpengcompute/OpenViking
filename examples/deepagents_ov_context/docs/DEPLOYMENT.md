@@ -327,6 +327,8 @@ OV_COMMIT__KEEP_RECENT_COUNT=8
 
 `.env` 的 `CHAT_MODEL__CALL_TIMEOUT_SECONDS` 控制模型响应等待超时，示例配置为 180 秒。流式调用分别限制首个片段和后续相邻片段的等待时间，收到文本、reasoning、工具参数或 usage 片段后重新计时；持续有片段返回的回复可以超过 180 秒。非流式调用限制等待完整响应的时间。整轮任务总时限由 `timeout_seconds` 单独控制。`CHAT_AGENT__ENABLE_TODOS` 控制任务计划工具。创建 Session 时保存有效值，后续 Run 复用；页面可在新会话中覆盖。
 
+`CHAT_MODEL__THINKING=true` 设置 Agent 默认开启推理。直连和网关请求均显式发送 `thinking.type`；配置为 `false` 时发送 `disabled`。CLI 的 `--thinking`／`--no-thinking` 覆盖环境配置，Session 的 Thinking 选项覆盖服务默认值并随会话保存。OV 摘要与记忆提取使用独立的 `ov_extra_request_body` 配置。
+
 Chat 支持通过 `--environments-file` 加载额外 OV 环境，配置文件放在挂载的 `/config` 下。各环境指定独立的 OV 地址、account、凭据文件及环境文件；页面和批量实验通过 `environment_id` 选择。Session 保存环境绑定，`experiment_id` 用于关联一组实验。默认环境为 `daily`。
 
 ### 3.5 镜像、端口与资源
@@ -490,7 +492,8 @@ benchmark/
     ├── tasks/                    # 办公案例的 H/Q 提示词
     ├── datasets/                 # H/Q 种子、PPT 和文档输入及验收参考
     ├── cases/                    # 办公页面、业务规则与案例定义
-    ├── suites/                   # 执行、评分和功能验收
+    ├── suites/                   # 案例执行、证据采集和性能统计
+    ├── evaluation/               # AI复核提示词与验收预算
     ├── admin/                    # 数据集和邮箱初始化
     └── tests/                    # 案例离线回归
 ```
@@ -611,7 +614,7 @@ bash examples/deepagents_ov_context/scripts/container.sh cases case-data invento
 
 **资料生成文档**：按定义文件向 H、原生 Q 和记忆 Q 上传相同的六份业务资料及 `record_helpers.py`，使用对应 H/Q 提示词生成文档。Q 提示可使用辅助函数，H 额外说明导入方式、事件处理顺序与原始记录核验方法；核对资料事实、指定章节、文件完整性和下载入口。辅助文件和提示词的 SHA-256 纳入案例指纹，更新后重新准备 H 记忆。
 
-脚本执行时从镜像内夹具路径读取文件，通过 Chat 上传接口装载到本次 Run 的 `inputs/`。页面手工执行时，先从配套源码选择同一份输入材料并上传。管理员参考与评分文件保存在独立目录。宿主机 `data/cases/inputs/` 可保存按 H/Q 分开的输入副本，数据版本与定义文件保持一致。
+脚本执行时从镜像内夹具路径读取文件，通过 Chat 上传接口装载到本次 Run 的 `inputs/`。页面手工执行时，先从配套源码选择同一份输入材料并上传。管理员参考及验收规则保存在独立目录，AI复核入口为 `benchmark/office/evaluation/AI_REVIEW_PROMPT.md`。宿主机 `data/cases/inputs/` 可保存按 H/Q 分开的输入副本，数据版本与定义文件保持一致。
 
 ### 7.6 记忆对照与数据管理
 

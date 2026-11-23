@@ -1,9 +1,5 @@
 """Administrator fixture and task contract for mail reading/body export only."""
 
-import hashlib
-import re
-from pathlib import Path
-
 VERSION = "office-mail-read-v1"
 CASES = {
     "H": {
@@ -126,21 +122,3 @@ def task(config):
         "读取邮件正文（正文可能在iframe中），将完整正文保存为本轮output/content.txt。"
         "按主题与发件人共同匹配，保留正文中的编号、时间和签名。完成后按打开顺序逐个关闭本任务的邮箱和登录/工作台标签页，最后给我文件链接。"
     )
-
-
-def check_export(path, phase="H"):
-    p = Path(path)
-    actual = p.read_text(encoding="utf-8") if p.is_file() else ""
-
-    def normalize(s):
-        return re.sub(r"\s+", "", s)
-
-    expected = body(phase)
-    return {
-        "file_exists": p.is_file(),
-        "filename_correct": p.name == "content.txt",
-        "body_complete": bool(actual) and normalize(actual) == normalize(expected),
-        "actual_sha256": hashlib.sha256(actual.encode()).hexdigest(),
-        "expected_sha256": hashlib.sha256(expected.encode()).hexdigest(),
-        "comparison": "Ignore whitespace only; require all body text and no extra headers.",
-    }

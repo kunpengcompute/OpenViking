@@ -46,6 +46,7 @@ class ExecutionProfile(BaseModel):
     native_tool_compression: bool = Field(default=True, strict=True)
     target_uris: tuple[str, ...] | None = None
     experience_target_uris: tuple[str, ...] | None = None
+    candidate_limit: int | None = Field(default=None, ge=0, strict=True)
     memory_budget_chars: int | None = Field(default=None, ge=1, le=64000)
     memory_budget_tokens: int | None = Field(default=None, ge=1, le=128000)
     memory_detail: Literal["abstract", "overview", "full"] | None = None
@@ -108,7 +109,7 @@ class ExecutionProfile(BaseModel):
                     if (self.mode == "ordinary" and category != "experiences")
                     or (self.mode == "experience" and category == "experiences")
                 }
-        for name in ("target_uris", "experience_target_uris", "recall_timeout"):
+        for name in ("target_uris", "experience_target_uris", "candidate_limit", "recall_timeout"):
             value = getattr(self, name)
             if value is not None:
                 overrides[name] = value

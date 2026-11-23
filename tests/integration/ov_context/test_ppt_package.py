@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmark.office.cases.ppt_update.files import load_case
-from benchmark.office.cases.ppt_update.scoring import package_bytes, slide_parts, xml
+from benchmark.office.cases.ppt_update.package import package_bytes, slide_parts, xml
 
 
 async def test_upload_rejects_invalid_files_and_does_not_overwrite(chat: Any, skill: Path) -> None:

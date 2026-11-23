@@ -8,9 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from benchmark.office.suites.common.timing import scoring_policy
+from benchmark.office.suites.common.execution import load_execution_profile
+from benchmark.office.suites.common.policy import acceptance_policy
 from benchmark.office.tasks import CASES, PHASES, render_task
-from benchmark.paths import RESULT_ROOT
+from benchmark.paths import OFFICE_ROOT, RESULT_ROOT
 
 
 def task_for_workspace(case, phase, workspace, page_url, config):
@@ -42,6 +43,8 @@ def main():
 
     config = OfficePortal(args.registry).config(args.workspace)
     phase, query = task_for_workspace(args.case, args.phase, args.workspace, args.page_url, config)
+    profile_path = OFFICE_ROOT / "cases" / args.case / "execution.json"
+    execution = load_execution_profile(profile_path)
 
     def api(path, body=None):
         request = urllib.request.Request(
@@ -49,15 +52,15 @@ def main():
             data=None if body is None else json.dumps(body, ensure_ascii=False).encode(),
             headers={"Content-Type": "application/json"},
         )
-        return urllib.request.urlopen(request, timeout=960)
+        return urllib.request.urlopen(request, timeout=execution["timeout_seconds"] + 60)
 
     with api("/api/sessions") as response:
         sessions = json.load(response)
     if any((s.get("last_run") or {}).get("status") == "running" for s in sessions):
         raise RuntimeError("Chat is busy")
     with api("/api/execution-profiles") as response:
-        if not json.load(response).get("automatic_benchmark"):
-            raise RuntimeError("Chat must support automatic benchmark snapshots")
+        if not json.load(response).get("benchmark_evidence"):
+            raise RuntimeError("Chat must support benchmark evidence capture")
     stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d-%H%M%S")
     out = args.output / (args.case + "-" + args.mode + "-" + stamp)
     out.mkdir(parents=True, exist_ok=False)
@@ -69,13 +72,7 @@ def main():
         "仅通过可见网页操作本工作区合成资源；邮箱只读。业务结果以页面保存后回查为准。"
         "最终交付文件放到本轮output/目录；所有业务账号凭据均由测试平台管理。"
     )
-    execution = {
-        "mode": args.mode,
-        "system_prompt": context,
-        "timeout_seconds": 900,
-        "recursion_limit": 300,
-        "max_tokens": 16384,
-    }
+    execution.update(mode=args.mode, system_prompt=context)
     with api(
         "/api/sessions",
         {
@@ -87,6 +84,7 @@ def main():
     ) as response:
         session = json.load(response)
     sid = session["session_id"]
+    (out / "session.json").write_text(json.dumps(session, ensure_ascii=False, indent=2))
     (out / "condition.json").write_text(
         json.dumps(
             {
@@ -99,8 +97,9 @@ def main():
                 "mode": args.mode,
                 "session_id": sid,
                 "entry": entry,
+                "execution_profile": str(profile_path.relative_to(OFFICE_ROOT.parent.parent)),
                 "execution": execution,
-                "scoring_policy": scoring_policy(args.case),
+                "acceptance_policy": acceptance_policy(args.case),
                 "query": query,
             },
             ensure_ascii=False,
@@ -153,9 +152,9 @@ def main():
                 indent=2,
             )
         )
-        with api(f"/api/sessions/{sid}/runs/{run_id}/benchmark", {}) as response:
-            grade = json.load(response)
-        (out / "grade.json").write_text(json.dumps(grade, ensure_ascii=False, indent=2))
+        with api(f"/api/sessions/{sid}/runs/{run_id}/benchmark/evidence") as response:
+            evidence = json.load(response)
+        (out / "evidence.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2))
     if not terminal or terminal["event"] != "done":
         raise RuntimeError("Run did not complete; evidence retained")
     print("Evidence:", out)

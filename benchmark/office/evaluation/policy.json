@@ -1,7 +1,7 @@
 {
-  "version": "office-subtask-budget-v1",
+  "version": "office-ai-review-v1",
   "applies_to": "Q",
-  "mode": "subtask_completion_deadline",
+  "mode": "ai_evidence_review",
   "clock": "seconds from Chat Run start to each subtask's verified completion",
   "task_count": 6,
   "preparation_task_counts": {
@@ -14,9 +14,10 @@
     "ppt_update": 120,
     "reqdoc_generation": 550
   },
-  "success": "All assertions for the subtask pass and its completion time is <= budget_seconds; six equally weighted subtasks per valid run.",
-  "cumulative_latency": "For the first k subtasks, max(t_1, ..., t_k); unknown or failed earlier subtasks make this cumulative time unknown.",
+  "success": "AI reviews each subtask against its business assertions, completion evidence and budget; document chapters use equally weighted checkpoints within equally weighted chapters.",
+  "cumulative_latency": "Calculated from AI-verified completion times: max(t_1, ..., t_k); unknown times remain unverified.",
   "delivery": "Whole-run status and final delivery are recorded separately from subtask success.",
   "over_budget": "Continue to terminal; retain complete run latency and Agent plus OV LLM usage, including late and failed samples.",
-  "repetitions": 3
+  "repetitions": 3,
+  "review_prompt": "benchmark/office/evaluation/AI_REVIEW_PROMPT.md"
 }

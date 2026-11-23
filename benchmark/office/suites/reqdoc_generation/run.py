@@ -14,14 +14,13 @@ import httpx
 from benchmark.office.cases.ppt_update.files import collect_artifacts, export_tool_evidence
 from benchmark.office.cases.reqdoc_generation.files import load_case
 from benchmark.office.suites.common.chat import chat_events
+from benchmark.office.suites.common.execution import load_execution_profile
 from benchmark.office.suites.common.files_config import write_json
 from benchmark.office.suites.common.memory_inventory import memory_leaves
-from benchmark.office.suites.common.timing import scoring_policy
+from benchmark.office.suites.common.policy import acceptance_policy
 from examples.deepagents_ov_context.chat.prompts import chat_base_prompt
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.client.identity import OVIdentity
-
-from .scoring import grade, rubric_for_spec
 
 ORDINARY_TYPES = {"profile", "preferences", "entities", "events"}
 
@@ -56,7 +55,7 @@ def fingerprints(pool):
 def seed_contract(spec):
     return {
         "case_version": spec["version"],
-        "rubric_version": rubric_for_spec(spec),
+        "rubric_version": spec["rubric_version"],
         "H_prompt_sha256": spec["phases"]["H"]["sha256"],
         "Q_prompt_sha256": spec["phases"]["Q"]["sha256"],
         "input_fingerprints": {item["filename"]: item["sha256"] for item in spec["inputs"]},
@@ -128,7 +127,7 @@ class FirstInputGate:
         if self.phase == "H":
             passed = (
                 task_ok
-                and "【H轮执行方法指导】" in text
+                and "【H组执行方法指导】" in text
                 and not matches
                 and not any(r.get("count", 0) > 0 for r in self.recalls)
             )
@@ -161,7 +160,8 @@ class FirstInputGate:
 async def run(args):
     root = Path.cwd()
     spec, sources = load_case(args.spec)
-    rubric_version = rubric_for_spec(spec)
+    execution = load_execution_profile(root / spec["execution_profile"])
+    rubric_version = spec["rubric_version"]
     phase = args.phase
     mode = args.mode or ("current" if phase == "H" else "ordinary")
     if phase == "H" and mode != "current":
@@ -203,35 +203,29 @@ async def run(args):
                 raise ValueError("Frozen pool differs before Q")
             write_json(args.output / "expected-memory.json", frozen_seed)
         async with httpx.AsyncClient(
-            base_url=args.chat_url, trust_env=False, timeout=httpx.Timeout(3660, connect=20)
+            base_url=args.chat_url,
+            trust_env=False,
+            timeout=httpx.Timeout(execution["timeout_seconds"] + 60, connect=20),
         ) as client:
             r = await client.get("/api/execution-profiles")
             r.raise_for_status()
             meta = r.json()
-            if not meta.get("automatic_benchmark"):
-                raise ValueError("Chat must support automatic benchmark snapshots")
+            if not meta.get("benchmark_evidence"):
+                raise ValueError("Chat must support benchmark evidence capture")
             if meta["account_id"] != args.account or meta["ov_url"].rstrip(
                 "/"
             ) != args.ov_url.rstrip("/"):
                 raise ValueError("Destination mismatch")
             if not {"office-documents", "data-analysis"}.issubset(meta.get("skills", {})):
                 raise ValueError("Required skills missing")
-            execution = {
-                "mode": mode,
-                "memory_extraction": phase == "H",
-                "context_window": 256000,
-                "max_tokens": 16384,
-                "thinking": True,
-                "recursion_limit": 1000,
-                "timeout_seconds": 3600,
-                "model_call_timeout_seconds": 180,
-                "system_prompt": chat_base_prompt(),
-                "memory_budget_tokens": 4000,
-                "memory_detail": "full",
-                "memory_recall_retry_attempts": args.recall_retry_attempts
+            execution.update(
+                mode=mode,
+                memory_extraction=phase == "H",
+                system_prompt=chat_base_prompt(),
+                memory_recall_retry_attempts=args.recall_retry_attempts
                 if phase == "Q" and mode == "ordinary"
                 else 0,
-            }
+            )
             r = await client.post(
                 "/api/sessions",
                 json={
@@ -284,11 +278,12 @@ async def run(args):
                     "memory_policy": metadata.get("memory_policy"),
                     "query": prompt,
                     "prompt_sha256": spec["phases"][phase]["sha256"],
+                    "execution_profile": spec["execution_profile"],
                     "execution": execution,
                     "metadata": meta,
                     "inputs": uploads,
                     "score_rubric": rubric_version,
-                    "scoring_policy": scoring_policy("reqdoc_generation"),
+                    "acceptance_policy": acceptance_policy("reqdoc_generation"),
                     "closing": spec.get("closing"),
                     "chat_url": args.chat_url.rstrip("/"),
                     "model_calls_via": "Chat HTTP/SSE",
@@ -340,19 +335,9 @@ async def run(args):
                 and json.loads((args.output / "first-input-gate.json").read_text())["passed"],
             }
             write_json(args.output / "result.json", result)
-            automatic = await client.post(f"/api/sessions/{sid}/runs/{rid}/benchmark")
-            automatic.raise_for_status()
-            auto_grade = automatic.json()
-            write_json(args.output / "automatic-grade.json", auto_grade)
-            review_path = None
-            if auto_grade.get("document_review"):
-                review_path = args.output / "automatic-reviews.json"
-                write_json(review_path, auto_grade["document_review"])
-            content_grade = grade(
-                args.output, reviews_path=review_path, rubric_version=rubric_version
-            )
-            content_grade.update(latency=auto_grade["latency"], automatic=auto_grade)
-            write_json(args.output / "grade.json", content_grade)
+            evidence = await client.get(f"/api/sessions/{sid}/runs/{rid}/benchmark/evidence")
+            evidence.raise_for_status()
+            write_json(args.output / "evidence.json", evidence.json())
             print(json.dumps({"execution": result["statistics"]}, ensure_ascii=False), flush=True)
             gate.finish()
         if not sdk:
@@ -425,7 +410,7 @@ def build_parser():
         "--spec",
         type=Path,
         default=Path("benchmark/office/cases/reqdoc_generation/spec.json"),
-        help="Frozen task and scoring specification",
+        help="Frozen task and acceptance specification",
     )
     p.add_argument("--phase", choices=["H", "Q"], default="H")
     p.add_argument("--mode", choices=["current", "ordinary", "baseline"])

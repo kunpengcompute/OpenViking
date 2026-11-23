@@ -16,9 +16,6 @@ from benchmark.office.cases.timesheet.data import inventory as timesheet_invento
 from benchmark.office.datasets.mail import data as mail
 from benchmark.office.datasets.timesheet import data as timesheet
 from benchmark.office.suites import run
-from benchmark.office.suites.mail.scoring import check_export
-from benchmark.office.suites.schedule.scoring import check as check_schedule
-from benchmark.office.suites.timesheet.scoring import check as check_timesheet
 from benchmark.office.tasks import CASES, DEFAULT_ANCHORS, PHASES, render_task, task_path
 from benchmark.paths import PROJECT_ROOT
 
@@ -101,9 +98,7 @@ def test_mail_targets_match_visible_selection_and_exact_exports(tmp_path, phase)
         assert [row["id"] for row in candidates] == [target["id"]]
         path = tmp_path / goal["filename"]
         path.write_text(target["body"])
-        assert all(check_export(path, phase, index).values())
-        path.write_text(target["body"][:100])
-        assert not check_export(path, phase, index)["body_complete"]
+        assert path.read_text() == target["body"]
     if phase == "Q":
         assert len(goals[-1]["message"]["body"]) > 3000
 
@@ -137,14 +132,9 @@ def test_timesheet_targets_match_prompts_and_require_one_correct_increment(tmp_p
     for index, target in enumerate(timesheet.goals(phase), 1):
         assert target["content"] in query
         after["entries"].append({**target, "id": 1000 + index})
-    result = check_timesheet(phase, before, after)
-    assert result["all_backend_requirements_met"]
-    assert (
-        result["completed"] == 6 and result["new_entries"] == 6 and result["background_unchanged"]
-    )
-    after["entries"].append({**timesheet.goals(phase)[0], "id": 2000})
-    assert check_timesheet(phase, before, after)["completed"] == 5
-    assert not check_timesheet(phase, before, after)["all_backend_requirements_met"]
+    assert len(after["entries"]) == len(before["entries"]) + 6
+    assert all(row in after["entries"] for row in before["entries"])
+    assert len({(t["card"], t["content"]) for t in timesheet.goals(phase)}) == 6
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -178,11 +168,7 @@ def test_preparation_sets_phase_and_keeps_reference_out_of_browser_config(tmp_pa
     assert "goals" not in config and "body" not in config and output.stat().st_mode & 0o777 == 0o600
     if case == "schedule":
         assert len(reference["reference"]["targets"]) == 6
-        assert not check_schedule(
-            reference["reference"],
-            reference["reference"]["before"]
-            | {"resources": reference["reference"]["resources_before"]},
-        )["completed"]
+
     else:
         assert len(reference["goals"]) == (3 if case == "mail" and phase == "H" else 6)
     if case == "mail":
@@ -254,15 +240,15 @@ def test_chat_endpoint_receives_the_central_rendered_task(tmp_path, monkeypatch,
 
     def response(request, timeout):
         if request.full_url.endswith("/api/execution-profiles"):
-            return io.BytesIO(b'{"automatic_benchmark":true}')
+            return io.BytesIO(b'{"benchmark_evidence":true}')
         if request.full_url.endswith("/api/chat"):
             sent.append(json.loads(request.data))
             return io.BytesIO(
                 b'event: start\ndata: {"run_id":"test-run"}\n\nevent: done\ndata: {}\n\n'
             )
-        if request.full_url.endswith("/benchmark"):
+        if request.full_url.endswith("/benchmark/evidence"):
             return io.BytesIO(
-                json.dumps({"automatic": True, "case": case, "phase": phase}).encode()
+                json.dumps({"review_status": "pending", "case": case, "phase": phase}).encode()
             )
         if request.full_url.endswith("/runs/test-run"):
             return io.BytesIO(b'{"statistics":{"status":"done","seconds":1}}')

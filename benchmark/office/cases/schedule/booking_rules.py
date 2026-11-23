@@ -154,7 +154,6 @@ def check(reference, after):
         "items": items,
         "completed": completed,
         "total": 4,
-        "completion_rate": completed / 4,
         "new_event_count": len(new_ids),
         "background_unchanged": unchanged,
         "unmatched_new_event_ids": sorted(new_ids - matched),

@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 from benchmark.office.cases.mail.data import (
     body,
-    check_export,
     fixture,
     metadata,
     task,
@@ -48,18 +47,6 @@ class MailReadTest(unittest.TestCase):
             self.assertEqual(1, len(exact))
             self.assertEqual(body(phase), exact[0]["body"])
         self.assertNotEqual(body("H"), body("Q"))
-
-    def test_export_requires_complete_body(self):
-        with tempfile.TemporaryDirectory() as folder:
-            p = Path(folder) / "content.txt"
-            self.assertFalse(check_export(p)["file_exists"])
-            p.write_text(body("H"))
-            self.assertTrue(check_export(p)["body_complete"])
-            p.write_text(body("H").replace("\n", "\r\n"))
-            self.assertTrue(check_export(p)["body_complete"])
-            for text in [body("H")[:100], body("Q"), "邮件主题：test\n" + body("H")]:
-                p.write_text(text)
-                self.assertFalse(check_export(p)["body_complete"])
 
     def test_fresh_office_workspace_needs_no_redmine_project(self):
         with tempfile.TemporaryDirectory() as folder:

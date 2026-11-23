@@ -118,53 +118,58 @@ bash examples/deepagents_ov_context/scripts/container.sh run python -m \
 
 通过 `python -m benchmark.office.tasks --case mail --phase H --workspace mail-h --page-url http://127.0.0.1:19482` 输出填好入口的任务。邮件 H 使用三个准备目标，Q 使用六个验收目标，数据集版本为 `office-mail-h3-q6-v2`；H/Q 使用独立的主题、日期、正文及标识。准备后按工作区中的 case/phase 执行，旧单项工作区使用新的 namespace 重新准备。
 
-### 4.1 配置与评分预算
+### 4.1 配置与验收预算
 
-普通记忆 Reader 候选数为 25，实际注入数量及召回 Token／字符预算仍由 Reader 配置控制。Session 保存创建时的配置快照，调整配置后用新 Session 验证。
+普通记忆Reader候选数为25，实际注入数量及Token／字符预算由Reader配置控制。Session保存创建时的有效配置，调整配置后创建新Session。
 
-五个案例共用 `benchmark/office/cases/scoring.json` 的 Q 轮评分规则：
+验收预算和重复次数由 `benchmark/office/evaluation/policy.json` 固定，任务成功率按[AI复核提示词](../../../benchmark/office/evaluation/AI_REVIEW_PROMPT.md)结合实际证据评审。
 
-| 案例 | 每项任务评分预算／秒 |
-|---|---:|
-| 日程会议 | 450 |
-| 报工登记 | 300 |
-| 邮件整理 | 550 |
-| PPT 更新 | 120 |
-| 资料生成文档 | 550 |
+| 案例 | Q轮预算／秒 | 质量统计 |
+|---|---:|---|
+| 日程会议 | 450 | 六项业务子任务通过率 |
+| 报工登记 | 300 | 六项业务子任务通过率 |
+| 邮件整理 | 550 | 六项业务子任务通过率，允许附带对应准确主题 |
+| PPT更新 | 120 | 六项修改及完整回读的预算内通过率 |
+| 资料生成文档 | 550 | 六章等权、27个检查点的综合得分 |
 
-1. 每轮包含六个等权子任务。某项全部断言通过，且从 Chat Run 开始到该项保存、回查及核验完成的时间 `t_i ≤ T`，计一次预算内成功。三次测试成功率为成功项总数除以 18。
-2. 前 k 项累计时延为 `max(t_1, …, t_k)`，三次均有合格时点时取平均。每项成功率使用自身的 `t_i`；较早任务的延迟修复只影响累计时延。
-3. 完整 Run 的终态、最终交付、总耗时及 Agent＋OV LLM Token 单列。执行保护超时由 `execution.timeout_seconds` 控制；评分截止后继续执行至终态，失败样本保留。
-4. 正式 runner 自动创建带 `office-auto--案例名--H/Q` 标记的 Session。标准 Chat 在工具结束时保存业务状态、产物哈希与中间版本；Run 结束后，runner 自动请求 `POST /api/sessions/{session_id}/runs/{run_id}/benchmark` 完成验收和计分。
+每组执行三轮，固定分母为18。AI逐项核验内容、完成时点与交付条件，给出通过、失败或无法核定，引用快照行号、call ID和产物内容。完成时点只有预算后的观测上界时，预算内结果列为待核定。两组均100%时按满分规则判定达成目标，提升仍记录0个百分点。
 
-### 4.2 自动验收与分步统计
+### 4.2 证据采集与AI复核
 
-| 案例 | 自动验收依据 |
-|---|---|
-| 日程 | 六场会议字段、预约资源、背景记录保持性及各项详情回读审计 |
-| 报工 | 各卡片新增记录、日期和工时增量、背景记录保持性及对应 PNG 截图 |
-| 邮件 | 六份指定文件的正文与冻结参考逐项比对 |
-| PPT | 各中间版本的两处修改、页数及包内容保持性 |
-| 资料生成文档 | 六章结构、计算脚本／JSON 解析，以及对照原资料的 27 项自动语义评审 |
+runner创建带 `office-auto--案例名--H/Q` 标记的Session，标准Chat在工具结束和Run结束时采集证据。`/api/execution-profiles` 返回 `benchmark_evidence: true` 表示支持此能力。
 
-- 每项完成时间取最终有效版本序列中首次通过全部验收的快照时点。后续版本破坏已完成项时，清除该项完成时点，修复后重新计时；其他项目独立保留。
-- 快照位于 Chat 数据目录 `benchmark/<session_id>/<run_id>/`，包含 `manifest.json`、`snapshots.jsonl` 和按 SHA-256 去重的 `blobs/`。时间统一使用 Chat Run 的单调时钟，产物内容与其哈希一同校验。普通 Chat 会话沿用原执行链路。
-- 文档评审在 Run 结束后使用部署的模型配置调用模型，保留原文引用、资料引用、模型标识、每项判定和 usage。相同章节及证据复用缓存；模型请求、格式或引用校验失败时记录“未核验”。评审 Token 单列为 `judge_usage`，与 Agent／OV 用量分别统计。
-- 缺失快照、文件损坏或其他证据错误记录到评分结果的 `errors`。`unverified_subtasks` 为零时输出完整 `success_rate`；存在未核验项目时保留已确认成功项数及空成功率。
-- 日程、报工与邮件的工作区默认从 Chat 数据目录相邻的 `cases/registry` 读取。独立部署可通过 `OV_BENCHMARK_REGISTRY` 指定同一数据集部署的 registry。Session 的 user 必须与工作区标识相同，case／phase 与已准备的工作区一致。
+- Chat数据目录的 `benchmark/<session_id>/<run_id>/` 保存 `manifest.json`、`snapshots.jsonl` 和按SHA-256去重的 `blobs/`，供核对原始文件版本及业务状态。
+- runner通过 `GET /api/sessions/{session_id}/runs/{run_id}/benchmark/evidence` 保存 `evidence.json`，包含原始快照、案例参考、Run统计和证据目录位置。缺失文件或采集错误作为待复核证据保留。
+- SSE、模型输入、工具参数与返回、最终答复、下载文件及回执随运行目录保存。完整Run耗时和实际模型usage继续由执行链路统计。
+- 运行结束后，向AI提供正式Run清单、冻结任务及输入、证据目录和复核提示词。AI产出逐项复核账本和分案例报告，核对证据后形成最终验收结果。
 
-正式 runner 自动保存 `grade.json`。PPT 和文档另存 `automatic-grade.json`，其中含分步结果与评审证据。标准 Chat 的 `/api/execution-profiles` 返回 `automatic_benchmark: true` 后，runner 才发起任务。
+PPT普通记忆Q使用已完成的H目录和复核记录。先执行H并检查真实提交、提取及记忆指纹，再按提示词复核H产物；复核通过后记录H的Run ID、案例契约指纹及证据路径。执行方式见[PPT案例说明](../../../benchmark/office/cases/ppt_update/README.md)。
 
-三次测试完成后，从对应 Q 运行目录自动汇总：
+### 4.3 汇总AI复核材料
+
+在部署的Chat容器中运行统一收集入口：
+
+```bash
+bash examples/deepagents_ov_context/scripts/container.sh run python -m \
+  benchmark.office.evaluation.collect \
+  --runs /opt/openviking/result/ppt/pair-{1,2,3}/Q-{baseline,memory} \
+  --chat-data /data/chat --output /opt/openviking/result/ai-review/ppt
+```
+
+目录中包含AI提示词、正式Run清单、实际任务、模型及工具轨迹、冻结参考、文件版本和输入／产物。将整份目录交给AI，从根目录 `README.md` 开始。`issues.json`列出缺失或损坏证据，脚本保留失败Run。归档目录映射及输出结构见[材料汇总说明](../../../benchmark/office/evaluation/README.md#一条命令汇总材料)。
+
+### 4.4 性能汇总
+
+三次Q执行完成后汇总完整任务耗时与Token：
 
 ```bash
 python -m benchmark.office.suites.common.report \
   --runs result/ppt/pair-1/Q-baseline result/ppt/pair-2/Q-baseline result/ppt/pair-3/Q-baseline \
          result/ppt/pair-1/Q-memory result/ppt/pair-2/Q-memory result/ppt/pair-3/Q-memory \
-  --output result/ppt/summary.json
+  --output result/ppt/performance.json
 ```
 
-汇总按案例和实验组检查三次独立 Run、评分预算及模型／输入配置，输出分步累计时延均值、完整耗时、预算内任务成功率、Token 分项与优化百分比。失败及超时 Run 保留在样本中；OV Token 未采集时保持为空，总 LLM Token 的优化率等待用量齐全后计算。已有历史人工时点记录仍可用 `common.timing` 复核，历史成绩保留其原始条件。
+汇总检查三次独立Run、案例预算和模型／输入条件，保留失败及超时样本，输出完整耗时、Agent／OV LLM用量及优化百分比。OV用量尚未采集时保留为空。质量结果、分步完成时点及累计时延由AI复核账本提供，性能脚本只统计原始测量数据。
 
 ## 5. 执行记录
 
