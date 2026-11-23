@@ -26,7 +26,7 @@ from openviking.integrations.langchain.ov_context.recall_ranking import (
     render_experience,
     should_recall_experience,
 )
-from openviking_cli._exception_utils import auth_error
+from openviking_cli._exception_utils import auth_error, invalid_argument_error
 from openviking_cli.client.identity import _identity_arguments
 from openviking_cli.retrieve.context import (
     ContextSearchOptions,
@@ -368,7 +368,7 @@ class OVContextReader:
         except asyncio.TimeoutError:
             return RecallResult(status="timeout")
         except Exception as exc:
-            if auth_error(exc):
+            if auth_error(exc) or invalid_argument_error(exc):
                 raise
             logger.debug("OV recall failed", exc_info=True)
             return RecallResult(status="error")
@@ -457,7 +457,7 @@ class OVContextReader:
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
             if isinstance(outcome, Exception):
-                if auth_error(outcome):
+                if auth_error(outcome) or invalid_argument_error(outcome):
                     raise outcome
                 had_error = True
                 continue
@@ -489,7 +489,7 @@ class OVContextReader:
                         item, experience=exp, **_identity_arguments(identity)
                     )
                 except Exception as exc:
-                    if auth_error(exc):
+                    if auth_error(exc) or invalid_argument_error(exc):
                         raise
                     had_error = True
                     continue
@@ -541,7 +541,7 @@ class OVContextReader:
                 **_identity_arguments(identity),
             )
         except Exception as exc:
-            if auth_error(exc):
+            if auth_error(exc) or invalid_argument_error(exc):
                 raise
             return exc
 
@@ -556,7 +556,7 @@ class OVContextReader:
                 content = await self.client.read(item.uri, **_identity_arguments(identity))
                 return content.strip() or fallback
             except Exception as exc:
-                if auth_error(exc):
+                if auth_error(exc) or invalid_argument_error(exc):
                     raise
                 logger.debug("OV memory body read failed; using available summary", exc_info=True)
                 if not fallback:
@@ -592,7 +592,7 @@ class OVContextReader:
         except ContextReadError:
             raise
         except Exception as exc:
-            if auth_error(exc):
+            if auth_error(exc) or invalid_argument_error(exc):
                 raise
             if getattr(exc, "code", None) == "RESOURCE_EXHAUSTED":
                 raise ContextHistoryBudgetError(

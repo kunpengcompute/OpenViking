@@ -10,6 +10,8 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, cast
 
+from openviking_cli._exception_utils import invalid_argument_error
+
 try:
     from langchain.agents.middleware import AgentMiddleware
     from langchain.agents.middleware.types import ExtendedModelResponse, ModelRequest, ModelResponse
@@ -469,7 +471,11 @@ class OpenVikingContextMiddleware(AgentMiddleware[OVPluginState]):
         except ContextBudgetExceeded:
             raise
         except Exception as exc:
-            if isinstance(exc, IdentityMismatchError) or auth_error(exc):
+            if (
+                isinstance(exc, IdentityMismatchError)
+                or auth_error(exc)
+                or invalid_argument_error(exc)
+            ):
                 raise
             raise ContextBudgetExceeded(
                 f"Capacity compression failed ({type(exc).__name__})"
@@ -497,6 +503,7 @@ class OpenVikingContextMiddleware(AgentMiddleware[OVPluginState]):
                 isinstance(exc, (IdentityMismatchError, ContextBudgetExceeded))
                 or isinstance(exc, ContextHistoryBudgetError)
                 or auth_error(exc)
+                or invalid_argument_error(exc)
                 or engine.config.context_failure == "raise"
             ):
                 raise

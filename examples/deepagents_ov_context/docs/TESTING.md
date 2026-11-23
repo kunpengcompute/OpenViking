@@ -19,7 +19,7 @@ LITELLM_LOCAL_MODEL_COST_MAP=true python -m pytest -o addopts='' -q \
 
 ```bash
 bash examples/deepagents_ov_context/scripts/container.sh run \
-  env LITELLM_LOCAL_MODEL_COST_MAP=true python -m pytest -o addopts='' -q \
+  python -m pytest -o addopts='' -q \
   tests/unit/ov_context tests/integration/ov_context \
   tests/client/test_http_request_identity.py
 ```

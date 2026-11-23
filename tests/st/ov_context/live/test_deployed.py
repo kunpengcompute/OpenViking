@@ -11,9 +11,12 @@ import httpx
 import pytest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 
 from examples.deepagents_ov_context.chat.config import ModelConfig
 from examples.deepagents_ov_context.chat.model import ArkChatOpenAI
+from openviking.integrations.langchain.ov_context import OVPluginState, RunIdentity
 from openviking.integrations.langchain.ov_context.assembler import validate_tool_pairs
 from openviking.integrations.langchain.ov_context.errors import (
     ContextReadError,
@@ -21,9 +24,11 @@ from openviking.integrations.langchain.ov_context.errors import (
 )
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig, OVContextReader
 from openviking.integrations.langchain.ov_context.state import OVContext
+from openviking.integrations.langchain.ov_context.tool_readback import make_session_tools
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter, WriterConfig
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.exceptions import NotFoundError, PermissionDeniedError, UnavailableError
+from tests.st.ov_context.components import signature, validate_persisted_projection
 
 from .support import ChatProcess, NetworkGate, events
 
@@ -47,6 +52,115 @@ def history(rounds=4, parallel=2):
         )
     messages.append(AIMessage(id="final", content="已核对，任务可以继续。"))
     return messages
+
+
+async def test_i04_source_read_preserves_live_fragment_and_server_reference_view(live):
+    """Force the real readback tool path without relying on an LLM choosing it."""
+    context, identity = await live.new()
+    sid = context.session_id
+    source = "BEGIN\n订单O-42金额137元\n" + "A-42,137,confirmed\n" * 2200
+    raw = [
+        HumanMessage(id="source-user", content="核对订单金额"),
+        AIMessage(
+            id="source-call",
+            content="",
+            tool_calls=[
+                {
+                    "id": "ledger",
+                    "name": "load_ledger",
+                    "args": {},
+                }
+            ],
+        ),
+        ToolMessage(id="source-result", tool_call_id="ledger", name="load_ledger", content=source),
+    ]
+    original = deepcopy(raw)
+    writer = OVMessageWriter(live.sdk)
+    first = await writer.write(sid, raw, 0, identity=identity)
+    context.append(first.model_messages)
+    view = await live.sdk.get_session_context(sid, identity=identity)
+    source_part = next(
+        p
+        for m in view["messages"]
+        for p in m["parts"]
+        if p.get("tool_id") == "ledger" and p.get("tool_status") == "completed"
+    )
+    ref = source_part["tool_output_ref"]
+    assert ref and "[OpenViking tool result externalized]" in str(context.messages[-1].content)
+    run = RunIdentity(
+        identity.account_id, identity.user_id, identity.actor_peer_id, sid, "readback"
+    )
+    context.begin_run(run.run_id, raw[0])
+    args = {"ref": ref, "offset": 5, "limit": 200}
+    read_call = AIMessage(
+        id="read-call",
+        content="",
+        tool_calls=[
+            {
+                "id": "read-fragment",
+                "name": "openviking_tool_result_read",
+                "args": args,
+            }
+        ],
+    )
+    engine = live.engine()
+    graph = StateGraph(OVPluginState)
+    graph.add_node("tools", ToolNode(make_session_tools(engine, lambda state, runtime: run)))
+    graph.add_edge(START, "tools")
+    graph.add_edge("tools", END)
+    try:
+        result = await graph.compile().ainvoke(
+            {
+                "messages": [read_call],
+                "ov_context": context.to_state(),
+            }
+        )
+        read_message = result["messages"][-1]
+        assert isinstance(read_message, ToolMessage) and read_message.status == "success"
+        payload = json.loads(read_message.content)
+        assert payload["content"] == source[5:205]
+        raw.extend([read_call, read_message])
+        before_write = deepcopy(raw)
+        delta = await writer.write(sid, raw, first.write_index, identity=identity)
+        context.append(delta.model_messages)
+        assert raw == before_write and raw[:3] == original
+        assert context.messages[-1] is read_message
+        cached = deepcopy(context.messages)
+        restored = await OVContextReader(live.sdk).exchange_context(sid, identity=identity)
+        assert signature(context.messages) != signature(restored.messages)
+        assert (
+            await validate_persisted_projection(
+                context.messages,
+                restored.messages,
+                sdk=live.sdk,
+                session_id=sid,
+                identity=identity,
+            )
+            == 1
+        )
+        assert context.messages == cached
+        listed = await live.sdk.list_tool_results(sid, identity=identity)
+        assert len(listed["tool_results"]) == 1
+        (live.directory / "source-read-contract.json").write_text(
+            json.dumps(
+                {
+                    "session_id": sid,
+                    "offset": 5,
+                    "limit": 200,
+                    "fragment_chars": 200,
+                    "local_body_chars": len(read_message.content),
+                    "cached_messages": len(cached),
+                    "restored_messages": len(restored.messages),
+                    "verified_source_read_views": 1,
+                    "tool_result_originals": 1,
+                    "raw_messages_unchanged": raw == before_write,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    finally:
+        await engine.client.close()
 
 
 async def test_i01_chat_rebuild_keeps_checkpoint_and_model_history(live):

@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from openviking.core.identifiers import validate_identifier_part
 from openviking.integrations.langchain.ov_context.commit import CommitConfig
 from openviking.integrations.langchain.ov_context.config import OVContextConfig
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig
@@ -82,6 +83,9 @@ class ChatOVPolicy(BaseSettings):
         context_quotas: bool = False,
     ) -> tuple[str, ...] | None:
         valid_identity_field(agent_id)
+        error = validate_identifier_part(agent_id, "actor_peer_id")
+        if error:
+            raise ValueError(error)
         if targets is None:
             if context_quotas:
                 if self.recall_agent_memories:
@@ -215,6 +219,13 @@ class ModelConfig:
     chat_max_tokens: int = 256
     embedding_provider: str = "openai"
     embedding_input: str = "text"
+    ov_extra_request_body: dict[str, Any] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.ov_extra_request_body is not None and not isinstance(
+            self.ov_extra_request_body, dict
+        ):
+            raise ValueError("ov_extra_request_body must be a JSON object or null")
 
     @classmethod
     def load(cls, path: Path) -> ModelConfig:
@@ -269,7 +280,9 @@ def write_server_config(config: ModelConfig, output: Path, port: int) -> Path:
             "max_retries": 1,
             "timeout": 60,
             "extra_request_body": (
-                {"thinking": {"type": "disabled"}} if "volces.com" in config.api_base else {}
+                dict(config.ov_extra_request_body)
+                if config.ov_extra_request_body is not None
+                else ({"thinking": {"type": "disabled"}} if "volces.com" in config.api_base else {})
             ),
         },
         "oauth": {"enabled": False},

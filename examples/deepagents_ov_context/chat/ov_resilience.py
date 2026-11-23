@@ -23,7 +23,7 @@ from openviking.integrations.langchain.ov_context.errors import (
 from openviking.integrations.langchain.ov_context.reader import RecallResult
 from openviking.integrations.langchain.ov_context.retry import retryable_read
 from openviking.integrations.langchain.ov_context.state import OVPluginState
-from openviking_cli._exception_utils import auth_error
+from openviking_cli._exception_utils import auth_error, invalid_argument_error
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,11 @@ class _RecallDeadlineReader:
             done, _ = await asyncio.wait({task}, timeout=budget)
             result = task.result() if done else RecallResult(status="timeout")
         except Exception as exc:
-            if isinstance(exc, IdentityMismatchError) or auth_error(exc):
+            if (
+                isinstance(exc, IdentityMismatchError)
+                or auth_error(exc)
+                or invalid_argument_error(exc)
+            ):
                 raise
             result = RecallResult(status="timeout" if isinstance(exc, TimeoutError) else "error")
         finally:
@@ -199,9 +203,13 @@ class ResilientOVMiddleware(OpenVikingContextMiddleware):
             async with asyncio.timeout(self.wait_budget):
                 return await method(state, runtime)
         except Exception as exc:
-            if isinstance(
-                exc, (IdentityMismatchError, ContextBudgetExceeded, ContextHistoryBudgetError)
-            ) or auth_error(exc):
+            if (
+                isinstance(
+                    exc, (IdentityMismatchError, ContextBudgetExceeded, ContextHistoryBudgetError)
+                )
+                or auth_error(exc)
+                or invalid_argument_error(exc)
+            ):
                 raise
             return self._degrade(stage, exc, state)
 
@@ -324,6 +332,7 @@ class ResilientOVMiddleware(OpenVikingContextMiddleware):
                     exc, (IdentityMismatchError, ContextBudgetExceeded, ContextHistoryBudgetError)
                 )
                 or auth_error(exc)
+                or invalid_argument_error(exc)
             ):
                 raise
             self._degrade(
@@ -350,6 +359,8 @@ class ResilientOVMiddleware(OpenVikingContextMiddleware):
                 async with asyncio.timeout(self.wait_budget):
                     return await handler(request)
             except Exception as exc:
+                if auth_error(exc) or invalid_argument_error(exc):
+                    raise
                 self._degrade("tool_result_read", exc, request.state)
         message = ToolMessage(
             content="OV暂不可用，本次读取未完成。请使用当前对话中已有的原始工具结果，不要重复读取OV。",

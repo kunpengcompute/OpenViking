@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from openviking.core.identifiers import validate_account_id
 from openviking_cli.client.identity import valid_identity_field
 
 
@@ -23,6 +24,9 @@ class EnvironmentBinding(BaseModel):
     @classmethod
     def valid_account(cls, value: str) -> str:
         valid_identity_field(value)
+        error = validate_account_id(value)
+        if error:
+            raise ValueError(error)
         return value
 
     @field_validator("ov_url")

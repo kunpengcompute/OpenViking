@@ -193,6 +193,15 @@ class ContextAssembler:
         tokens = self._count(fixed)
         return HistoryBudget(budget, tokens, max(0, budget.base_context_limit - tokens))
 
+    def check_user_input(self, request: ModelRequest[Any]) -> int:
+        """Preflight the new input and known fixed content before saving messages.
+
+        The host supplies only the incoming messages, its system prompt and tools.
+        Framework additions and recalled content still require prepare()'s final
+        check; compressible session history belongs to that later stage.
+        """
+        return self.check_input_budget(self._system_request(request))
+
     def assemble(self, request: ModelRequest[Any], context: OVContext) -> ModelRequest[Any]:
         return self.prepare(request, context).request
 

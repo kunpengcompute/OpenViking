@@ -63,6 +63,20 @@ print('Python:', sys.executable, sys.version.split()[0])
 print('Build requirements:', tomllib.load(open('pyproject.toml', 'rb'))['build-system']['requires'])
 PY
 
+# 隔离镜像内的 Cargo source 替换配置，CLI 与 RAGFS 均使用官方 sparse 源。
+# 配置和依赖缓存留在作业产物目录，保留镜像原有工具链和全局配置。
+export CARGO_HOME="$REPORT_DIR/cargo"
+mkdir -p "$CARGO_HOME"
+cat > "$CARGO_HOME/config.toml" <<'TOML'
+[registries.crates-io]
+protocol = "sparse"
+[net]
+retry = 5
+[http]
+timeout = 120
+TOML
+cargo fetch --locked
+
 # editable 构建生成与源码对应的 Rust CLI、RAGFS 和 VectorDB 扩展。
 uv pip install --python "$PYTHON" --no-deps --no-build-isolation --reinstall --editable .
 uv build --python "$PYTHON" --wheel --no-build-isolation --out-dir "$REPORT_DIR/wheels"

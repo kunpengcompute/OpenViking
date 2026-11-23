@@ -25,6 +25,18 @@ def ci_env(tmp_path):
         path = bin_dir / name
         path.write_text("#!/usr/bin/env bash\nexit 0\n")
         path.chmod(0o755)
+    cargo = bin_dir / "cargo"
+    cargo.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "if sys.argv[1:2] == ['fetch']:\n"
+        "    home = pathlib.Path(os.environ['CARGO_HOME'])\n"
+        "    pathlib.Path(os.environ['CARGO_ARGS_FILE']).write_text(json.dumps({\n"
+        "        'args': sys.argv[1:], 'home': str(home),\n"
+        "        'config': (home / 'config.toml').read_text()}))\n"
+        "    sys.exit(int(os.environ.get('CARGO_FETCH_EXIT', '0')))\n"
+    )
+    cargo.chmod(0o755)
     uv = bin_dir / "uv"
     uv.write_text('#!/usr/bin/env bash\n[[ "$1" != sync ]] || exit 17\n')
     uv.chmod(0o755)
@@ -51,6 +63,7 @@ def ci_env(tmp_path):
         "UT_SCOPE": "unit",
         "UT_WORKERS": "1",
         "ARGS_FILE": str(tmp_path / "pytest-args.json"),
+        "CARGO_ARGS_FILE": str(tmp_path / "cargo-args.json"),
     }
 
 
@@ -69,6 +82,38 @@ def test_build_propagates_dependency_sync_failure(ci_env):
     assert result.returncode == 17
     assert "退出码 17" in result.stdout
     assert not (Path(ci_env["REPORT_DIR"]) / "build-result.json").exists()
+
+
+def test_build_isolates_cargo_from_the_image_mirror(ci_env, tmp_path):
+    import tomllib
+
+    image_home = tmp_path / "image-cargo"
+    image_home.mkdir()
+    config = image_home / "config.toml"
+    original = '[source.crates-io]\nreplace-with = "broken-mirror"\n'
+    config.write_text(original)
+    result = run(
+        "build_ci.sh",
+        {**ci_env, "OV_SKIP_UV_SYNC": "1", "CARGO_HOME": str(image_home)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = json.loads(Path(ci_env["CARGO_ARGS_FILE"]).read_text())
+    assert recorded["args"] == ["fetch", "--locked"]
+    assert Path(recorded["home"]) == Path(ci_env["REPORT_DIR"]) / "cargo"
+    settings = tomllib.loads(recorded["config"])
+    assert settings["registries"]["crates-io"]["protocol"] == "sparse"
+    assert "source" not in settings
+    assert config.read_text() == original
+
+
+def test_cargo_fetch_failure_stops_before_native_build(ci_env):
+    result = run(
+        "build_ci.sh",
+        {**ci_env, "OV_SKIP_UV_SYNC": "1", "CARGO_FETCH_EXIT": "101"},
+    )
+    assert result.returncode == 101, result.stdout + result.stderr
+    assert "退出码 101" in result.stdout
+    assert "编译验证通过" not in result.stdout
 
 
 @pytest.mark.parametrize("jobs", ["0", "-1", "auto"])

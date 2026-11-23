@@ -31,8 +31,8 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langchain.agents.middleware import TodoListMiddleware
-from langchain.agents.middleware.types import AgentMiddleware
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
@@ -124,6 +124,7 @@ from examples.deepagents_ov_context.chat.tool_call_recovery import (
     InvalidToolCallError,
     ToolCallRecoveryMiddleware,
 )
+from openviking.core.identifiers import validate_account_id
 from openviking.integrations.langchain.middleware import (
     OpenVikingCommitPolicy,
     OpenVikingContextMiddleware,
@@ -139,6 +140,7 @@ from openviking.integrations.langchain.ov_context.errors import ContextReadError
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig, OVContextReader
 from openviking.integrations.langchain.ov_context.retry import retry_call
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter, WriterConfig
+from openviking_cli._exception_utils import invalid_argument_error
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.client.identity import OVIdentity, valid_identity_field
 from openviking_cli.exceptions import AlreadyExistsError, NotFoundError, OpenVikingError
@@ -227,6 +229,9 @@ class ChatSettings:
         if not self.ov_api_key and key_file.is_file():
             object.__setattr__(self, "ov_api_key", key_file.read_text().strip())
         valid_identity_field(self.account_id)
+        error = validate_account_id(self.account_id)
+        if error:
+            raise ValueError(error)
         loaded = (*self.environments, *load_environments(self.environments_file))
         if any(item.id == "daily" for item in loaded) or len({e.id for e in loaded}) != len(loaded):
             raise ValueError("Environment IDs must be unique; daily is reserved")
@@ -553,6 +558,10 @@ class ChatRuntime:
                 raise HTTPException(409, "请先发送消息，空会话没有可提取内容") from None
             if meta.get("message_count") == 0:
                 return MemoryExtractionStatus(status="idle")
+            # Invalidate durably before an external commit can change OV's view.
+            # The next Run must discover its archive even when automatic commits
+            # are disabled and a write receipt would otherwise skip the probe.
+            await self.invalidate_context_cache(session, sdk)
             # Mark before I/O: a lost receipt cannot safely be retried automatically.
             session.memory_commit_unknown = True
             self.store.save(session)
@@ -577,6 +586,21 @@ class ChatRuntime:
             )
         finally:
             await sdk.close()
+
+    async def invalidate_context_cache(self, session: SessionInfo, sdk: AsyncHTTPClient) -> None:
+        graph, middleware = self.session_graph(session, sdk, ActiveRun())
+        try:
+            values = (await graph.aget_state(session.graph_config)).values
+            context = values.get("ov_context")
+            if context and middleware is not None:
+                await graph.aupdate_state(
+                    session.graph_config,
+                    {"ov_context": {**context, "context_status": "reload_required"}},
+                    as_node=f"{middleware.name}.after_agent",
+                )
+        finally:
+            if middleware is not None:
+                await middleware.aclose()
 
     def snapshot(self, session: SessionInfo) -> SessionConfigSnapshot:
         environment = self.environment(session.environment_id)
@@ -668,6 +692,7 @@ class ChatRuntime:
         browser: AgentBrowser | None = None,
         skill_run: OfficeSkillRun | None = None,
         session: SessionInfo | None = None,
+        input_message: HumanMessage | None = None,
     ) -> tuple[DemoAgent, OpenVikingContextMiddleware | None]:
         snapshot = session.config_snapshot if session else None
         if session is not None and snapshot is None:
@@ -828,28 +853,53 @@ class ChatRuntime:
                 observer=metric,
             ),
         ]
+        system_prompt = (
+            current_browser_prompt(
+                snapshot.execution["system_prompt"], legacy=browser.legacy_file_aliases
+            )
+            if snapshot and browser is not None
+            else snapshot.execution["system_prompt"]
+            if snapshot
+            else build_chat_system_prompt(
+                tool_names={item.name for item in tools}
+                | {
+                    item.name
+                    for component in graph_middleware
+                    for item in getattr(component, "tools", ())
+                },
+                custom_prompt=profile.system_prompt,
+                skill_names=skill_run.skill_names if skill_run else (),
+            )
+        ) + ("\n\n" + skill_run.instructions if skill_run else "")
+        if input_message is not None and middleware is not None:
+            available_tools = {
+                item.name: item
+                for item in [
+                    *tools,
+                    *(
+                        item
+                        for component in graph_middleware
+                        for item in getattr(component, "tools", ())
+                    ),
+                ]
+            }
+            admission = ModelRequest(
+                model=model,
+                system_message=SystemMessage(content=system_prompt),
+                messages=[input_message],
+                tools=list(available_tools.values()),
+            )
+            try:
+                middleware._ov_session_engine.assembler.check_user_input(admission)
+            except ContextBudgetExceeded as exc:
+                # No graph invocation or OV request has started. Keep its previous
+                # checkpoint intact and allow a corrected input on the same Session.
+                exc.ov_state_consistent = True
+                raise
         graph = create_deep_agent(
             model=model,
             tools=tools,
-            system_prompt=(
-                current_browser_prompt(
-                    snapshot.execution["system_prompt"], legacy=browser.legacy_file_aliases
-                )
-                if snapshot and browser is not None
-                else snapshot.execution["system_prompt"]
-                if snapshot
-                else build_chat_system_prompt(
-                    tool_names={item.name for item in tools}
-                    | {
-                        item.name
-                        for component in graph_middleware
-                        for item in getattr(component, "tools", ())
-                    },
-                    custom_prompt=profile.system_prompt,
-                    skill_names=skill_run.skill_names if skill_run else (),
-                )
-            )
-            + ("\n\n" + skill_run.instructions if skill_run else ""),
+            system_prompt=system_prompt,
             skills=["/skills/"] if skill_run else None,
             backend=skill_run.backend if skill_run else None,
             middleware=graph_middleware,
@@ -866,8 +916,16 @@ class ChatRuntime:
         *,
         browser: AgentBrowser | None = None,
         skill_run: OfficeSkillRun | None = None,
+        input_message: HumanMessage | None = None,
     ) -> tuple[DemoAgent, OpenVikingContextMiddleware | None]:
-        return self.graph(sdk, run, session=session, browser=browser, skill_run=skill_run)
+        return self.graph(
+            sdk,
+            run,
+            session=session,
+            browser=browser,
+            skill_run=skill_run,
+            input_message=input_message,
+        )
 
     async def state(self, session: SessionInfo) -> dict[str, Any]:
         sdk = self.sdk(session)
@@ -963,8 +1021,14 @@ class ChatRuntime:
                 if skill_sources
                 else None
             )
+            input_message = HumanMessage(id="u-" + uuid.uuid4().hex, content=prompt)
             graph, middleware = self.session_graph(
-                session, sdk, run, browser=browser, skill_run=skill_run
+                session,
+                sdk,
+                run,
+                browser=browser,
+                skill_run=skill_run,
+                input_message=input_message,
             )
             if session.execution.uses_ov:
                 await sdk.initialize()
@@ -990,7 +1054,7 @@ class ChatRuntime:
             # AnyIO level cancellation can cancel that cleanup task as well.
             async with asyncio.timeout(session.execution.timeout_seconds):
                 async for item in graph.astream(
-                    {"messages": [HumanMessage(id="u-" + uuid.uuid4().hex, content=prompt)]},
+                    {"messages": [input_message]},
                     config=config,
                     context=RequestContext(identity),
                     stream_mode=["messages", "updates"],
@@ -1177,6 +1241,8 @@ class ChatRuntime:
                 if isinstance(exc, InvalidToolCallError)
                 else "交付文件校验或发布失败，会话已保存。可继续对话重新生成文件。"
                 if artifact_error
+                else "请求参数无效，任务未完成。请检查身份和接口配置，并从 OV 恢复或新建会话后重试。"
+                if invalid_argument_error(exc)
                 else "上下文预算不足，本轮已结束。可在当前会话发起新请求，或新建会话调整预算。"
                 if consistent and isinstance(exc, ContextBudgetExceeded)
                 else "执行失败，已保留确认的写入进度。请检查服务后在当前会话发起新请求。"

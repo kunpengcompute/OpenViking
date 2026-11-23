@@ -74,6 +74,116 @@ def test_configure_uses_data_mount_and_stable_service_key(mounted, capsys):
     assert "fixture-only-private" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "api_base,overrides,expected",
+    [
+        ("https://ark.cn-beijing.volces.com/api/v3", {}, {"thinking": {"type": "disabled"}}),
+        ("https://gateway.example/v1", {}, {}),
+        ("https://gateway.example/v1", {"ov_extra_request_body": None}, {}),
+        ("https://ark.cn-beijing.volces.com/api/v3", {"ov_extra_request_body": {}}, {}),
+        (
+            "https://gateway.example/v1",
+            {"ov_extra_request_body": {"thinking": {"type": "disabled"}}},
+            {"thinking": {"type": "disabled"}},
+        ),
+        (
+            "https://ark.cn-beijing.volces.com/api/v3",
+            {"ov_extra_request_body": {"thinking": {"type": "enabled"}}},
+            {"thinking": {"type": "enabled"}},
+        ),
+        (
+            "https://gateway.example/v1",
+            {"ov_extra_request_body": {"enable_thinking": False, "vendor": {"mode": "custom"}}},
+            {"enable_thinking": False, "vendor": {"mode": "custom"}},
+        ),
+    ],
+)
+def test_configure_preserves_explicit_ov_request_body(mounted, api_base, overrides, expected):
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+
+    runtime.initialize()
+    model = mounted / "config/models.local.json"
+    settings = json.loads(model.read_text())
+    settings.update(api_key="fixture-only-private", api_base=api_base, **overrides)
+    model.write_text(json.dumps(settings))
+
+    runtime.configure()
+    path = mounted / "config/ov/ov.conf"
+    generated = json.loads(path.read_text())
+    assert generated["vlm"]["extra_request_body"] == expected
+    assert OpenVikingConfig.from_dict(generated).vlm.extra_request_body == expected
+    runtime.configure()
+    assert json.loads(path.read_text())["vlm"]["extra_request_body"] == expected
+
+
+@pytest.mark.parametrize("body", ["disabled", [], 1024, False])
+def test_configure_rejects_nonobject_ov_request_body(mounted, body):
+    runtime.initialize()
+    model = mounted / "config/models.local.json"
+    settings = json.loads(model.read_text())
+    settings.update(api_key="fixture-only-private", ov_extra_request_body=body)
+    model.write_text(json.dumps(settings))
+
+    with pytest.raises(ValueError, match="ov_extra_request_body must be a JSON object or null"):
+        runtime.configure()
+    assert not (mounted / "config/ov/ov.conf").exists()
+
+
+@pytest.mark.parametrize("body", [None, {}, {"thinking": {"type": "disabled"}}])
+async def test_gateway_ov_request_contains_configured_thinking(mounted, monkeypatch, body):
+    import httpx
+    import openai
+
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+
+    runtime.initialize()
+    model = mounted / "config/models.local.json"
+    settings = json.loads(model.read_text())
+    settings.update(
+        api_key="fixture-only-private",
+        api_base="https://gateway.volceapi.com/v1",
+        ov_extra_request_body=body,
+    )
+    model.write_text(json.dumps(settings))
+    runtime.configure()
+    generated = json.loads((mounted / "config/ov/ov.conf").read_text())
+    vlm = OpenVikingConfig.from_dict(generated).vlm.get_vlm_instance()
+    requests = []
+
+    def respond(request):
+        assert request.url.path == "/v1/chat/completions"
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "completion-fixture",
+                "object": "chat.completion",
+                "created": 0,
+                "model": settings["chat_model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "summary"},
+                    }
+                ],
+            },
+        )
+
+    async with openai.AsyncOpenAI(
+        api_key="fixture-only-private",
+        base_url=settings["api_base"],
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    ) as sdk:
+        monkeypatch.setattr(vlm, "get_async_client", lambda: sdk)
+        assert await vlm.get_completion_async("Summarize the session") == "summary"
+    assert len(requests) == 1
+    if body:
+        assert requests[0]["thinking"] == {"type": "disabled"}
+    else:
+        assert "thinking" not in requests[0]
+
+
 def test_credential_from_readonly_mount_does_not_override_explicit_key(mounted, monkeypatch):
     folder = mounted / "config/ov"
     folder.mkdir(parents=True)
