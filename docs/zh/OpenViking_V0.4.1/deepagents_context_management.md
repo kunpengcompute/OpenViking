@@ -77,7 +77,7 @@ X-OpenViking-Actor-Peer     actor_peer_id
 `OVContext` 是 Session 级上下文状态对象。Middleware 从图状态恢复它，`SessionEngine` 将写入、读取及归档结果应用到它，`ContextAssembler` 使用其中的消息构建模型输入。主要状态分为三组：
 
 - **会话缓存**：`messages` 保存模型消息，`archive_id` 标识该缓存已应用的归档边界，`owner` 记录身份与 Session 绑定。
-- **写入和提交进度**：`write_index` 记录原始图消息的已同步位置；`pending_commit` 记录已知提交任务；`commit_count` 记录已观察到的远端提交计数；`completed_runs` 和 `last_completed_run` 支持轮数策略及完成计数去重。
+- **写入和提交进度**：`write_index` 记录原始图消息的已同步位置；`pending_commit` 记录已知提交任务；`commit_count` 记录已观察到的远端提交计数；`completed_runs` 和 `last_completed_run` 支持轮数策略及完成计数去重；`last_activity` 记录最近一次成功消息同步的时间。
 - **Run 临时状态**：`run_id`、`original_user`、`recall_done` 和 `recall_status` 记录当前任务、用户原文及召回尝试结果。
 
 `context_status` 表达缓存可用性：`uninitialized` 表示尚待首次读取，`ready` 表示已获得可用视图，`reload_required` 表示后续需要补读远端上下文。

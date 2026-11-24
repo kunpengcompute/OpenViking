@@ -586,10 +586,10 @@ index 9af0893c743ea664236d893a380f0c6dd657036d..6883ca9d6cc1780a72b59d10e48332df
  
  
 diff --git a/openviking/integrations/langchain/middleware.py b/openviking/integrations/langchain/middleware.py
-index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105ca5e6ef85 100644
+index d3038b70b8fea42ebdd9032e50c196f26cf7225a..1b2c2dd74dd7e6b9ea39ba3c41f605fc139dd825 100644
 --- a/openviking/integrations/langchain/middleware.py
 +++ b/openviking/integrations/langchain/middleware.py
-@@ -4,27 +4,33 @@
+@@ -4,27 +4,35 @@
  
  from __future__ import annotations
  
@@ -599,6 +599,8 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
 -from typing import Any, Callable
 +from dataclasses import replace
 +from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, cast
++
++from openviking_cli._exception_utils import invalid_argument_error
  
  try:
      from langchain.agents.middleware import AgentMiddleware
@@ -626,7 +628,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
      OpenVikingConnection,
      apply_commit_policy,
      call_openviking,
-@@ -37,10 +43,42 @@ from openviking.integrations.langchain.context import (
+@@ -37,10 +45,42 @@ from openviking.integrations.langchain.context import (
      OpenVikingSessionContextAssembler,
  )
  from openviking.integrations.langchain.history import langchain_message_to_openviking
@@ -669,7 +671,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
  _SESSION_ID_ERROR = (
      "OpenVikingContextMiddleware requires a LangGraph session id. Pass "
      'config={"configurable": {"thread_id": "..."}}, set state["session_id"], '
-@@ -48,14 +86,15 @@ _SESSION_ID_ERROR = (
+@@ -48,14 +88,15 @@ _SESSION_ID_ERROR = (
  )
  
  
@@ -690,7 +692,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
      def __init__(
          self,
          *,
-@@ -63,6 +102,9 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -63,6 +104,9 @@ class OpenVikingContextMiddleware(AgentMiddleware):
          retriever: OpenVikingRetriever | None = None,
          url: str | None = None,
          api_key: str | None = None,
@@ -700,7 +702,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
          account: str | None = None,
          user: str | None = None,
          user_id: str | None = None,
-@@ -73,20 +115,48 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -73,20 +117,48 @@ class OpenVikingContextMiddleware(AgentMiddleware):
          peer_id: str | None = None,
          score_threshold: float | None = None,
          token_budget: int = 128_000,
@@ -752,7 +754,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
              account=account,
              user=user,
              user_id=user_id,
-@@ -126,16 +196,467 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -126,16 +198,472 @@ class OpenVikingContextMiddleware(AgentMiddleware):
              include_recall=True,
              recall_header=recall_header,
          )
@@ -1031,7 +1033,11 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
 +        except ContextBudgetExceeded:
 +            raise
 +        except Exception as exc:
-+            if isinstance(exc, IdentityMismatchError) or auth_error(exc):
++            if (
++                isinstance(exc, IdentityMismatchError)
++                or auth_error(exc)
++                or invalid_argument_error(exc)
++            ):
 +                raise
 +            raise ContextBudgetExceeded(
 +                f"Capacity compression failed ({type(exc).__name__})"
@@ -1059,6 +1065,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
 +                isinstance(exc, (IdentityMismatchError, ContextBudgetExceeded))
 +                or isinstance(exc, ContextHistoryBudgetError)
 +                or auth_error(exc)
++                or invalid_argument_error(exc)
 +                or engine.config.context_failure == "raise"
 +            ):
 +                raise
@@ -1222,7 +1229,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
  
      def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], Any]) -> Any:
          query = get_latest_user_text(request.messages)
-@@ -173,7 +694,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -173,7 +701,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
              self._pending_context_parts.pop(pending_key, None)
              raise
  
@@ -1231,7 +1238,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
          if not self.capture_on_after_agent:
              return None
          messages = list(state.get("messages") or [])
-@@ -221,7 +742,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -221,7 +749,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
              apply_commit_policy(client, session_id, self.commit_policy)
          return None
  
@@ -1240,7 +1247,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
          if self.session_id_resolver:
              resolved = _normalize_session_id(self.session_id_resolver(state, runtime))
              if resolved:
-@@ -233,6 +754,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -233,6 +761,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
              _nested_get(getattr(runtime, "context", None), "thread_id"),
              _nested_get(getattr(runtime, "config", None), "configurable", "thread_id"),
              _nested_get(getattr(runtime, "config", None), "configurable", "session_id"),
@@ -1248,7 +1255,7 @@ index d3038b70b8fea42ebdd9032e50c196f26cf7225a..eca74cd42ec777fd6dab83d15ef1105c
          ]
          for candidate in candidates:
              resolved = _normalize_session_id(candidate)
-@@ -240,7 +762,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
+@@ -240,7 +769,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
                  return resolved
          raise ValueError(_SESSION_ID_ERROR)
  
@@ -1400,10 +1407,10 @@ index 0000000000000000000000000000000000000000..f25065738270b8790acff0e366eb9e6e
 +]
 diff --git a/openviking/integrations/langchain/ov_context/assembler.py b/openviking/integrations/langchain/ov_context/assembler.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..5a89f0d44f9c1410bdd1dd797dac78742e00e995
+index 0000000000000000000000000000000000000000..71a9a78a78deeaeb17f36a5cd8d8d255dfb8cf6d
 --- /dev/null
 +++ b/openviking/integrations/langchain/ov_context/assembler.py
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,418 @@
 +# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 +# SPDX-License-Identifier: AGPL-3.0
 +"""Model request assembly and archive refresh planning."""
@@ -1598,6 +1605,15 @@ index 0000000000000000000000000000000000000000..5a89f0d44f9c1410bdd1dd797dac7874
 +        budget = self.budget(fixed)
 +        tokens = self._count(fixed)
 +        return HistoryBudget(budget, tokens, max(0, budget.base_context_limit - tokens))
++
++    def check_user_input(self, request: ModelRequest[Any]) -> int:
++        """Preflight the new input and known fixed content before saving messages.
++
++        The host supplies only the incoming messages, its system prompt and tools.
++        Framework additions and recalled content still require prepare()'s final
++        check; compressible session history belongs to that later stage.
++        """
++        return self.check_input_budget(self._system_request(request))
 +
 +    def assemble(self, request: ModelRequest[Any], context: OVContext) -> ModelRequest[Any]:
 +        return self.prepare(request, context).request
@@ -2575,7 +2591,7 @@ index 0000000000000000000000000000000000000000..bafdcb75576af77eac6d515fe374086d
 +        return rows
 diff --git a/openviking/integrations/langchain/ov_context/reader.py b/openviking/integrations/langchain/ov_context/reader.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd1f0c114a
+index 0000000000000000000000000000000000000000..16c4832143ebb2aa7f569a51a9bb9b595c9b8756
 --- /dev/null
 +++ b/openviking/integrations/langchain/ov_context/reader.py
 @@ -0,0 +1,660 @@
@@ -2607,7 +2623,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +    render_experience,
 +    should_recall_experience,
 +)
-+from openviking_cli._exception_utils import auth_error
++from openviking_cli._exception_utils import auth_error, invalid_argument_error
 +from openviking_cli.client.identity import _identity_arguments
 +from openviking_cli.retrieve.context import (
 +    ContextSearchOptions,
@@ -2949,7 +2965,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +        except asyncio.TimeoutError:
 +            return RecallResult(status="timeout")
 +        except Exception as exc:
-+            if auth_error(exc):
++            if auth_error(exc) or invalid_argument_error(exc):
 +                raise
 +            logger.debug("OV recall failed", exc_info=True)
 +            return RecallResult(status="error")
@@ -3038,7 +3054,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +            if isinstance(outcome, asyncio.CancelledError):
 +                raise outcome
 +            if isinstance(outcome, Exception):
-+                if auth_error(outcome):
++                if auth_error(outcome) or invalid_argument_error(outcome):
 +                    raise outcome
 +                had_error = True
 +                continue
@@ -3070,7 +3086,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +                        item, experience=exp, **_identity_arguments(identity)
 +                    )
 +                except Exception as exc:
-+                    if auth_error(exc):
++                    if auth_error(exc) or invalid_argument_error(exc):
 +                        raise
 +                    had_error = True
 +                    continue
@@ -3122,7 +3138,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +                **_identity_arguments(identity),
 +            )
 +        except Exception as exc:
-+            if auth_error(exc):
++            if auth_error(exc) or invalid_argument_error(exc):
 +                raise
 +            return exc
 +
@@ -3137,7 +3153,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +                content = await self.client.read(item.uri, **_identity_arguments(identity))
 +                return content.strip() or fallback
 +            except Exception as exc:
-+                if auth_error(exc):
++                if auth_error(exc) or invalid_argument_error(exc):
 +                    raise
 +                logger.debug("OV memory body read failed; using available summary", exc_info=True)
 +                if not fallback:
@@ -3173,7 +3189,7 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +        except ContextReadError:
 +            raise
 +        except Exception as exc:
-+            if auth_error(exc):
++            if auth_error(exc) or invalid_argument_error(exc):
 +                raise
 +            if getattr(exc, "code", None) == "RESOURCE_EXHAUSTED":
 +                raise ContextHistoryBudgetError(
@@ -3241,10 +3257,10 @@ index 0000000000000000000000000000000000000000..189c3e0820d800d9d6a8168a62997bbd
 +]
 diff --git a/openviking/integrations/langchain/ov_context/recall_assembly.py b/openviking/integrations/langchain/ov_context/recall_assembly.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..885f5dc18ebf6e00104b57dd4d8624111b413361
+index 0000000000000000000000000000000000000000..5ae50a781715c6075e3711de6e7bc57ea7061967
 --- /dev/null
 +++ b/openviking/integrations/langchain/ov_context/recall_assembly.py
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,690 @@
 +# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 +# SPDX-License-Identifier: AGPL-3.0
 +
@@ -3263,7 +3279,7 @@ index 0000000000000000000000000000000000000000..885f5dc18ebf6e00104b57dd4d862411
 +from openviking.core.namespace import canonical_user_root, canonicalize_uri, classify_uri
 +from openviking.core.retrieval_targets import default_target_directories, resolve_retrieval_targets
 +from openviking.utils.token_estimation import text_token_weight
-+from openviking_cli._exception_utils import auth_error
++from openviking_cli._exception_utils import auth_error, invalid_argument_error
 +from openviking_cli.client.identity import OVIdentity, _identity_arguments
 +from openviking_cli.exceptions import InvalidArgumentError
 +from openviking_cli.retrieve.context import (
@@ -3633,7 +3649,11 @@ index 0000000000000000000000000000000000000000..885f5dc18ebf6e00104b57dd4d862411
 +                stats["searches"] += 1
 +                result = await transport.find(search_arguments(task))
 +        except Exception as exc:
-+            if auth_error(exc) or isinstance(exc, (InvalidArgumentError, ValueError)):
++            if (
++                auth_error(exc)
++                or invalid_argument_error(exc)
++                or isinstance(exc, (InvalidArgumentError, ValueError))
++            ):
 +                raise
 +            stats["retrieval_errors"].append(type(exc).__name__)
 +            return []
@@ -3735,7 +3755,7 @@ index 0000000000000000000000000000000000000000..885f5dc18ebf6e00104b57dd4d862411
 +                raw = await transport.read(uri)
 +            return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw or "")
 +        except Exception as exc:
-+            if auth_error(exc):
++            if auth_error(exc) or invalid_argument_error(exc):
 +                raise
 +            stats["read_errors"].append(type(exc).__name__)
 +            return ""
@@ -5433,10 +5453,10 @@ index 0000000000000000000000000000000000000000..8fe5582af4d39547164bb5f314923fc0
 +        self.ready = False
 diff --git a/openviking/integrations/langchain/ov_context/session_engine.py b/openviking/integrations/langchain/ov_context/session_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..06d6317923c5c405a76b05c52c4fd5c264316bb4
+index 0000000000000000000000000000000000000000..c413ac9cdbd1afdf40778ccaf4bf1ac2bf7a7dff
 --- /dev/null
 +++ b/openviking/integrations/langchain/ov_context/session_engine.py
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1035 @@
 +# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 +# SPDX-License-Identifier: AGPL-3.0
 +"""Session operations shared by middleware hooks and tool-result readers."""
@@ -5458,6 +5478,7 @@ index 0000000000000000000000000000000000000000..06d6317923c5c405a76b05c52c4fd5c2
 +from langchain_core.messages import BaseMessage, ToolMessage
 +
 +from openviking.integrations.langchain.client import OpenVikingConnection
++from openviking_cli._exception_utils import invalid_argument_error
 +
 +from .assembler import ContextAssembler, ContextRefreshPlan, is_summary, validate_tool_pairs
 +from .budget import TokenCounter
@@ -5842,6 +5863,7 @@ index 0000000000000000000000000000000000000000..06d6317923c5c405a76b05c52c4fd5c2
 +            if (
 +                isinstance(exc, (IdentityMismatchError, ContextHistoryBudgetError))
 +                or auth_error(exc)
++                or invalid_argument_error(exc)
 +                or not initial
 +                or self.config.context_failure == "raise"
 +            ):
@@ -6048,7 +6070,11 @@ index 0000000000000000000000000000000000000000..06d6317923c5c405a76b05c52c4fd5c2
 +            except ContextBudgetExceeded:
 +                raise
 +            except Exception as exc:
-+                if isinstance(exc, IdentityMismatchError) or auth_error(exc):
++                if (
++                    isinstance(exc, IdentityMismatchError)
++                    or auth_error(exc)
++                    or invalid_argument_error(exc)
++                ):
 +                    raise
 +                if context.session_key in self._refresh_progress or finished:
 +                    raise ContextBudgetExceeded(
@@ -12899,13 +12925,34 @@ index d1d2465eb03f658d29e607a1289c3827dc3a9f36..805c86af8dfe997fcf7ff725daab93ef
  def estimate_serialized_tokens(value: Any) -> int:
 diff --git a/openviking_cli/_exception_utils.py b/openviking_cli/_exception_utils.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..84771691fa230c03de6840e4970b0b08352ce02f
+index 0000000000000000000000000000000000000000..9c51d06f92ff924ff4743e07d49ad85891b98c45
 --- /dev/null
 +++ b/openviking_cli/_exception_utils.py
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,37 @@
 +# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 +# SPDX-License-Identifier: AGPL-3.0
 +"""Shared exception classification for SDK clients and integrations."""
++
++from openviking_cli.exceptions import InvalidArgumentError
++
++
++def invalid_argument_error(exc: BaseException) -> bool:
++    """Recognize invalid requests, including an explicitly wrapped SDK failure."""
++    seen: set[int] = set()
++    current: BaseException | None = exc
++    while current is not None and id(current) not in seen:
++        seen.add(id(current))
++        status = getattr(current, "status_code", None)
++        if status is None:
++            status = getattr(getattr(current, "response", None), "status_code", None)
++        if (
++            isinstance(current, InvalidArgumentError)
++            or getattr(current, "code", None) in ("INVALID_ARGUMENT", "INVALID_URI")
++            or status in (400, 422)
++        ):
++            return True
++        current = current.__cause__
++    return False
 +
 +
 +def auth_error(exc: BaseException) -> bool:

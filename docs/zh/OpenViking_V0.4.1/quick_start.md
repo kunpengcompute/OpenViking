@@ -1,6 +1,6 @@
 # DeepAgents Quick Start
 
-通过 Python 直接调用 DeepAgents，完成消息写入、同 Session 的 checkpoint 恢复，以及新 Session 的记忆召回。运行环境和 OV 服务按[部署指南](deployment_guide.md)准备。特性说明见《[OpenViking 接入 DeepAgents 实现上下文管理](deepagents_context_management.md)》。
+通过 Python 直接调用 DeepAgents，完成消息写入、同 Session 的 checkpoint 恢复，以及新 Session 的记忆召回。运行环境和 OV 服务按[部署指南](deployment_guide.md)准备。特性说明见[OpenViking 接入 DeepAgents 实现上下文管理](deepagents_context_management.md)。
 
 ## 1. 准备应用配置
 
