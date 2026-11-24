@@ -29,6 +29,11 @@
 
 新增 OpenViking 接入 DeepAgents 的上下文管理能力，支持消息增量写入、工具结果压缩与回读、输入预算、提交归档、记忆召回及 checkpoint 恢复。具体请参见《[OpenViking 接入 DeepAgents 实现上下文管理](./deepagents_context_management.md)》。
 
+### 验收问题跟踪
+
+- [Issue #11](https://gitcode.com/boostkit/OpenViking/issues/11) — 真实网关在输出上限为 32 和 64 token 时均返回 `finish_reason=length`，OV 两次均报告 `VLMOutputLimitError`。输出上限为 8192 token 的对照请求返回 `stop`。
+- [Issue #12](https://gitcode.com/boostkit/OpenViking/issues/12) — [开发 PR #28](https://gitcode.com/boostkit/OpenViking/pull/28) 修复了 Chat 在手动记忆归档恢复完成前发起模型调用的问题。在归档任务处于 `pending` 和 `running` 时分别中断 OV 进程，正常 Chat Session 恢复后，首次模型请求均包含原归档摘要。该修复位于开发仓的 Chat 集成，公共补丁交付范围见[补丁说明](../../../patches/OpenViking_V0.4.1/README.md)。
+
 ### 遗留问题
 
 无。
