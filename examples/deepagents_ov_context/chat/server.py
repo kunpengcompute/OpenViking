@@ -137,9 +137,8 @@ from openviking.integrations.langchain.ov_context import (
 )
 from openviking.integrations.langchain.ov_context.commit import CommitConfig
 from openviking.integrations.langchain.ov_context.errors import ContextReadError
-from openviking.integrations.langchain.ov_context.retry import retryable_read
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig, OVContextReader
-from openviking.integrations.langchain.ov_context.retry import retry_call
+from openviking.integrations.langchain.ov_context.retry import retry_call, retryable_read
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter, WriterConfig
 from openviking_cli._exception_utils import invalid_argument_error
 from openviking_cli.client.http import AsyncHTTPClient
@@ -502,7 +501,8 @@ class ChatRuntime:
         assert session.memory_task_id is not None
         task = await self.ov_read(lambda: sdk.get_task(session.memory_task_id, identity=identity))
         if task is not None and (
-            task.get("resource_id") != session.session_id or task.get("task_type") != "session_commit"
+            task.get("resource_id") != session.session_id
+            or task.get("task_type") != "session_commit"
         ):
             raise HTTPException(502, "记忆提取任务与当前会话不匹配")
         return task
@@ -537,7 +537,7 @@ class ChatRuntime:
                                 if latest:
                                     # A newer archive can already be visible in this Session.
                                     await self.ov_read(
-                                        lambda: sdk.get_session_archive(
+                                        lambda target=target: sdk.get_session_archive(
                                             session.session_id, target, identity=identity
                                         )
                                     )
@@ -569,7 +569,9 @@ class ChatRuntime:
         sdk = self.sdk(session)
         try:
             await sdk.initialize()
-            task = await self.memory_task(sdk, session, session.identity("memory-status").sdk_identity)
+            task = await self.memory_task(
+                sdk, session, session.identity("memory-status").sdk_identity
+            )
             if task is None:
                 return MemoryExtractionStatus(status="unknown", task_id=session.memory_task_id)
             result = task.get("result") or {}
