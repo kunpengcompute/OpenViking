@@ -137,6 +137,7 @@ from openviking.integrations.langchain.ov_context import (
 )
 from openviking.integrations.langchain.ov_context.commit import CommitConfig
 from openviking.integrations.langchain.ov_context.errors import ContextReadError
+from openviking.integrations.langchain.ov_context.retry import retryable_read
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig, OVContextReader
 from openviking.integrations.langchain.ov_context.retry import retry_call
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter, WriterConfig
@@ -193,6 +194,11 @@ async def ensure_extraction_disabled_session(
 
 class ModelOutputLimitError(RuntimeError):
     """The provider stopped generating before a complete answer or tool call."""
+
+
+class ManualMemoryCommitError(RuntimeError):
+    # The guard runs before the graph writes or sends the next user turn.
+    ov_state_consistent = True
 
 
 class ArtifactPublishError(RuntimeError):
@@ -490,6 +496,66 @@ class ChatRuntime:
             if sdk is not None:
                 await sdk.close()
 
+    async def memory_task(
+        self, sdk: AsyncHTTPClient, session: SessionInfo, identity: OVIdentity
+    ) -> dict[str, Any] | None:
+        assert session.memory_task_id is not None
+        task = await self.ov_read(lambda: sdk.get_task(session.memory_task_id, identity=identity))
+        if task is not None and (
+            task.get("resource_id") != session.session_id or task.get("task_type") != "session_commit"
+        ):
+            raise HTTPException(502, "记忆提取任务与当前会话不匹配")
+        return task
+
+    async def wait_for_memory_archive(
+        self, sdk: AsyncHTTPClient, session: SessionInfo, identity: OVIdentity
+    ) -> None:
+        assert session.config_snapshot is not None
+        config = session.config_snapshot.context_config
+        timeout = min(config.commit_wait_timeout, session.execution.timeout_seconds or math.inf)
+        delay = config.poll_interval
+        try:
+            async with asyncio.timeout(timeout):
+                await sdk.initialize()
+                while True:
+                    try:
+                        # Reading the Session drives OV recovery after a stale lease expires.
+                        meta = await self.ov_read(
+                            lambda: sdk.get_session(session.session_id, identity=identity)
+                        )
+                        task = await self.memory_task(sdk, session, identity)
+                        if task is not None:
+                            status = task.get("status")
+                            if status == "completed":
+                                uri = (task.get("result") or {}).get("archive_uri")
+                                if not isinstance(uri, str) or not uri.rsplit("/", 1)[-1]:
+                                    raise ManualMemoryCommitError("记忆提取任务缺少归档标识。")
+                                target = uri.rsplit("/", 1)[-1]
+                                latest = meta.get("latest_finished_archive_id")
+                                if latest == target:
+                                    return
+                                if latest:
+                                    # A newer archive can already be visible in this Session.
+                                    await self.ov_read(
+                                        lambda: sdk.get_session_archive(
+                                            session.session_id, target, identity=identity
+                                        )
+                                    )
+                                    return
+                            elif status not in {"pending", "running"}:
+                                raise ManualMemoryCommitError("记忆提取任务未成功完成。")
+                    except Exception as exc:
+                        if not isinstance(exc, NotFoundError) and not retryable_read(exc):
+                            raise
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max(config.poll_interval, config.poll_max_interval))
+        except TimeoutError:
+            raise ManualMemoryCommitError("等待记忆提取归档就绪超时，可在当前会话重试。") from None
+        except ManualMemoryCommitError:
+            raise
+        except Exception:
+            raise ManualMemoryCommitError("无法确认当前会话的记忆提取归档。") from None
+
     async def memory_status(self, session: SessionInfo) -> MemoryExtractionStatus:
         self.store.require_identity(session.identity("memory_status"))
         if self.settings.ov_policy.fail_open and (await self.state(session)).get("ov_failure"):
@@ -503,19 +569,9 @@ class ChatRuntime:
         sdk = self.sdk(session)
         try:
             await sdk.initialize()
-            task = await self.ov_read(
-                lambda: sdk.get_task(
-                    session.memory_task_id,
-                    identity=session.identity("memory-status").sdk_identity,
-                )
-            )
+            task = await self.memory_task(sdk, session, session.identity("memory-status").sdk_identity)
             if task is None:
                 return MemoryExtractionStatus(status="unknown", task_id=session.memory_task_id)
-            if (
-                task.get("resource_id") != session.session_id
-                or task.get("task_type") != "session_commit"
-            ):
-                raise HTTPException(502, "记忆提取任务与当前会话不匹配")
             result = task.get("result") or {}
             return MemoryExtractionStatus(
                 status=task["status"],
@@ -573,6 +629,7 @@ class ChatRuntime:
                 self.store.save(session)
                 raise
             session.memory_task_id = task_id
+            session.memory_archive_applied = False
             session.memory_commit_unknown = False
             self.store.save(session)
             return MemoryExtractionStatus(
@@ -732,16 +789,20 @@ class ChatRuntime:
             scope_policy=policy if profile.target_uris is None else None,
         )
         reader.observer = metric
+        require_memory_archive = (
+            input_message is not None and session is not None and session.requires_memory_archive
+        )
+        fail_open = policy.fail_open and not require_memory_archive
         optional_middleware: dict[str, Any] = (
             {
                 "io_timeout": policy.io_timeout,
                 "recall_retry_attempts": profile.memory_recall_retry_attempts,
             }
-            if policy.fail_open
+            if fail_open
             else {}
         )
         middleware: OpenVikingContextMiddleware | None = (
-            (ResilientOVMiddleware if policy.fail_open else OpenVikingContextMiddleware)(
+            (ResilientOVMiddleware if fail_open else OpenVikingContextMiddleware)(
                 client=sdk,
                 message_writer=OVMessageWriter(sdk, snapshot.writer_config if snapshot else None),
                 context_reader=reader,
@@ -754,7 +815,11 @@ class ChatRuntime:
                 commit_policy=OpenVikingCommitPolicy(mode="never")
                 if profile.mode != "current"
                 else None,
-                context_config=snapshot.context_config
+                context_config=(
+                    replace(snapshot.context_config, context_failure="raise")
+                    if require_memory_archive
+                    else snapshot.context_config
+                )
                 if snapshot
                 else OVContextConfig(
                     context_window=context_window,
@@ -998,6 +1063,15 @@ class ChatRuntime:
                 if session.execution.mode == "current"
                 else None,
             )
+            require_memory_archive = session.requires_memory_archive
+            run_timeout = session.execution.timeout_seconds
+            if require_memory_archive:
+                wait_started = time.monotonic()
+                await self.wait_for_memory_archive(sdk, session, identity.sdk_identity)
+                # Older checkpoints may already have refreshed before the archive was ready.
+                await self.invalidate_context_cache(session, sdk)
+                if run_timeout is not None:
+                    run_timeout = max(0.0, run_timeout - (time.monotonic() - wait_started))
             skill_sources = {
                 name: self.settings.skill_sources[name] for name in snapshot.execution["skills"]
             }
@@ -1024,7 +1098,8 @@ class ChatRuntime:
                 input_message=input_message,
             )
             if session.execution.uses_ov:
-                await sdk.initialize()
+                if not require_memory_archive:
+                    await sdk.initialize()
                 if session.execution.mode != "current" or not session.execution.memory_extraction:
 
                     async def prepare_session():
@@ -1045,7 +1120,7 @@ class ChatRuntime:
             }
             # LangGraph awaits a separate task to cancel and join its workers.
             # AnyIO level cancellation can cancel that cleanup task as well.
-            async with asyncio.timeout(session.execution.timeout_seconds):
+            async with asyncio.timeout(run_timeout):
                 async for item in graph.astream(
                     {"messages": [input_message]},
                     config=config,
@@ -1159,6 +1234,8 @@ class ChatRuntime:
                     skill_run.publish()
                 except Exception as exc:
                     raise ArtifactPublishError("Generated files could not be published") from exc
+            if require_memory_archive:
+                session.memory_archive_applied = True
             session.needs_restore = False
             statistics.status = "done"
             statistics.seconds = round(time.monotonic() - started, 3)
@@ -1226,6 +1303,8 @@ class ChatRuntime:
                 else type(exc).__name__,
                 message="已停止。继续前请从 OV 恢复或新建会话。"
                 if cancelled
+                else str(exc)
+                if isinstance(exc, ManualMemoryCommitError)
                 else "等待模型响应超时：流式首包或后续片段长时间未到达，或非流式响应未完成。本轮任务未完成。"
                 if isinstance(exc, ModelCallTimeoutError)
                 else "模型输出达到上限，回答未完成。请调整输出预算后从 OV 恢复或新建会话。"

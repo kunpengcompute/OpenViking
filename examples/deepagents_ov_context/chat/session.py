@@ -67,11 +67,20 @@ class SessionInfo(BaseModel):
     needs_restore: bool = False
     last_run: RunStatistics | None = None
     memory_task_id: str | None = None
+    memory_archive_applied: bool = False
     memory_commit_unknown: bool = False
     environment_id: str = Field(default="daily", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     experiment_id: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_.-]{1,100}$")
     execution: ExecutionProfile = Field(default_factory=ExecutionProfile)
     config_snapshot: SessionConfigSnapshot | None = None
+
+    @property
+    def requires_memory_archive(self) -> bool:
+        return (
+            self.execution.native_context
+            and self.memory_task_id is not None
+            and not self.memory_archive_applied
+        )
 
     def identity(self, run_id: str) -> RunIdentity:
         return RunIdentity(self.account_id, self.user_id, self.agent_id, self.session_id, run_id)

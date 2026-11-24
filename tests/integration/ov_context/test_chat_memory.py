@@ -74,10 +74,11 @@ async def test_manual_extraction_refreshes_next_run_without_replaying_archived_m
     sid = await new_session(client)
     server.recalled = []
     archived = False
-    finished = not extraction_pending
+    waiting = False
+    task_polls = 0
 
     async def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal archived
+        nonlocal archived, task_polls
         response = await server.handle(request)
         if response.status_code == 404:
             return httpx.Response(
@@ -92,20 +93,25 @@ async def test_manual_extraction_refreshes_next_run_without_replaying_archived_m
         if path.endswith("/commit"):
             archived = True
             server.session_messages[sid] = []
-            server.overview = "Archived preference: keep the weekly report concise."
-            server.archive_id = "archive_001"
             value["archive_uri"] = "viking://test/history/archive_001"
         elif path.endswith("/tasks/t1"):
+            if waiting:
+                task_polls += 1
+            finished = not extraction_pending or task_polls >= 2
             value.update(task(sid, "completed" if finished else "running"))
         elif path.endswith("/context"):
-            value["latest_finished_archive_id"] = "archive_001" if archived else None
+            value["latest_finished_archive_id"] = server.archive_id
         elif path.endswith("/messages/batch"):
             value["pending_tokens"] = 10
         elif path.endswith("/" + sid):
+            if archived and (not extraction_pending or task_polls >= 2):
+                server.overview = "Archived preference: keep the weekly report concise."
+                server.archive_id = "archive_001"
             value.update(
                 message_count=len(server.session_messages.get(sid, [])),
                 commit_count=int(archived),
                 auto_commit_policy=None,
+                latest_finished_archive_id=server.archive_id,
             )
         return httpx.Response(200, json=body)
 
@@ -127,8 +133,7 @@ async def test_manual_extraction_refreshes_next_run_without_replaying_archived_m
     assert invalidated["write_index"] == 2
     if extraction_pending:
         assert (await client.get(f"/api/sessions/{sid}/memory")).json()["status"] == "running"
-        finished = True
-    assert (await client.get(f"/api/sessions/{sid}/memory")).json()["status"] == "completed"
+    waiting = True
 
     async def follow_up(client: httpx.AsyncClient):
         response = await client.post(
@@ -150,6 +155,8 @@ async def test_manual_extraction_refreshes_next_run_without_replaying_archived_m
     else:
         events = await follow_up(client)
     assert events[-1][0] == "done"
+    if extraction_pending:
+        assert task_polls >= 2
     model_input = next(data["messages"] for name, data in events if name == "model_input")
     assert not any(message.get("id") == original_id for message in model_input)
     assert any(
@@ -158,6 +165,36 @@ async def test_manual_extraction_refreshes_next_run_without_replaying_archived_m
     context = events[-1][1]["context"]
     assert context["archive_id"] == "archive_001"
     assert context["write_index"] == context["raw_message_count"] == 4
+
+
+@pytest.mark.parametrize("status", ["failed", "running", "completed"])
+async def test_manual_archive_failure_or_timeout_prevents_model_input(chat, status):
+    client, rt = chat
+    sid = await new_session(client, execution={"timeout_seconds": 0.05})
+    session = rt.store.get(sid)
+    session.memory_task_id = "task-1"
+    rt.store.save(session)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        if request.url.path.endswith("/tasks/task-1"):
+            value = task(sid, status)
+        else:
+            assert request.url.path.endswith("/sessions/" + sid)
+            value = {"latest_finished_archive_id": None}
+        return httpx.Response(200, json={"result": value})
+
+    await rt.ov_http.aclose()
+    rt.ov_http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    response = await client.post("/api/chat", json={"session_id": sid, "message": "Continue."})
+    events = parse_events(response.text)
+    assert not any(name == "model_input" for name, _ in events)
+    name, error = events[-1]
+    assert name == "error" and error["error_type"] == "ManualMemoryCommitError"
+    assert error["can_continue"] is True
+    assert ("未成功完成" if status == "failed" else "超时") in error["message"]
+    assert not rt.store.get(sid).needs_restore
+    assert not rt.store.get(sid).memory_archive_applied
 
 
 @pytest.mark.parametrize("status", ["running", "pending", "missing"])
