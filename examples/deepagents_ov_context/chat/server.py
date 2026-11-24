@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import json
 import logging
 import math
 import shutil
@@ -31,8 +30,8 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langchain.agents.middleware import TodoListMiddleware
-from langchain.agents.middleware.types import AgentMiddleware
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
@@ -59,6 +58,7 @@ from examples.deepagents_ov_context.chat.config import (
     load_commit_defaults,
     load_context_config,
     load_model_call_timeout,
+    load_model_thinking,
     load_ov_policy,
     load_reader_config,
     load_service_api_key,
@@ -124,6 +124,7 @@ from examples.deepagents_ov_context.chat.tool_call_recovery import (
     InvalidToolCallError,
     ToolCallRecoveryMiddleware,
 )
+from openviking.core.identifiers import validate_account_id
 from openviking.integrations.langchain.middleware import (
     OpenVikingCommitPolicy,
     OpenVikingContextMiddleware,
@@ -137,8 +138,9 @@ from openviking.integrations.langchain.ov_context import (
 from openviking.integrations.langchain.ov_context.commit import CommitConfig
 from openviking.integrations.langchain.ov_context.errors import ContextReadError
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig, OVContextReader
-from openviking.integrations.langchain.ov_context.retry import retry_call
+from openviking.integrations.langchain.ov_context.retry import retry_call, retryable_read
 from openviking.integrations.langchain.ov_context.writer import OVMessageWriter, WriterConfig
+from openviking_cli._exception_utils import invalid_argument_error
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.client.identity import OVIdentity, valid_identity_field
 from openviking_cli.exceptions import AlreadyExistsError, NotFoundError, OpenVikingError
@@ -193,6 +195,11 @@ class ModelOutputLimitError(RuntimeError):
     """The provider stopped generating before a complete answer or tool call."""
 
 
+class ManualMemoryCommitError(RuntimeError):
+    # The guard runs before the graph writes or sends the next user turn.
+    ov_state_consistent = True
+
+
 class ArtifactPublishError(RuntimeError):
     """Generated files failed publication after the graph saved its state."""
 
@@ -208,7 +215,7 @@ class ChatSettings:
     browser_executable: Path | None = None
     browser_proxy: str | None = None
     recursion_limit: int = 24
-    thinking: bool = False
+    thinking: bool = field(default_factory=load_model_thinking)
     enable_todos: bool = field(default_factory=load_todo_enabled)
     pptx_skill: Path | None = None
     skill_node_modules: Path | None = None
@@ -227,6 +234,9 @@ class ChatSettings:
         if not self.ov_api_key and key_file.is_file():
             object.__setattr__(self, "ov_api_key", key_file.read_text().strip())
         valid_identity_field(self.account_id)
+        error = validate_account_id(self.account_id)
+        if error:
+            raise ValueError(error)
         loaded = (*self.environments, *load_environments(self.environments_file))
         if any(item.id == "daily" for item in loaded) or len({e.id for e in loaded}) != len(loaded):
             raise ValueError("Environment IDs must be unique; daily is reserved")
@@ -301,7 +311,6 @@ class ChatRuntime:
         self.saver = checkpointer
         self.active: dict[str, ActiveRun] = {}
         self.restoring: set[str] = set()
-        self.benchmark_jobs: dict[tuple[str, str], asyncio.Task] = {}
         self.ov_http = httpx.AsyncClient(
             timeout=self.settings.ov_policy.wait_budget, trust_env=False
         )
@@ -330,13 +339,9 @@ class ChatRuntime:
             max_retries=0,
             async_call_timeout_seconds=settings.model_call_timeout_seconds,
             model_kwargs={"parallel_tool_calls": False} if settings.agent_browser else {},
-            extra_body=(
-                {
-                    "thinking": {"type": "enabled" if settings.thinking else "disabled"},
-                }
-                if "volces.com" in model.api_base
-                else None
-            ),
+            extra_body={
+                "thinking": {"type": "enabled" if settings.thinking else "disabled"},
+            },
         )
 
     def environment(self, environment_id: str = "daily") -> ChatEnvironment:
@@ -376,6 +381,7 @@ class ChatRuntime:
             commit_config=load_commit_defaults(environment.env_file),
             ov_policy=load_ov_policy(environment.env_file),
             enable_todos=load_todo_enabled(environment.env_file),
+            thinking=load_model_thinking(environment.env_file),
             model_call_timeout_seconds=load_model_call_timeout(environment.env_file),
         )
 
@@ -489,6 +495,67 @@ class ChatRuntime:
             if sdk is not None:
                 await sdk.close()
 
+    async def memory_task(
+        self, sdk: AsyncHTTPClient, session: SessionInfo, identity: OVIdentity
+    ) -> dict[str, Any] | None:
+        assert session.memory_task_id is not None
+        task = await self.ov_read(lambda: sdk.get_task(session.memory_task_id, identity=identity))
+        if task is not None and (
+            task.get("resource_id") != session.session_id
+            or task.get("task_type") != "session_commit"
+        ):
+            raise HTTPException(502, "记忆提取任务与当前会话不匹配")
+        return task
+
+    async def wait_for_memory_archive(
+        self, sdk: AsyncHTTPClient, session: SessionInfo, identity: OVIdentity
+    ) -> None:
+        assert session.config_snapshot is not None
+        config = session.config_snapshot.context_config
+        timeout = min(config.commit_wait_timeout, session.execution.timeout_seconds or math.inf)
+        delay = config.poll_interval
+        try:
+            async with asyncio.timeout(timeout):
+                await sdk.initialize()
+                while True:
+                    try:
+                        # Reading the Session drives OV recovery after a stale lease expires.
+                        meta = await self.ov_read(
+                            lambda: sdk.get_session(session.session_id, identity=identity)
+                        )
+                        task = await self.memory_task(sdk, session, identity)
+                        if task is not None:
+                            status = task.get("status")
+                            if status == "completed":
+                                uri = (task.get("result") or {}).get("archive_uri")
+                                if not isinstance(uri, str) or not uri.rsplit("/", 1)[-1]:
+                                    raise ManualMemoryCommitError("记忆提取任务缺少归档标识。")
+                                target = uri.rsplit("/", 1)[-1]
+                                latest = meta.get("latest_finished_archive_id")
+                                if latest == target:
+                                    return
+                                if latest:
+                                    # A newer archive can already be visible in this Session.
+                                    await self.ov_read(
+                                        lambda target=target: sdk.get_session_archive(
+                                            session.session_id, target, identity=identity
+                                        )
+                                    )
+                                    return
+                            elif status not in {"pending", "running"}:
+                                raise ManualMemoryCommitError("记忆提取任务未成功完成。")
+                    except Exception as exc:
+                        if not isinstance(exc, NotFoundError) and not retryable_read(exc):
+                            raise
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max(config.poll_interval, config.poll_max_interval))
+        except TimeoutError:
+            raise ManualMemoryCommitError("等待记忆提取归档就绪超时，可在当前会话重试。") from None
+        except ManualMemoryCommitError:
+            raise
+        except Exception:
+            raise ManualMemoryCommitError("无法确认当前会话的记忆提取归档。") from None
+
     async def memory_status(self, session: SessionInfo) -> MemoryExtractionStatus:
         self.store.require_identity(session.identity("memory_status"))
         if self.settings.ov_policy.fail_open and (await self.state(session)).get("ov_failure"):
@@ -502,19 +569,11 @@ class ChatRuntime:
         sdk = self.sdk(session)
         try:
             await sdk.initialize()
-            task = await self.ov_read(
-                lambda: sdk.get_task(
-                    session.memory_task_id,
-                    identity=session.identity("memory-status").sdk_identity,
-                )
+            task = await self.memory_task(
+                sdk, session, session.identity("memory-status").sdk_identity
             )
             if task is None:
                 return MemoryExtractionStatus(status="unknown", task_id=session.memory_task_id)
-            if (
-                task.get("resource_id") != session.session_id
-                or task.get("task_type") != "session_commit"
-            ):
-                raise HTTPException(502, "记忆提取任务与当前会话不匹配")
             result = task.get("result") or {}
             return MemoryExtractionStatus(
                 status=task["status"],
@@ -553,6 +612,10 @@ class ChatRuntime:
                 raise HTTPException(409, "请先发送消息，空会话没有可提取内容") from None
             if meta.get("message_count") == 0:
                 return MemoryExtractionStatus(status="idle")
+            # Invalidate durably before an external commit can change OV's view.
+            # The next Run must discover its archive even when automatic commits
+            # are disabled and a write receipt would otherwise skip the probe.
+            await self.invalidate_context_cache(session, sdk)
             # Mark before I/O: a lost receipt cannot safely be retried automatically.
             session.memory_commit_unknown = True
             self.store.save(session)
@@ -568,6 +631,7 @@ class ChatRuntime:
                 self.store.save(session)
                 raise
             session.memory_task_id = task_id
+            session.memory_archive_applied = False
             session.memory_commit_unknown = False
             self.store.save(session)
             return MemoryExtractionStatus(
@@ -577,6 +641,21 @@ class ChatRuntime:
             )
         finally:
             await sdk.close()
+
+    async def invalidate_context_cache(self, session: SessionInfo, sdk: AsyncHTTPClient) -> None:
+        graph, middleware = self.session_graph(session, sdk, ActiveRun())
+        try:
+            values = (await graph.aget_state(session.graph_config)).values
+            context = values.get("ov_context")
+            if context and middleware is not None:
+                await graph.aupdate_state(
+                    session.graph_config,
+                    {"ov_context": {**context, "context_status": "reload_required"}},
+                    as_node=f"{middleware.name}.after_agent",
+                )
+        finally:
+            if middleware is not None:
+                await middleware.aclose()
 
     def snapshot(self, session: SessionInfo) -> SessionConfigSnapshot:
         environment = self.environment(session.environment_id)
@@ -668,6 +747,7 @@ class ChatRuntime:
         browser: AgentBrowser | None = None,
         skill_run: OfficeSkillRun | None = None,
         session: SessionInfo | None = None,
+        input_message: HumanMessage | None = None,
     ) -> tuple[DemoAgent, OpenVikingContextMiddleware | None]:
         snapshot = session.config_snapshot if session else None
         if session is not None and snapshot is None:
@@ -711,16 +791,20 @@ class ChatRuntime:
             scope_policy=policy if profile.target_uris is None else None,
         )
         reader.observer = metric
+        require_memory_archive = (
+            input_message is not None and session is not None and session.requires_memory_archive
+        )
+        fail_open = policy.fail_open and not require_memory_archive
         optional_middleware: dict[str, Any] = (
             {
                 "io_timeout": policy.io_timeout,
                 "recall_retry_attempts": profile.memory_recall_retry_attempts,
             }
-            if policy.fail_open
+            if fail_open
             else {}
         )
         middleware: OpenVikingContextMiddleware | None = (
-            (ResilientOVMiddleware if policy.fail_open else OpenVikingContextMiddleware)(
+            (ResilientOVMiddleware if fail_open else OpenVikingContextMiddleware)(
                 client=sdk,
                 message_writer=OVMessageWriter(sdk, snapshot.writer_config if snapshot else None),
                 context_reader=reader,
@@ -733,7 +817,11 @@ class ChatRuntime:
                 commit_policy=OpenVikingCommitPolicy(mode="never")
                 if profile.mode != "current"
                 else None,
-                context_config=snapshot.context_config
+                context_config=(
+                    replace(snapshot.context_config, context_failure="raise")
+                    if require_memory_archive
+                    else snapshot.context_config
+                )
                 if snapshot
                 else OVContextConfig(
                     context_window=context_window,
@@ -761,14 +849,11 @@ class ChatRuntime:
             or profile.thinking is not None
         ):
             extra = dict(model.extra_body or {})
-            if "volces.com" in self.model_config.api_base:
-                extra["thinking"] = {
-                    "type": "enabled"
-                    if (
-                        profile.thinking if profile.thinking is not None else self.settings.thinking
-                    )
-                    else "disabled"
-                }
+            extra["thinking"] = {
+                "type": "enabled"
+                if (profile.thinking if profile.thinking is not None else self.settings.thinking)
+                else "disabled"
+            }
             model = model.model_copy(update={"max_tokens": max_tokens, "extra_body": extra})
         office_skills = (
             snapshot.execution["office_skills"] if snapshot else self.settings.office_skills
@@ -828,28 +913,53 @@ class ChatRuntime:
                 observer=metric,
             ),
         ]
+        system_prompt = (
+            current_browser_prompt(
+                snapshot.execution["system_prompt"], legacy=browser.legacy_file_aliases
+            )
+            if snapshot and browser is not None
+            else snapshot.execution["system_prompt"]
+            if snapshot
+            else build_chat_system_prompt(
+                tool_names={item.name for item in tools}
+                | {
+                    item.name
+                    for component in graph_middleware
+                    for item in getattr(component, "tools", ())
+                },
+                custom_prompt=profile.system_prompt,
+                skill_names=skill_run.skill_names if skill_run else (),
+            )
+        ) + ("\n\n" + skill_run.instructions if skill_run else "")
+        if input_message is not None and middleware is not None:
+            available_tools = {
+                item.name: item
+                for item in [
+                    *tools,
+                    *(
+                        item
+                        for component in graph_middleware
+                        for item in getattr(component, "tools", ())
+                    ),
+                ]
+            }
+            admission = ModelRequest(
+                model=model,
+                system_message=SystemMessage(content=system_prompt),
+                messages=[input_message],
+                tools=list(available_tools.values()),
+            )
+            try:
+                middleware._ov_session_engine.assembler.check_user_input(admission)
+            except ContextBudgetExceeded as exc:
+                # No graph invocation or OV request has started. Keep its previous
+                # checkpoint intact and allow a corrected input on the same Session.
+                exc.ov_state_consistent = True
+                raise
         graph = create_deep_agent(
             model=model,
             tools=tools,
-            system_prompt=(
-                current_browser_prompt(
-                    snapshot.execution["system_prompt"], legacy=browser.legacy_file_aliases
-                )
-                if snapshot and browser is not None
-                else snapshot.execution["system_prompt"]
-                if snapshot
-                else build_chat_system_prompt(
-                    tool_names={item.name for item in tools}
-                    | {
-                        item.name
-                        for component in graph_middleware
-                        for item in getattr(component, "tools", ())
-                    },
-                    custom_prompt=profile.system_prompt,
-                    skill_names=skill_run.skill_names if skill_run else (),
-                )
-            )
-            + ("\n\n" + skill_run.instructions if skill_run else ""),
+            system_prompt=system_prompt,
             skills=["/skills/"] if skill_run else None,
             backend=skill_run.backend if skill_run else None,
             middleware=graph_middleware,
@@ -866,8 +976,16 @@ class ChatRuntime:
         *,
         browser: AgentBrowser | None = None,
         skill_run: OfficeSkillRun | None = None,
+        input_message: HumanMessage | None = None,
     ) -> tuple[DemoAgent, OpenVikingContextMiddleware | None]:
-        return self.graph(sdk, run, session=session, browser=browser, skill_run=skill_run)
+        return self.graph(
+            sdk,
+            run,
+            session=session,
+            browser=browser,
+            skill_run=skill_run,
+            input_message=input_message,
+        )
 
     async def state(self, session: SessionInfo) -> dict[str, Any]:
         sdk = self.sdk(session)
@@ -947,6 +1065,15 @@ class ChatRuntime:
                 if session.execution.mode == "current"
                 else None,
             )
+            require_memory_archive = session.requires_memory_archive
+            run_timeout = session.execution.timeout_seconds
+            if require_memory_archive:
+                wait_started = time.monotonic()
+                await self.wait_for_memory_archive(sdk, session, identity.sdk_identity)
+                # Older checkpoints may already have refreshed before the archive was ready.
+                await self.invalidate_context_cache(session, sdk)
+                if run_timeout is not None:
+                    run_timeout = max(0.0, run_timeout - (time.monotonic() - wait_started))
             skill_sources = {
                 name: self.settings.skill_sources[name] for name in snapshot.execution["skills"]
             }
@@ -963,11 +1090,18 @@ class ChatRuntime:
                 if skill_sources
                 else None
             )
+            input_message = HumanMessage(id="u-" + uuid.uuid4().hex, content=prompt)
             graph, middleware = self.session_graph(
-                session, sdk, run, browser=browser, skill_run=skill_run
+                session,
+                sdk,
+                run,
+                browser=browser,
+                skill_run=skill_run,
+                input_message=input_message,
             )
             if session.execution.uses_ov:
-                await sdk.initialize()
+                if not require_memory_archive:
+                    await sdk.initialize()
                 if session.execution.mode != "current" or not session.execution.memory_extraction:
 
                     async def prepare_session():
@@ -988,9 +1122,9 @@ class ChatRuntime:
             }
             # LangGraph awaits a separate task to cancel and join its workers.
             # AnyIO level cancellation can cancel that cleanup task as well.
-            async with asyncio.timeout(session.execution.timeout_seconds):
+            async with asyncio.timeout(run_timeout):
                 async for item in graph.astream(
-                    {"messages": [HumanMessage(id="u-" + uuid.uuid4().hex, content=prompt)]},
+                    {"messages": [input_message]},
                     config=config,
                     context=RequestContext(identity),
                     stream_mode=["messages", "updates"],
@@ -1102,6 +1236,8 @@ class ChatRuntime:
                     skill_run.publish()
                 except Exception as exc:
                     raise ArtifactPublishError("Generated files could not be published") from exc
+            if require_memory_archive:
+                session.memory_archive_applied = True
             session.needs_restore = False
             statistics.status = "done"
             statistics.seconds = round(time.monotonic() - started, 3)
@@ -1169,6 +1305,8 @@ class ChatRuntime:
                 else type(exc).__name__,
                 message="已停止。继续前请从 OV 恢复或新建会话。"
                 if cancelled
+                else str(exc)
+                if isinstance(exc, ManualMemoryCommitError)
                 else "等待模型响应超时：流式首包或后续片段长时间未到达，或非流式响应未完成。本轮任务未完成。"
                 if isinstance(exc, ModelCallTimeoutError)
                 else "模型输出达到上限，回答未完成。请调整输出预算后从 OV 恢复或新建会话。"
@@ -1177,6 +1315,8 @@ class ChatRuntime:
                 if isinstance(exc, InvalidToolCallError)
                 else "交付文件校验或发布失败，会话已保存。可继续对话重新生成文件。"
                 if artifact_error
+                else "请求参数无效，任务未完成。请检查身份和接口配置，并从 OV 恢复或新建会话后重试。"
+                if invalid_argument_error(exc)
                 else "上下文预算不足，本轮已结束。可在当前会话发起新请求，或新建会话调整预算。"
                 if consistent and isinstance(exc, ContextBudgetExceeded)
                 else "执行失败，已保留确认的写入进度。请检查服务后在当前会话发起新请求。"
@@ -1222,9 +1362,6 @@ class ChatRuntime:
 
     async def close(self) -> None:
         tasks = []
-        for task in self.benchmark_jobs.values():
-            task.cancel()
-            tasks.append(task)
         for run in self.active.values():
             run.cancel_requested = True
             if run.task is not None:
@@ -1325,7 +1462,7 @@ def create_app(settings: ChatSettings) -> FastAPI:
         defaults = runtime().environment_defaults(environment)
         return {
             "modes": ["current", "baseline", "context_only", "ordinary", "experience"],
-            "automatic_benchmark": True,
+            "benchmark_evidence": True,
             "environment_id": environment.id,
             "account_id": environment.account_id,
             "model": runtime().model_config.chat_model,
@@ -1465,41 +1602,19 @@ def create_app(settings: ChatSettings) -> FastAPI:
         rt.store.get(session_id)
         return rt.store.history.get(session_id, run_id)
 
-    @app.post("/api/sessions/{session_id}/runs/{run_id}/benchmark")
-    async def benchmark_grade(session_id: str, run_id: str) -> dict[str, Any]:
-        from benchmark.office.suites.common.automatic import evaluate_audit
-        from benchmark.office.suites.common.document_judge import DocumentJudge
+    @app.get("/api/sessions/{session_id}/runs/{run_id}/benchmark/evidence")
+    async def benchmark_evidence(session_id: str, run_id: str) -> dict[str, Any]:
+        from benchmark.office.suites.common.evidence import export_evidence
 
         rt = runtime()
         rt.store.get(session_id)
         trace = rt.store.history.get(session_id, run_id)
         if trace.statistics.status == "running" or session_id in rt.active:
-            raise HTTPException(409, "Benchmark grading requires a terminal Run")
+            raise HTTPException(409, "Benchmark evidence requires a terminal Run")
         folder = rt.settings.data_dir / "benchmark" / session_id / run_id
         if not (folder / "manifest.json").is_file():
-            raise HTTPException(404, "This Run has no automatic benchmark snapshots")
-        if (folder / "grade.json").is_file():
-            return json.loads((folder / "grade.json").read_text())
-
-        async def grade():
-            manifest = json.loads((folder / "manifest.json").read_text())
-            judge = (
-                DocumentJudge(rt.settings.model_config)
-                if manifest["case"] == "reqdoc_generation"
-                else None
-            )
-            try:
-                return await evaluate_audit(folder, trace.statistics.model_dump(), judge=judge)
-            finally:
-                if judge is not None:
-                    await judge.close()
-
-        key = (session_id, run_id)
-        if key not in rt.benchmark_jobs:
-            task = asyncio.create_task(grade())
-            rt.benchmark_jobs[key] = task
-            task.add_done_callback(lambda finished: rt.benchmark_jobs.pop(key, None))
-        return await asyncio.shield(rt.benchmark_jobs[key])
+            raise HTTPException(404, "This Run has no benchmark snapshots")
+        return await asyncio.to_thread(export_evidence, folder, trace.statistics.model_dump())
 
     @app.get("/api/sessions/{session_id}/state")
     async def graph_state(session_id: str) -> dict[str, Any]:
@@ -1703,7 +1818,12 @@ def main() -> None:
         type=int,
         help="Override OV_CONTEXT__RETRY_ATTEMPTS for transient OV failures; 0 disables retries",
     )
-    parser.add_argument("--thinking", action="store_true", help="Enable Ark model thinking")
+    parser.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override CHAT_MODEL__THINKING for the Agent model",
+    )
     parser.add_argument("--pptx-skill", type=Path, help="Installed Anthropic pptx Skill directory")
     parser.add_argument(
         "--office-skills", action="store_true", help="Enable bundled office and data Skills"
@@ -1725,7 +1845,7 @@ def main() -> None:
         browser_executable=args.browser_executable,
         browser_proxy=args.browser_proxy,
         recursion_limit=args.recursion_limit,
-        thinking=args.thinking,
+        thinking=args.thinking if args.thinking is not None else load_model_thinking(args.env_file),
         enable_todos=load_todo_enabled(args.env_file),
         model_call_timeout_seconds=load_model_call_timeout(args.env_file),
         pptx_skill=args.pptx_skill,

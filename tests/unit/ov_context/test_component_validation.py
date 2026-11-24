@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from tests.st.ov_context import components
 from tests.st.ov_context.components import (
     Suite,
     Tenant,
@@ -123,6 +125,115 @@ def test_projection_detects_call_arguments_and_message_order() -> None:
     changed = AIMessage(content="", tool_calls=[{"id": "c", "name": "read", "args": {"limit": 11}}])
     assert signature([human, ai]) != signature([human, changed])
     assert signature([human, ai]) != signature([ai, human])
+
+
+def source_read_projection():
+    ref = "viking://user/alice/sessions/s/tool-results/original"
+    args = {"ref": ref, "offset": 10, "limit": 200}
+    payload = {
+        "tool_result_id": "original",
+        "content": "order_id=O-42; amount=137",
+        "offset": 10,
+        "limit": 200,
+        "offset_unit": "unicode_code_point",
+        "total_chars": 38069,
+        "has_more": True,
+    }
+    local = [
+        HumanMessage(content="核对金额"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "read",
+                    "name": "openviking_tool_result_read",
+                    "args": args,
+                }
+            ],
+        ),
+        ToolMessage(
+            tool_call_id="read", name="openviking_tool_result_read", content=json.dumps(payload)
+        ),
+    ]
+    preview = "[OpenViking tool result externalized]\nref: " + ref
+    remote = [*local[:2], local[2].model_copy(update={"content": preview})]
+    part = {
+        "type": "tool",
+        "tool_id": "read",
+        "tool_name": "openviking_tool_result_read",
+        "tool_status": "completed",
+        "tool_input": args,
+        "tool_output": preview,
+        "tool_output_ref": ref,
+        "tool_output_source_ref": ref,
+        "tool_output_source_offset": 10,
+        "tool_output_source_limit": 200,
+        "tool_output_externalized_reason": "source_read",
+    }
+    sdk = SimpleNamespace(
+        get_session_context=AsyncMock(return_value={"messages": [{"parts": [part]}]}),
+        read_tool_result=AsyncMock(return_value=deepcopy(payload)),
+    )
+    return local, remote, sdk, part
+
+
+async def test_persisted_projection_accepts_verified_source_read_without_mutating_cache():
+    local, remote, sdk, _ = source_read_projection()
+    before = deepcopy(local)
+    assert signature(local) != signature(remote)
+    checked = await components.validate_persisted_projection(
+        local, remote, sdk=sdk, session_id="s", identity=TENANT.identity("r").sdk_identity
+    )
+    assert checked == 1
+    assert local == before
+    sdk.read_tool_result.assert_awaited_once_with(
+        "s", "original", offset=10, limit=200, identity=TENANT.identity("r").sdk_identity
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "ref",
+        "offset",
+        "limit",
+        "reason",
+        "arguments",
+        "fragment",
+        "preview",
+        "name",
+        "call-id",
+        "status",
+        "order",
+        "ordinary-content",
+        "missing",
+    ],
+)
+async def test_persisted_projection_still_rejects_broken_contract(tamper):
+    local, remote, sdk, part = source_read_projection()
+    if tamper in {"ref", "offset", "limit"}:
+        part["tool_output_source_" + tamper] = "wrong" if tamper == "ref" else 11
+    elif tamper == "reason":
+        part["tool_output_externalized_reason"] = "single_threshold"
+    elif tamper == "arguments":
+        part["tool_input"] = {**part["tool_input"], "limit": 201}
+    elif tamper == "fragment":
+        sdk.read_tool_result.return_value["content"] = "wrong amount"
+    elif tamper == "preview":
+        remote[-1] = remote[-1].model_copy(update={"content": "unrelated view"})
+    elif tamper in {"name", "call-id", "status"}:
+        key = "tool_call_id" if tamper == "call-id" else tamper
+        remote[-1] = remote[-1].model_copy(update={key: "error" if key == "status" else "other"})
+    elif tamper == "order":
+        remote[:2] = reversed(remote[:2])
+    elif tamper == "ordinary-content":
+        remote[0] = HumanMessage(content="changed user request")
+    elif tamper == "missing":
+        remote.pop()
+    with pytest.raises(AssertionError):
+        await components.validate_persisted_projection(
+            local, remote, sdk=sdk, session_id="s", identity=TENANT.identity("r").sdk_identity
+        )
 
 
 @pytest.mark.parametrize(

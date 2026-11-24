@@ -10,7 +10,7 @@
 | PPT 更新 | `cases/ppt_update/spec.json`；`tasks/ppt_update/{H,Q}.md`；`datasets/ppt_update/` | `benchmark.office.suites.ppt_update.compare` |
 | 资料生成文档 | `cases/reqdoc_generation/spec.json`；`tasks/reqdoc_generation/{H,Q}.md`；`datasets/reqdoc_generation/` | `benchmark.office.suites.reqdoc_generation.run` |
 
-PPT 更新按六项任务、十二处修改检查，Q 完成时限为 250 秒。资料生成文档交付一份 `requirements.md`，按六个等权任务、45 个检查点评分，全文核对与交付作为收尾记录。具体版本标识、输入摘要、提示词摘要和验收条件由各自 `spec.json` 固定。
+五案例通过Chat采集实际模型输入、工具轨迹、业务状态快照和交付物，使用[evaluation/AI_REVIEW_PROMPT.md](evaluation/AI_REVIEW_PROMPT.md)进行AI证据复核。预算由[evaluation/policy.json](evaluation/policy.json)固定；PPT为120秒，资料生成文档为550秒、六章27项检查点。性能脚本汇总完整耗时和Token，质量结果来自逐项复核账本。
 
 ```text
 office/
@@ -18,8 +18,8 @@ office/
 ├── cases/       # 案例实现及公共页面服务
 │   ├── portal/             # 公共登录、导航、工作区初始化与存储连接
 │   ├── schedule/           # 日程
-│   ├── timesheet/          # 报工页面、数据初始化与结果检查
-│   ├── mail/               # 邮件正文导出检查
+│   ├── timesheet/          # 报工页面与数据初始化
+│   ├── mail/               # 邮件页面数据
 │   ├── ppt_update/         # PPT 更新
 │   └── reqdoc_generation/  # 资料生成文档
 ├── datasets/    # 五个案例的固化数据与评分参考
@@ -28,14 +28,12 @@ office/
 │   ├── mail/               # 邮件 H/Q 目标和背景邮件
 │   ├── ppt_update/         # 原始 PPT
 │   └── reqdoc_generation/  # 六份输入资料与评分参考
-├── suites/      # Chat 执行、证据收集和评分
+├── evaluation/  # AI复核提示词、验收预算与复核记录说明
+├── suites/      # Chat执行、原始证据收集和性能汇总
 │   ├── run.py              # 日程、报工、邮件的统一执行入口
 │   ├── common/             # SSE、证据保存、快照统计等公共能力
-│   ├── schedule/           # 六项日程及会议室预约验收
-│   ├── timesheet/          # 六项报工增量与历史记录保护验收
-│   ├── mail/               # 邮件正文导出：H 三封、Q 六封
-│   ├── ppt_update/         # PPT 对照执行与评分
-│   └── reqdoc_generation/  # 文档对照执行与评分
+│   ├── ppt_update/         # PPT对照执行与证据采集
+│   └── reqdoc_generation/  # 文档执行与证据采集
 ├── tasks/       # 每个案例的 H/Q 提示词
 └── tests/       # 页面、数据及准备脚本回归
 ```

@@ -18,15 +18,15 @@ from benchmark.office.cases.ppt_update.files import (
     load_case,
 )
 from benchmark.office.suites.common.chat import chat_events
+from benchmark.office.suites.common.execution import load_execution_profile
 from benchmark.office.suites.common.files_config import write_json
 from benchmark.office.suites.common.memory_inventory import memory_leaves
-from benchmark.office.suites.common.timing import scoring_policy
+from benchmark.office.suites.common.policy import acceptance_policy
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.client.identity import OVIdentity
 
 from .gates import CaseContract, FirstInputGate
 from .preparation import freeze_automatic_memory
-from .scoring import score
 
 
 async def fingerprint(sdk, identity):
@@ -41,6 +41,7 @@ async def fingerprint(sdk, identity):
 async def run(args):
     root = Path.cwd()
     spec, source = load_case(args.spec)
+    execution = load_execution_profile(root / spec["execution_profile"])
     phase = spec["phases"][args.phase]
     if args.phase == "H" and args.mode != "current":
         raise ValueError("H uses current mode for Middleware automatic extraction")
@@ -52,11 +53,14 @@ async def run(args):
     assert hashlib.sha256(prompt.encode()).hexdigest() == phase["prompt_sha256"]
     case_contract = CaseContract.from_case(spec)
     expected = None
+    preparation_review = None
     if args.expected_memory:
         saved_memory = json.loads(args.expected_memory.read_text())
-        case_contract.require_accepted(saved_memory)
+        preparation_review = case_contract.require_reviewed(saved_memory, args.preparation_review)
         expected = saved_memory["fingerprint"]
     args.output.mkdir(parents=True, exist_ok=False)
+    if preparation_review is not None:
+        write_json(args.output / "preparation-review.json", preparation_review)
     identity = OVIdentity(args.account, args.user, args.peer)
     sdk = None
     try:
@@ -76,15 +80,17 @@ async def run(args):
             if before != expected:
                 raise ValueError("Frozen memory differs before Q")
         async with httpx.AsyncClient(
-            base_url=args.chat_url, timeout=httpx.Timeout(1900, connect=20), trust_env=False
+            base_url=args.chat_url,
+            timeout=httpx.Timeout(execution["timeout_seconds"] + 100, connect=20),
+            trust_env=False,
         ) as client:
             response = await client.get(
                 "/api/execution-profiles", params={"environment_id": args.environment_id}
             )
             response.raise_for_status()
             meta = response.json()
-            if not meta.get("automatic_benchmark"):
-                raise ValueError("Chat must support automatic benchmark snapshots")
+            if not meta.get("benchmark_evidence"):
+                raise ValueError("Chat must support benchmark evidence capture")
             if meta["account_id"] != args.account or meta["ov_url"].rstrip(
                 "/"
             ) != args.ov_url.rstrip("/"):
@@ -100,7 +106,6 @@ async def run(args):
                 saved_condition = args.expected_memory.parent / "condition.json"
                 if json.loads(saved_condition.read_text())["metadata"] != meta:
                     raise ValueError("Chat model/Reader/Skill profile differs from H")
-            execution = json.loads((root / spec["execution_profile"]).read_text())
             execution.update(
                 mode=args.mode,
                 memory_extraction=args.phase == "H",
@@ -131,15 +136,18 @@ async def run(args):
             write_json(
                 args.output / "condition.json",
                 {
+                    "case": "ppt_update",
+                    "version": spec["version"],
                     "phase": args.phase,
                     "mode": args.mode,
                     "query": prompt,
+                    "execution_profile": spec["execution_profile"],
                     "execution": execution,
                     "metadata": meta,
                     "input_sha256": spec["input_sha256"],
                     "prompt_sha256": phase["prompt_sha256"],
                     "support_files": spec["support_files"],
-                    "scoring_policy": scoring_policy("ppt_update"),
+                    "acceptance_policy": acceptance_policy("ppt_update"),
                 },
             )
             inputs = [(source, source.name, spec["input_sha256"])] + [
@@ -217,14 +225,9 @@ async def run(args):
                 "real_memory_in_first_input": memory_in_first_input(trace) if sdk else False,
             }
             write_json(args.output / "result.json", result)
-            audit = args.chat_data / "ppt-audit" / sid / run_id
-            automatic = await client.post(f"/api/sessions/{sid}/runs/{run_id}/benchmark")
-            automatic.raise_for_status()
-            auto_grade = automatic.json()
-            write_json(args.output / "automatic-grade.json", auto_grade)
-            content_grade = score(spec, args.phase, args.output, audit, source)
-            content_grade.update(latency=auto_grade["latency"], automatic=auto_grade)
-            write_json(args.output / "grade.json", content_grade)
+            evidence = await client.get(f"/api/sessions/{sid}/runs/{run_id}/benchmark/evidence")
+            evidence.raise_for_status()
+            write_json(args.output / "evidence.json", evidence.json())
             print(
                 json.dumps(
                     {
@@ -238,9 +241,8 @@ async def run(args):
                 flush=True,
             )
         if args.phase == "H" and sdk:
-            grade = json.loads((args.output / "grade.json").read_text())
-            if not grade["task_pass"] or trace["statistics"]["status"] != "done":
-                raise ValueError("H acceptance failed; stop memory preparation")
+            if trace["statistics"]["status"] != "done":
+                raise ValueError("H execution failed; stop memory preparation")
             await freeze_automatic_memory(
                 sdk,
                 identity,
@@ -270,7 +272,6 @@ def main():
     parser.add_argument("--phase", choices=["H", "Q"], required=True)
     parser.add_argument("--mode", choices=["current", "ordinary", "baseline"], required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--chat-data", type=Path, required=True)
     parser.add_argument("--chat-url", required=True)
     parser.add_argument("--environment-id", default="daily")
     parser.add_argument("--ov-url", required=True)
@@ -279,6 +280,7 @@ def main():
     parser.add_argument("--user", required=True)
     parser.add_argument("--peer", required=True)
     parser.add_argument("--expected-memory", type=Path)
+    parser.add_argument("--preparation-review", type=Path, help="AI review of the completed H Run")
     asyncio.run(run(parser.parse_args()))
 
 

@@ -78,7 +78,8 @@ async def freeze_automatic_memory(
         {
             "fingerprint": pool,
             **evidence,
-            "artifact_acceptance": {
+            "preparation_run_id": trace["run_id"],
+            "memory_integrity": {
                 "passed": True,
                 "contract_sha256": contract.sha256,
             },

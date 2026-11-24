@@ -31,16 +31,10 @@ REQUIRED = (
     "cases/timesheet/ui.css",
     "cases/mail/data.py",
     "suites/run.py",
-    *(
-        f"suites/{case}/scoring.py"
-        for case in (
-            "schedule",
-            "timesheet",
-            "mail",
-            "ppt_update",
-            "reqdoc_generation",
-        )
-    ),
+    "suites/common/evidence.py",
+    "evaluation/AI_REVIEW_PROMPT.md",
+    "evaluation/collect.py",
+    "evaluation/policy.json",
     "cases/schedule/data.py",
     *(f"tasks/{case}/{phase}.md" for case in CASES for phase in ("H", "Q")),
     "datasets/schedule/data.py",

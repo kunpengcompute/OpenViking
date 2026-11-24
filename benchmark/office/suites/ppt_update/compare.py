@@ -1,4 +1,4 @@
-"""Prepare H once, then run balanced native/ordinary Q pairs through Chat."""
+"""Run balanced Q pairs after a separately reviewed H preparation."""
 
 from __future__ import annotations
 
@@ -9,19 +9,30 @@ import json
 from pathlib import Path
 
 from benchmark.office.suites.common.files_config import write_json
-from benchmark.office.suites.common.timing import scoring_policy
+from benchmark.office.suites.common.policy import acceptance_policy
 from benchmark.paths import OFFICE_ROOT
 
+from .gates import CaseContract
 from .run import run
 
 
 async def compare(args):
-    args.output.mkdir(parents=True, exist_ok=False)
     root = Path.cwd()
     spec = json.loads(args.spec.read_text())
+    preparation = args.preparation
+    frozen_memory = preparation / "frozen-memory.json"
+    saved_memory = json.loads(frozen_memory.read_text())
+    preparation_review = CaseContract.from_case(spec).require_reviewed(
+        saved_memory, args.preparation_review
+    )
+    args.output.mkdir(parents=True, exist_ok=False)
     files = [
         args.spec,
-        OFFICE_ROOT / "cases/scoring.json",
+        OFFICE_ROOT / "evaluation/policy.json",
+        OFFICE_ROOT / "evaluation/AI_REVIEW_PROMPT.md",
+        args.preparation_review,
+        frozen_memory,
+        preparation / "condition.json",
         root / spec["source"],
         root / spec["execution_profile"],
         root / spec["system_prompt"],
@@ -34,13 +45,14 @@ async def compare(args):
         {
             "files": frozen,
             "pairs": args.pairs,
+            "preparation_review": preparation_review,
             "latency_budget_seconds": spec["latency_budget_seconds"],
-            "scoring_policy": scoring_policy("ppt_update"),
+            "acceptance_policy": acceptance_policy("ppt_update"),
         },
     )
     rows = []
     write_json(args.output / "comparison.json", {"status": "running", "runs": rows})
-    phases = [("H", "current", args.output / "H")]
+    phases = []
     for pair in range(1, args.pairs + 1):
         order = ["baseline", "ordinary"] if pair % 2 else ["ordinary", "baseline"]
         for mode in order:
@@ -57,14 +69,12 @@ async def compare(args):
                 "phase": phase,
                 "mode": mode,
                 "output": folder,
-                "expected_memory": args.output / "H/frozen-memory.json"
-                if mode == "ordinary"
-                else None,
+                "preparation_review": args.preparation_review,
+                "expected_memory": frozen_memory if mode == "ordinary" else None,
             }
             await run(argparse.Namespace(**values))
-            grade = json.loads((folder / "grade.json").read_text())
             if phase == "Q":
-                origin = json.loads((args.output / "H/condition.json").read_text())["metadata"]
+                origin = json.loads((preparation / "condition.json").read_text())["metadata"]
                 current = json.loads((folder / "condition.json").read_text())["metadata"]
                 if current != origin:
                     raise RuntimeError("Chat model/Reader/Skill profile changed during comparison")
@@ -75,8 +85,8 @@ async def compare(args):
                     "mode": mode,
                     "output": str(folder),
                     "statistics": statistics,
-                    "task_pass": grade["task_pass"],
-                    "latency": grade["latency"],
+                    "review_status": "pending",
+                    "evidence": str(folder / "evidence.json"),
                 }
             )
             write_json(args.output / "comparison.json", {"status": "running", "runs": rows})
@@ -99,10 +109,11 @@ def main():
     parser.add_argument(
         "--spec", type=Path, default=Path("benchmark/office/cases/ppt_update/spec.json")
     )
+    parser.add_argument("--preparation", type=Path, required=True, help="Completed H directory")
+    parser.add_argument("--preparation-review", type=Path, required=True)
     parser.add_argument("--pairs", type=int, default=3, choices=range(1, 11))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chat-url", required=True)
-    parser.add_argument("--chat-data", type=Path, required=True)
     parser.add_argument("--environment-id", default="daily")
     parser.add_argument("--ov-url", required=True)
     parser.add_argument("--ov-key", type=Path, required=True)

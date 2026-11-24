@@ -8,7 +8,7 @@ ARG OPENVIKING_VERSION=0.4.1
 RUN dnf install -y gcc gcc-c++ make cmake pkgconf openssl-devel libffi-devel \
       zlib-devel bzip2-devel xz-devel git curl ca-certificates tar gzip xz unzip \
     && dnf clean all
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_LINK_MODE=copy \
     PATH=/opt/openviking/.venv/bin:/root/.cargo/bin:$PATH \
     OV_REQUIRE_RAGFS_BUILD=1 OV_SKIP_STUDIO_BUILD=1 \
@@ -81,10 +81,11 @@ RUN bash examples/deepagents_ov_context/scripts/deploy.sh install-office-skills 
     && python -m benchmark.office.admin.datasets check \
     && php -r 'foreach (["pdo_sqlite", "mbstring", "dom", "intl", "openssl", "fileinfo"] as $name) { if (!extension_loaded($name)) { fwrite(STDERR, "Missing PHP extension: $name\n"); exit(1); } }' \
     && dovecot --version \
-    && python -m pip install pytest pytest-asyncio \
+    && python -m pip install 'pytest==9.2.0' 'pytest-asyncio==1.5.0' \
     && python -m pip check \
     && python -m pip freeze > /opt/openviking/image-requirements.txt \
     && chmod -R a+rX /opt/ov-tools /opt/python /opt/openviking \
     && rm -rf /tmp/ov-home \
     && dnf clean all
+COPY --from=builder /opt/openviking/pyproject.toml /opt/openviking/pyproject.toml
 CMD ["chat"]

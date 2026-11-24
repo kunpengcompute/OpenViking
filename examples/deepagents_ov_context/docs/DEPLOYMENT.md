@@ -8,7 +8,7 @@
 
 ## 1. 运行环境
 
-- **目标平台**：920B 7282C，ARM64，openEuler 24.03 LTS。
+- **目标平台**：鲲鹏 920B 7282C（ARM64），openEuler 24.03 LTS SP3。
 - **宿主机依赖**：Docker Engine、Docker Compose 插件、Buildx 插件、Git 和 curl。
 - **容器系统**：OV 和 Chat 基于 `openeuler/openeuler:24.03-lts-sp3`。[官方镜像说明](https://github.com/openeuler-mirror/openeuler-docker-images/blob/master/README.en.md)
 - **模型服务**：Chat 及 OV 的摘要 / 记忆提取连接外部模型服务；向量化连接 Embedding 服务。
@@ -165,11 +165,22 @@ $OV_DEPLOY_HOME/
   "embedding_model": "doubao-embedding-vision",
   "embedding_dimension": 1024,
   "embedding_provider": "volcengine",
-  "embedding_input": "multimodal"
+  "embedding_input": "multimodal",
+  "ov_extra_request_body": {
+    "thinking": {"type": "disabled"}
+  }
 }
 ```
 
 Chat 使用 `chat_model` 调用对话模型；配置生成器默认使用相同模型生成 OV 摘要与记忆提取配置，向量检索使用 Embedding 模型。生成器将 `api_base` 和 `api_key` 同时用于 OV 的生成模型与 Embedding 初始配置。接口地址、模型权限和向量维度须配套；各服务使用独立地址或凭据时，在生成后的 `ov.conf` 中分别配置。
+
+`ov_extra_request_body` 指定 OV 摘要与记忆提取模型的额外请求参数，执行 `configure` 时写入 `ov.conf` 的 `vlm.extra_request_body`。该参数独立于 Chat Agent 的 thinking 设置；直连与网关均按显式配置生成，重新执行 `configure` 时继续应用。
+
+| `ov_extra_request_body` 配置 | 生成行为 |
+|---|---|
+| JSON 对象，例如 `{"thinking":{"type":"disabled"}}` | 原样传递该对象；上例适用于接受此参数的模型，其他模型按其接口要求填写 |
+| `{}` | 清空额外请求参数，使用模型服务端的默认行为 |
+| 未填写或 `null` | 保留自动行为：`api_base` 包含 `volces.com` 时附加关闭 thinking 的参数，其他地址使用空对象 |
 
 ### 3.2 OV 服务配置
 
@@ -240,6 +251,35 @@ OV 使用 `trusted` 认证。首次生成配置时创建 `config/ov/service.key`
 
 `configure` 每次根据 `models.local.json` 重写 `ov.conf`，保留已有 `service.key`。OV 专用模型参数在生成后设置；后续重新生成配置时同步应用这些设置。切换 Embedding 模型或维度时，使用独立部署目录初始化 OV 数据，并重新写入、提取记忆和建立索引。
 
+**OpenAI 兼容 Embedding 接口的维度配置**
+
+本版本的 OpenAI Embedding 适配器在 `provider="openai"` 时，仅配置 `dimension` 会控制本地保留的向量长度，请求中不会自动加入 `dimensions`。例如，配置 `dimension=1024`，服务默认返回 2048 维时，OV 会截取前 1024 维。该结果与服务端直接生成的 1024 维向量可能不同，影响检索效果。
+
+对于支持请求参数 `dimensions` 的接口，可在已生成的 `$OV_DEPLOY_HOME/config/ov/ov.conf` 中，通过 `query_param` 和 `document_param` 显式传入。GLM `embedding-3` 默认返回 2048 维向量，也支持通过 `dimensions=1024` 由服务端生成 1024 维向量。以下配置使用该模型的 1024 维文本向量，替换 `embedding.dense` 部分：
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "openai",
+      "api_base": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key": "填写 Embedding API Key",
+      "model": "embedding-3",
+      "dimension": 1024,
+      "input": "text",
+      "query_param": "dimensions=1024",
+      "document_param": "dimensions=1024"
+    }
+  }
+}
+```
+
+- `dimension` 指定 OV 使用的向量维度；`query_param` 用于检索向量，`document_param` 用于入库向量。两侧均配置相同的 `dimensions`，由服务端生成目标维度。
+- 这两个参数通过请求体透传，`dimensions=1024` 会被解析为字符串值。验收环境已验证上述 GLM 接口接受该形式；其他接口须先确认支持 `dimensions` 参数及字符串值，再使用此配置。
+- 若已有 `query_param` 或 `document_param`，在 `key=value` 格式中保留其他参数并设置 `dimensions=1024`，例如 `input_type=query,dimensions=1024`。原值为 `query` 等简写时，先展开为 `input_type=query` 再追加。
+- 重新执行 `configure` 后，再次应用上述自定义字段。配置修改后的容器重建及检查命令见下方“应用配置修改”。
+- 从本地截断切换为服务端生成指定维度时，即使维度数保持一致，也应使用独立数据目录重新生成向量和索引，保证入库与查询使用相同的生成方式。
+
 **应用配置修改**
 
 首次部署按第 4 节启动。运行中修改模型或 OV 配置后，执行以下命令重建容器并等待就绪，数据继续使用原挂载目录：
@@ -279,9 +319,15 @@ OV_COMMIT__KEEP_RECENT_COUNT=8
 - 同步归档等待上限为 300 秒；单次 OV I/O 受 Chat 的等待配置约束。读取、写入及降级状态通过执行事件观测。
 - Session 创建时合并并保存有效配置，每 Run 重建 Agent 时复用该快照。修改 `.env` 后重启 Chat，新建 Session 使用新配置。
 
+**会话级召回配置**
+
+创建 Session 时，可在请求的 `execution` 中设置 `memory_detail`（`abstract`、`overview`、`full`）、`memory_budget_tokens`、`memory_budget_chars` 和 `target_uris`，分别控制召回内容的详情等级、Token 预算、注入字符上限和检索目录。省略的字段沿用服务 Reader 配置；有效配置随 Session 快照保存，后续 Run 复用。记忆对照测试应保存各组的检索范围、预算及实际注入内容。
+
 ### 3.4 模型调用与执行环境
 
 `.env` 的 `CHAT_MODEL__CALL_TIMEOUT_SECONDS` 控制模型响应等待超时，示例配置为 180 秒。流式调用分别限制首个片段和后续相邻片段的等待时间，收到文本、reasoning、工具参数或 usage 片段后重新计时；持续有片段返回的回复可以超过 180 秒。非流式调用限制等待完整响应的时间。整轮任务总时限由 `timeout_seconds` 单独控制。`CHAT_AGENT__ENABLE_TODOS` 控制任务计划工具。创建 Session 时保存有效值，后续 Run 复用；页面可在新会话中覆盖。
+
+`CHAT_MODEL__THINKING=true` 设置 Agent 默认开启推理。直连和网关请求均显式发送 `thinking.type`；配置为 `false` 时发送 `disabled`。CLI 的 `--thinking`／`--no-thinking` 覆盖环境配置，Session 的 Thinking 选项覆盖服务默认值并随会话保存。OV 摘要与记忆提取使用独立的 `ov_extra_request_body` 配置。
 
 Chat 支持通过 `--environments-file` 加载额外 OV 环境，配置文件放在挂载的 `/config` 下。各环境指定独立的 OV 地址、account、凭据文件及环境文件；页面和批量实验通过 `environment_id` 选择。Session 保存环境绑定，`experiment_id` 用于关联一组实验。默认环境为 `daily`。
 
@@ -446,7 +492,8 @@ benchmark/
     ├── tasks/                    # 办公案例的 H/Q 提示词
     ├── datasets/                 # H/Q 种子、PPT 和文档输入及验收参考
     ├── cases/                    # 办公页面、业务规则与案例定义
-    ├── suites/                   # 执行、评分和功能验收
+    ├── suites/                   # 案例执行、证据采集和性能统计
+    ├── evaluation/               # AI复核提示词与验收预算
     ├── admin/                    # 数据集和邮箱初始化
     └── tests/                    # 案例离线回归
 ```
@@ -561,13 +608,13 @@ bash examples/deepagents_ov_context/scripts/container.sh cases case-data invento
 | 案例 | 定义文件 | 输入夹具 |
 |---|---|---|
 | PPT 更新 | `benchmark/office/cases/ppt_update/spec.json` | `benchmark/office/datasets/ppt_update/modify_test.pptx` |
-| 资料生成文档 | `benchmark/office/cases/reqdoc_generation/spec.json` | `benchmark/office/datasets/reqdoc_generation/inputs/`，包含 Markdown、Word、JSON、Excel 和 PDF 六份业务资料，以及 `record_helpers.py` 辅助文件 |
+| 资料生成文档 | `benchmark/office/cases/reqdoc_generation/spec.json` | `benchmark/office/datasets/reqdoc_generation/inputs/`，包含六份业务资料：两份 Markdown，以及 Word、JSON、Excel、PDF 各一份；另附 `record_helpers.py` 辅助文件 |
 
 **PPT 更新**：H/Q 分别从原稿副本开始，按定义文件中的页码、位置和目标值完成修改。模型通过 pptx Skill 更新文件，保持受保护内容与版式，并交付定义文件指定的 PPT。
 
 **资料生成文档**：按定义文件向 H、原生 Q 和记忆 Q 上传相同的六份业务资料及 `record_helpers.py`，使用对应 H/Q 提示词生成文档。Q 提示可使用辅助函数，H 额外说明导入方式、事件处理顺序与原始记录核验方法；核对资料事实、指定章节、文件完整性和下载入口。辅助文件和提示词的 SHA-256 纳入案例指纹，更新后重新准备 H 记忆。
 
-脚本执行时从镜像内夹具路径读取文件，通过 Chat 上传接口装载到本次 Run 的 `inputs/`。页面手工执行时，先从配套源码选择同一份输入材料并上传。管理员参考与评分文件保存在独立目录。宿主机 `data/cases/inputs/` 可保存按 H/Q 分开的输入副本，数据版本与定义文件保持一致。
+脚本执行时从镜像内夹具路径读取文件，通过 Chat 上传接口装载到本次 Run 的 `inputs/`。页面手工执行时，先从配套源码选择同一份输入材料并上传。管理员参考及验收规则保存在独立目录，AI复核入口为 `benchmark/office/evaluation/AI_REVIEW_PROMPT.md`。宿主机 `data/cases/inputs/` 可保存按 H/Q 分开的输入副本，数据版本与定义文件保持一致。
 
 ### 7.6 记忆对照与数据管理
 
@@ -593,15 +640,8 @@ ssh -N -T -o ExitOnForwardFailure=yes \
 | 挂载目录权限错误 | 使用数据目录所属账号启动，核对 UID / GID 与目录权限 |
 | OV 不就绪 | 查看 `container.sh logs ov`，检查模型、Embedding、凭据和存储路径 |
 | 端口被占用 | 初始化前通过 `compose.env` 确定 OV、Chat、IMAP 和 Webmail 端口；办公页面预留 19482 |
-| 页面有回复但OV未同步 | 查看 `ov_degraded`、`ov_sync_pending` 和错误类型，核对远端及本地消息后显式恢复 |
+| 页面有回复但 OV 未同步 | 查看 `ov_degraded`、`ov_sync_pending` 和错误类型，核对远端及本地消息后显式恢复 |
 | 文件校验或发布失败 | 保存执行记录；`artifact_publish` 错误保留 checkpoint，可在原会话重新生成文件 |
 | 容器重建后缺少会话 | 确认沿用同一 `OV_DEPLOY_HOME`，且两份 SQLite 与 OV 数据挂载完整 |
 | 案例资产校验失败 | 按 `case-data check` 输出核对仓库内完整案例目录及输入夹具 |
 | 案例服务启动失败 | 检查 `data/cases/logs/`，核对初始化配置、端口和目录权限 |
-
-
-### 浏览器接口与历史会话
-
-新会话记录 `browser_contract_version=2`，普通命令使用官方 CLI，文件交付使用 browser_files。旧会话的执行配置和 checkpoint 保持原样；每 Run 只替换应用生成的浏览器说明，保留业务规则和用户自定义要求。旧接口会话的 download/pdf_text 和原截图调用由定向适配处理；当前官方接口保持原命令语义。运行事件 browser.compatibility 可核对接口版本与适配状态。
-
-按会话测试方法记忆时，可在 execution 中指定 memory_detail（abstract、overview、full）、memory_budget_tokens 和 target_uris，并结合已有 memory_budget_chars 控制实际注入。配置随会话快照冻结，省略字段时沿用服务 Reader 配置。target_uris 使用业务需要的记忆类别目录；记忆类型、预算和实际注入内容应随实验条件保存。

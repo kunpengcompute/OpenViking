@@ -168,7 +168,6 @@ def check(reference: dict, after: dict) -> dict:
         "items": checks,
         "completed": sum(i["completed"] for i in checks),
         "total": len(checks),
-        "completion_rate": sum(i["completed"] for i in checks) / len(checks),
         "new_event_count": len(new_ids),
         "expected_new_event_count": 6,
         "extra_event_ids": extra,

@@ -20,7 +20,13 @@ class CaseContract:
     def from_case(cls, spec=None):
         if spec is None:
             spec = json.loads((OFFICE_ROOT / "cases/ppt_update/spec.json").read_text())
-        files = {}
+        source = PROJECT_ROOT / spec["source"]
+        if (
+            source.is_symlink()
+            or hashlib.sha256(source.read_bytes()).hexdigest() != spec["input_sha256"]
+        ):
+            raise ValueError("PPT source differs from the frozen case")
+        files = {spec["source"]: spec["input_sha256"]}
         for item in [*spec["phases"].values(), *spec["support_files"]]:
             name = item.get("prompt", item.get("source"))
             path = PROJECT_ROOT / name
@@ -32,10 +38,22 @@ class CaseContract:
             files[name] = digest
         return cls({"version": spec["version"], "files": files})
 
-    def require_accepted(self, frozen):
-        acceptance = frozen.get("artifact_acceptance", {})
+    def require_reviewed(self, frozen, review_path):
+        if review_path is None:
+            raise ValueError("Ordinary Q requires --preparation-review for H")
+        review = json.loads(review_path.read_text())
+        acceptance = frozen.get("memory_integrity", {})
         if acceptance.get("passed") is not True or acceptance.get("contract_sha256") != self.sha256:
-            raise ValueError("Frozen H memory has no matching artifact acceptance")
+            raise ValueError("Frozen H memory integrity or case contract differs")
+        if (
+            review.get("decision") != "passed"
+            or review.get("contract_sha256") != self.sha256
+            or not frozen.get("preparation_run_id")
+            or review.get("run_id") != frozen["preparation_run_id"]
+            or not review.get("evidence")
+        ):
+            raise ValueError("H needs a passing AI review with matching Run and case evidence")
+        return review
 
 
 def strings(value):

@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from examples.deepagents_ov_context.chat.environments import EnvironmentBinding
 from examples.deepagents_ov_context.chat.history import RunHistory, RunStatistics
 from examples.deepagents_ov_context.chat.profiles import ExecutionProfile
+from openviking.core.identifiers import validate_identifier_part
 from openviking.integrations.langchain.ov_context import RunIdentity
 from openviking.integrations.langchain.ov_context.commit import CommitConfig
 from openviking.integrations.langchain.ov_context.config import OVContextConfig
@@ -37,6 +38,9 @@ class NewSession(BaseModel):
     @classmethod
     def valid_identity(cls, value: str) -> str:
         valid_identity_field(value)
+        error = validate_identifier_part(value, "identity")
+        if error:
+            raise ValueError(error)
         return value
 
 
@@ -63,11 +67,20 @@ class SessionInfo(BaseModel):
     needs_restore: bool = False
     last_run: RunStatistics | None = None
     memory_task_id: str | None = None
+    memory_archive_applied: bool = False
     memory_commit_unknown: bool = False
     environment_id: str = Field(default="daily", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     experiment_id: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_.-]{1,100}$")
     execution: ExecutionProfile = Field(default_factory=ExecutionProfile)
     config_snapshot: SessionConfigSnapshot | None = None
+
+    @property
+    def requires_memory_archive(self) -> bool:
+        return (
+            self.execution.native_context
+            and self.memory_task_id is not None
+            and not self.memory_archive_applied
+        )
 
     def identity(self, run_id: str) -> RunIdentity:
         return RunIdentity(self.account_id, self.user_id, self.agent_id, self.session_id, run_id)

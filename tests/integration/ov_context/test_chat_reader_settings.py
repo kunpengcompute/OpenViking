@@ -98,6 +98,63 @@ async def test_session_snapshot_saves_effective_user_and_peer_roots(chat, explic
     assert list(saved.config_snapshot.reader_config.target_uris) == expected
 
 
+@pytest.mark.parametrize("value", [-1, True, False, 1.5, "30"])
+async def test_session_rejects_invalid_candidate_limit_before_saving(chat, value):
+    client, runtime = chat
+    response = await client.post("/api/sessions", json={"execution": {"candidate_limit": value}})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "execution", "candidate_limit"]
+    assert runtime.store.list() == []
+
+
+@pytest.mark.parametrize("candidate_limit", [None, 0, 30])
+async def test_session_candidate_limit_survives_defaults_and_runtime_changes(
+    chat, tmp_path, candidate_limit
+):
+    client, first = chat
+    env_file = tmp_path / ".env"
+    env_file.write_text("OV_READER__CANDIDATE_LIMIT=25\n")
+    first.settings = replace(first.settings, reader_config=load_reader_config(env_file))
+    first.model = NoToolModel()
+    execution = {} if candidate_limit is None else {"candidate_limit": candidate_limit}
+    response = await client.post("/api/sessions", json={"execution": execution})
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    expected = 25 if candidate_limit is None else candidate_limit
+    assert saved["execution"]["candidate_limit"] == candidate_limit
+    assert saved["config_snapshot"]["reader_config"]["candidate_limit"] == expected
+    sid = saved["session_id"]
+
+    env_file.write_text("OV_READER__CANDIDATE_LIMIT=42\n")
+    first.settings = replace(first.settings, reader_config=load_reader_config(env_file))
+    rebuilt = ChatRuntime(first.settings, first.model_config, checkpointer=first.saver)
+    rebuilt.model = NoToolModel()
+    try:
+        for runtime in (first, rebuilt):
+            session = runtime.store.get(sid)
+            assert session.execution.candidate_limit == candidate_limit
+            assert session.config_snapshot.reader_config.candidate_limit == expected
+            for _ in range(2):
+                sdk = runtime.sdk()
+                middleware = None
+                try:
+                    _, middleware = runtime.session_graph(session, sdk, ActiveRun())
+                    assert middleware is not None
+                    assert (
+                        middleware._ov_session_engine.context_reader.config.candidate_limit
+                        == expected
+                    )
+                finally:
+                    if middleware is not None:
+                        await middleware.aclose()
+                    await sdk.close()
+        fresh = await client.post("/api/sessions", json={})
+        assert fresh.status_code == 201, fresh.text
+        assert fresh.json()["config_snapshot"]["reader_config"]["candidate_limit"] == 42
+    finally:
+        await rebuilt.close()
+
+
 @pytest.mark.parametrize(
     "setting",
     [

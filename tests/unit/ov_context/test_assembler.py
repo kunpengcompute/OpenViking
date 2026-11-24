@@ -25,6 +25,38 @@ def assembler(counter):
     )
 
 
+def test_user_input_preflight_counts_fixed_content_and_preserves_request(env):
+    instance = ContextAssembler(
+        OVContextConfig(context_window=12000, output_reserve=1024, capacity_ratio=0.8)
+    )
+    user = HumanMessage(id="incoming", content="预算测试" * 1000)
+    system = SystemMessage(content="系统说明" * 800)
+    request = env[4].override(messages=[user], system_message=system)
+    before = deepcopy(request.messages)
+    before_system = deepcopy(system)
+    assert instance.check_user_input(request.override(system_message=None)) > 0
+    assert instance.check_user_input(request.override(messages=[])) > 0
+    with pytest.raises(ContextBudgetExceeded):
+        instance.check_user_input(request)
+    assert request.messages == before
+    assert request.system_message == before_system
+
+
+def test_user_input_preflight_counts_tool_schema(env):
+    instance = ContextAssembler(
+        OVContextConfig(context_window=12000, output_reserve=1024, capacity_ratio=0.8)
+    )
+
+    @tool(description="工具说明" * 2000)
+    def large_tool(query: str) -> str:
+        return query
+
+    request = env[4].override(messages=[HumanMessage(content="short")], tools=[])
+    assert instance.check_user_input(request) > 0
+    with pytest.raises(ContextBudgetExceeded):
+        instance.check_user_input(request.override(tools=[large_tool]))
+
+
 def test_batch_guidance_follows_registered_tools_and_is_not_duplicated(env):
     @tool("openviking_tool_result_search_many", description="Test batch search")
     def lookup() -> str:

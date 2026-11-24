@@ -12,6 +12,25 @@ from urllib.parse import urlsplit
 import httpx
 
 
+def _decode_exec_output(raw: bytes) -> tuple[bytes, bytes]:
+    streams = {1: bytearray(), 2: bytearray()}
+    offset = 0
+    while offset < len(raw):
+        if len(raw) - offset < 8:
+            raise RuntimeError("Truncated Docker exec stream header")
+        header = raw[offset : offset + 8]
+        stream = header[0]
+        if stream not in streams or header[1:4] != b"\0\0\0":
+            raise RuntimeError("Invalid Docker exec stream header")
+        size = struct.unpack(">I", header[4:8])[0]
+        end = offset + 8 + size
+        if end > len(raw):
+            raise RuntimeError("Truncated Docker exec stream payload")
+        streams[stream].extend(raw[offset + 8 : end])
+        offset = end
+    return bytes(streams[1]), bytes(streams[2])
+
+
 class DockerOV:
     def __init__(self, environment):
         self.url = environment.url
@@ -102,26 +121,49 @@ for p in glob.glob("/proc/[0-9]*"):
    print(json.dumps({"fds":len(os.listdir(p+"/fd")),"rss_kib":int(status["VmRSS"].split()[0])}))
    break
  except (FileNotFoundError,PermissionError): pass
+else:
+ raise SystemExit("OV server process not found")
 """
         create = await self.http.post(
             f"/containers/{self.name}/exec",
             json={
                 "AttachStdout": True,
                 "AttachStderr": True,
-                "Cmd": ["/validation/OpenViking-0.4.1/.venv/bin/python", "-c", script],
+                "Cmd": ["python", "-c", script],
             },
         )
         create.raise_for_status()
+        exec_id = create.json()["Id"]
         response = await self.http.post(
-            f"/exec/{create.json()['Id']}/start", json={"Detach": False, "Tty": False}
+            f"/exec/{exec_id}/start", json={"Detach": False, "Tty": False}
         )
         response.raise_for_status()
-        raw, out = response.content, b""
-        while len(raw) >= 8:
-            size = struct.unpack(">I", raw[4:8])[0]
-            out += raw[8 : 8 + size]
-            raw = raw[8 + size :]
-        result.update(json.loads(out))
+        status = await self.http.get(f"/exec/{exec_id}/json")
+        status.raise_for_status()
+        execution = status.json()
+        exit_code = execution.get("ExitCode")
+        if execution.get("Running") or exit_code is None:
+            raise RuntimeError("OV metrics command has not finished")
+        if exit_code != 0:
+            try:
+                stdout, stderr = _decode_exec_output(response.content)
+                error = stderr or stdout
+            except RuntimeError:
+                error = response.content
+            detail = error.decode("utf-8", errors="replace").strip()[:1000]
+            raise RuntimeError(f"OV metrics command failed (exit={exit_code}): {detail}")
+        stdout, _ = _decode_exec_output(response.content)
+        if not stdout.strip():
+            raise RuntimeError("OV metrics command returned no process metrics")
+        try:
+            process = json.loads(stdout)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError("OV metrics command returned invalid JSON") from exc
+        if not isinstance(process, dict) or any(
+            type(process.get(key)) is not int or process[key] < 0 for key in ("fds", "rss_kib")
+        ):
+            raise RuntimeError("OV metrics command returned invalid process metrics")
+        result.update(process)
         return result
 
     async def close(self):

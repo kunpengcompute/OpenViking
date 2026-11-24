@@ -16,7 +16,7 @@ from typing import Any
 from openviking.core.namespace import canonical_user_root, canonicalize_uri, classify_uri
 from openviking.core.retrieval_targets import default_target_directories, resolve_retrieval_targets
 from openviking.utils.token_estimation import text_token_weight
-from openviking_cli._exception_utils import auth_error
+from openviking_cli._exception_utils import auth_error, invalid_argument_error
 from openviking_cli.client.identity import OVIdentity, _identity_arguments
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.retrieve.context import (
@@ -386,7 +386,11 @@ async def _assemble_context(
                 stats["searches"] += 1
                 result = await transport.find(search_arguments(task))
         except Exception as exc:
-            if auth_error(exc) or isinstance(exc, (InvalidArgumentError, ValueError)):
+            if (
+                auth_error(exc)
+                or invalid_argument_error(exc)
+                or isinstance(exc, (InvalidArgumentError, ValueError))
+            ):
                 raise
             stats["retrieval_errors"].append(type(exc).__name__)
             return []
@@ -488,7 +492,7 @@ async def _assemble_context(
                 raw = await transport.read(uri)
             return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw or "")
         except Exception as exc:
-            if auth_error(exc):
+            if auth_error(exc) or invalid_argument_error(exc):
                 raise
             stats["read_errors"].append(type(exc).__name__)
             return ""

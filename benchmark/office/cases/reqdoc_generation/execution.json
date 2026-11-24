@@ -1,0 +1,11 @@
+{
+  "context_window": 256000,
+  "max_tokens": 32768,
+  "thinking": true,
+  "recursion_limit": 1000,
+  "timeout_seconds": 3600,
+  "model_call_timeout_seconds": 180,
+  "memory_budget_tokens": 4000,
+  "memory_detail": "full",
+  "candidate_limit": 30
+}

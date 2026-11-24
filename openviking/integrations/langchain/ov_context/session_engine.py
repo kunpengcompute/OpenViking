@@ -19,6 +19,7 @@ from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import BaseMessage, ToolMessage
 
 from openviking.integrations.langchain.client import OpenVikingConnection
+from openviking_cli._exception_utils import invalid_argument_error
 
 from .assembler import ContextAssembler, ContextRefreshPlan, is_summary, validate_tool_pairs
 from .budget import TokenCounter
@@ -403,6 +404,7 @@ class SessionEngine:
             if (
                 isinstance(exc, (IdentityMismatchError, ContextHistoryBudgetError))
                 or auth_error(exc)
+                or invalid_argument_error(exc)
                 or not initial
                 or self.config.context_failure == "raise"
             ):
@@ -609,7 +611,11 @@ class SessionEngine:
             except ContextBudgetExceeded:
                 raise
             except Exception as exc:
-                if isinstance(exc, IdentityMismatchError) or auth_error(exc):
+                if (
+                    isinstance(exc, IdentityMismatchError)
+                    or auth_error(exc)
+                    or invalid_argument_error(exc)
+                ):
                     raise
                 if context.session_key in self._refresh_progress or finished:
                     raise ContextBudgetExceeded(

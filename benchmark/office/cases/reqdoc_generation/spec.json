@@ -1,5 +1,6 @@
 {
   "version": "reqdoc-independent-shared-helpers-v13",
+  "execution_profile": "benchmark/office/cases/reqdoc_generation/execution.json",
   "input_dir": "benchmark/office/datasets/reqdoc_generation/inputs",
   "inputs": [
     {
@@ -128,11 +129,11 @@
     "link_must_be_first": false
   },
   "budget": {
-    "policy": "benchmark/office/cases/scoring.json",
+    "policy": "benchmark/office/evaluation/policy.json",
     "applies_to": "Q",
-    "mode": "subtask_completion_deadline",
+    "mode": "ai_evidence_review",
     "seconds": 550,
-    "success": "All checkpoints for a chapter pass and its verified completion time from Chat Run start is <=550 seconds; delivery is scored separately.",
+    "success": "AI reviews the saved evidence within 550 seconds; each chapter has weight 1 and its checkpoints share that weight. Delivery is reviewed separately.",
     "over_budget": "Continue to terminal; preserve full latency and Agent plus OV LLM usage."
   }
 }

@@ -1,0 +1,6 @@
+{
+  "max_tokens": 32768,
+  "recursion_limit": 1000,
+  "thinking": true,
+  "timeout_seconds": 900
+}

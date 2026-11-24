@@ -42,7 +42,7 @@ from examples.deepagents_ov_context.chat.agent import DemoAgent, RequestContext
 from examples.deepagents_ov_context.chat.config import ModelConfig, load_service_api_key
 from examples.deepagents_ov_context.chat.model import ArkChatOpenAI
 from examples.deepagents_ov_context.chat.native_summary import DisabledNativeSummaryMiddleware
-from openviking.integrations._message_content import comparable_content
+from openviking.integrations._message_content import comparable_content, decode_tool_content
 from openviking.integrations.langchain.middleware import OpenVikingContextMiddleware
 from openviking.integrations.langchain.ov_context import (
     ApproximateTokenCounter,
@@ -115,6 +115,100 @@ def signature(messages: list[BaseMessage]) -> list[dict[str, Any]]:
             row.update(tool_call_id=m.tool_call_id, name=m.name, status=m.status)
         values.append(row)
     return values
+
+
+async def validate_persisted_projection(
+    cached: list[BaseMessage],
+    restored: list[BaseMessage],
+    *,
+    sdk: AsyncHTTPClient,
+    session_id: str,
+    identity: Any,
+) -> int:
+    """Check normal bodies exactly; verify source-read views by their provenance."""
+    local, remote = signature(cached), signature(restored)
+    check(len(local) == len(remote), "Cache/OV message count differs")
+    calls = {c["id"]: c for m in cached if isinstance(m, AIMessage) for c in m.tool_calls}
+    view = None
+    verified = 0
+    for message, left, right in zip(cached, local, remote, strict=True):
+        check(
+            {k: v for k, v in left.items() if k != "content"}
+            == {k: v for k, v in right.items() if k != "content"},
+            "Cache/OV message identity, order, calls or status differs",
+        )
+        if left["content"] == right["content"]:
+            continue
+        check(
+            isinstance(message, ToolMessage)
+            and message.name == "openviking_tool_result_read"
+            and message.status == "success",
+            "Cache/OV ordinary message content differs",
+        )
+        call = calls.get(message.tool_call_id)
+        check(bool(call) and call["name"] == message.name, "Source-read call missing")
+        args = call["args"]
+        ref = args.get("ref", "")
+        prefix = f"/sessions/{session_id}/tool-results/"
+        check(ref.startswith("viking://") and prefix in ref, "Source-read ref has wrong session")
+        result_id = ref.split(prefix, 1)[1]
+        check(bool(result_id) and "/" not in result_id, "Invalid source-read result ID")
+        if view is None:
+            view = await sdk.get_session_context(session_id, identity=identity)
+        parts = [
+            p
+            for record in view["messages"]
+            for p in record.get("parts", [])
+            if p.get("type") == "tool"
+            and p.get("tool_id") == message.tool_call_id
+            and p.get("tool_status") in {"completed", "error"}
+        ]
+        check(len(parts) == 1, "Source-read stored result missing or duplicated")
+        part = parts[0]
+        check(
+            part.get("tool_name") == message.name
+            and part.get("tool_input") == args
+            and part.get("tool_status") == "completed"
+            and part.get("tool_output_externalized_reason") == "source_read"
+            and part.get("tool_output_ref") == ref
+            and part.get("tool_output_source_ref") == ref
+            and part.get("tool_output_source_offset") == args.get("offset")
+            and part.get("tool_output_source_limit") == args.get("limit"),
+            "Source-read stored provenance differs",
+        )
+        check(
+            comparable_content(decode_tool_content(part)) == right["content"],
+            "Reader did not restore the server source-read view",
+        )
+        blocks = comparable_content(message.content)
+        check(all(b.get("type") == "text" for b in blocks), "Invalid source-read body")
+        try:
+            payload = json.loads("".join(b["text"] for b in blocks))
+        except (TypeError, ValueError) as exc:
+            raise AssertionError("Source-read body is not a JSON result") from exc
+        replay = await sdk.read_tool_result(
+            session_id,
+            result_id,
+            offset=args.get("offset", 0),
+            limit=args.get("limit", 20_000),
+            identity=identity,
+        )
+        fields = (
+            "tool_result_id",
+            "content",
+            "offset",
+            "limit",
+            "offset_unit",
+            "total_chars",
+            "has_more",
+        )
+        check(
+            isinstance(payload, dict)
+            and all(k in payload and k in replay and payload[k] == replay[k] for k in fields),
+            "Source-read fragment cannot be reproduced from its reference and range",
+        )
+        verified += 1
+    return verified
 
 
 @dataclass(frozen=True)
@@ -632,6 +726,7 @@ class Suite:
             ]
             raw = state["messages"]
             cached = state["ov_context"]["messages"]
+            source_read_views = 0
             if not interrupt:
                 validate_tool_pairs(cached)
                 ids = [m.id for m in cached]
@@ -682,14 +777,19 @@ class Suite:
                     },
                 )
                 phase_save = PHASE.set("compare")
-                remote = await OVContextReader(self.sdk).exchange_context(
-                    tenant.session, identity=identity.sdk_identity
-                )
-                PHASE.reset(phase_save)
-                check(
-                    signature(cached) == signature(remote.messages),
-                    "Cache/OV message projection differs",
-                )
+                try:
+                    remote = await OVContextReader(self.sdk).exchange_context(
+                        tenant.session, identity=identity.sdk_identity
+                    )
+                    source_read_views = await validate_persisted_projection(
+                        cached,
+                        remote.messages,
+                        sdk=self.sdk,
+                        session_id=tenant.session,
+                        identity=identity.sdk_identity,
+                    )
+                finally:
+                    PHASE.reset(phase_save)
             run_requests = [
                 r
                 for r in self.requests[requests_before:]
@@ -712,6 +812,7 @@ class Suite:
                 "context_reads": sum(r["path"].endswith("/context") for r in run_requests),
                 "raw_messages": len(raw),
                 "cached_messages": len(cached),
+                "verified_source_read_views": source_read_views,
                 "next": list(snapshot.next),
                 "interrupted": interrupt,
                 "parallel_tools": not follow and not resume,

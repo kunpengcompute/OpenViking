@@ -305,7 +305,9 @@ async def test_model_error_is_terminal_and_redacted(chat, monkeypatch):
     client, rt = chat
     sid = await new_session(client)
 
-    def broken_graph(self, sdk, run, *, browser=None, skill_run=None, session=None):
+    def broken_graph(
+        self, sdk, run, *, browser=None, skill_run=None, session=None, input_message=None
+    ):
         raise RuntimeError("test-private-value")
 
     monkeypatch.setattr(ChatRuntime, "graph", broken_graph)

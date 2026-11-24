@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from openviking.core.identifiers import validate_identifier_part
 from openviking.integrations.langchain.ov_context.commit import CommitConfig
 from openviking.integrations.langchain.ov_context.config import OVContextConfig
 from openviking.integrations.langchain.ov_context.reader import MemoryReaderConfig
@@ -49,6 +50,7 @@ def load_todo_enabled(env_file: Path | None = None) -> bool:
 class ChatModelEnvironment(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CHAT_MODEL__", extra="ignore")
     call_timeout_seconds: float = Field(gt=0, le=3600, allow_inf_nan=False)
+    thinking: bool
 
 
 def load_model_call_timeout(env_file: Path | None = None) -> float:
@@ -57,6 +59,14 @@ def load_model_call_timeout(env_file: Path | None = None) -> float:
     defaults = DEFAULT_ENV_FILE
     files = (defaults, env_file) if env_file is not None else defaults
     return ChatModelEnvironment(_env_file=files).call_timeout_seconds
+
+
+def load_model_thinking(env_file: Path | None = None) -> bool:
+    if env_file is not None and not env_file.is_file():
+        raise ValueError(f"Model environment file not found: {env_file}")
+    defaults = DEFAULT_ENV_FILE
+    files = (defaults, env_file) if env_file is not None else defaults
+    return ChatModelEnvironment(_env_file=files).thinking
 
 
 class ChatOVPolicy(BaseSettings):
@@ -82,6 +92,9 @@ class ChatOVPolicy(BaseSettings):
         context_quotas: bool = False,
     ) -> tuple[str, ...] | None:
         valid_identity_field(agent_id)
+        error = validate_identifier_part(agent_id, "actor_peer_id")
+        if error:
+            raise ValueError(error)
         if targets is None:
             if context_quotas:
                 if self.recall_agent_memories:
@@ -215,6 +228,13 @@ class ModelConfig:
     chat_max_tokens: int = 256
     embedding_provider: str = "openai"
     embedding_input: str = "text"
+    ov_extra_request_body: dict[str, Any] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.ov_extra_request_body is not None and not isinstance(
+            self.ov_extra_request_body, dict
+        ):
+            raise ValueError("ov_extra_request_body must be a JSON object or null")
 
     @classmethod
     def load(cls, path: Path) -> ModelConfig:
@@ -269,7 +289,9 @@ def write_server_config(config: ModelConfig, output: Path, port: int) -> Path:
             "max_retries": 1,
             "timeout": 60,
             "extra_request_body": (
-                {"thinking": {"type": "disabled"}} if "volces.com" in config.api_base else {}
+                dict(config.ov_extra_request_body)
+                if config.ov_extra_request_body is not None
+                else ({"thinking": {"type": "disabled"}} if "volces.com" in config.api_base else {})
             ),
         },
         "oauth": {"enabled": False},
