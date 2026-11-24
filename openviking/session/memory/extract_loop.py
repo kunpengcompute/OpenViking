@@ -7,9 +7,14 @@ Reference: bot/vikingbot/agent/loop.py AgentLoop structure
 """
 
 import asyncio
+import hashlib
 import json
+import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from openviking import _kunpeng_opt
+
 from typing import Any, Dict, List, Optional, Tuple
 
 from openviking.models.vlm.base import ToolCall, VLMBase
@@ -56,6 +61,35 @@ logger = get_logger(__name__)
 # Models whose max output tokens is BELOW this value (e.g. gpt-4o-mini at 16384)
 # must set `vlm.max_tokens` in ov.conf to their own limit to override this default.
 _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS = 32768
+
+# prompt_schema 段里绝大部分耗时是把 memory schema 动态编译成 Pydantic 模型，
+# 只与 schema 内容 / 输出语言 / 输出格式 / link 开关 / peer 范围有关，与对话内容无关。
+# 这里按上述静态条件在进程内缓存，跨 commit 复用同一批模型类。
+#
+# 启用条件：默认开启；需要关闭时设 OPENVIKING_PROMPT_SCHEMA_CACHE=0（含 false/off/no/disable）。
+_PROMPT_SCHEMA_CACHE_ENV = "OPENVIKING_PROMPT_SCHEMA_CACHE"
+_PROMPT_SCHEMA_CACHE_OFF_VALUES = {"0", "false", "off", "no", "disable", "disabled"}
+_PROMPT_SCHEMA_CACHE_MAX = 8
+_PROMPT_SCHEMA_CACHE: "OrderedDict[tuple, Tuple[Any, Any, Any]]" = OrderedDict()
+
+
+def _prompt_schema_cache_enabled() -> bool:
+    """缓存开关：需鲲鹏总开关开启，且未显式设置关闭值。"""
+    if not _kunpeng_opt.enabled():
+        return False
+    raw = os.getenv(_PROMPT_SCHEMA_CACHE_ENV, "").strip().lower()
+    return raw not in _PROMPT_SCHEMA_CACHE_OFF_VALUES
+
+
+def _schemas_fingerprint(schemas) -> str:
+    """schema 内容指纹，保证 YAML 模板变了会自动失效。"""
+    payload = json.dumps(
+        [s.model_dump() for s in schemas],
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -215,14 +249,56 @@ class ExtractLoop:
 
         # 初始化 schema 生成器（使用 schemas 而非 registry）
         output_language = self.context_provider.get_output_language()
-        self.schema_model_generator = SchemaModelGenerator(
-            schemas,
-            template_context={"language": output_language},
-            # include_decision_reasoning=(
-            #     type(self.context_provider).__name__ != "PatchMergeContextProvider"
-            # ),
-        )
-        self.schema_model_generator.generate_all_models()
+
+        # Resolve global link support before generating the operations model.
+        config = get_openviking_config()
+        self._link_enabled = config.memory.link_enabled if config.memory else False
+        output_format = getattr(config.memory, "extraction_output_format", "python")
+        role_scope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
+
+        # schema 建模只是把上面的静态条件编译成 Pydantic 模型，与对话内容无关，
+        # 同一组条件下直接复用，避免每个 commit 重复生成。
+        # 缓存默认开启；设 OPENVIKING_PROMPT_SCHEMA_CACHE=0 可退回原生路径。
+        cache_key = None
+        if _prompt_schema_cache_enabled():
+            try:
+                cache_key = (
+                    _schemas_fingerprint(schemas),
+                    output_language,
+                    output_format,
+                    self._link_enabled,
+                    tuple(role_scope.peer_ids) if role_scope and role_scope.peer_ids else (),
+                )
+            except Exception:
+                # 指纹失败不影响提取，退回原生路径
+                cache_key = None
+                logger.warning("prompt_schema 缓存指纹计算失败，本次走原生路径", exc_info=True)
+
+        # 单事件循环内“查表→构建→写回”之间没有 await，命中判断是原子的；
+        # 多线程并发最坏情况是重复构建一次，不会读到半成品。
+        cached = _PROMPT_SCHEMA_CACHE.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            _PROMPT_SCHEMA_CACHE.move_to_end(cache_key)
+        else:
+            generator = SchemaModelGenerator(
+                schemas,
+                template_context={"language": output_language},
+                # include_decision_reasoning=(
+                #     type(self.context_provider).__name__ != "PatchMergeContextProvider"
+                # ),
+            )
+            generator.generate_all_models()
+            cached = (
+                generator,
+                generator.create_structured_operations_model(role_scope),
+                create_extraction_output_protocol(output_format),
+            )
+            if cache_key is not None:
+                while len(_PROMPT_SCHEMA_CACHE) >= _PROMPT_SCHEMA_CACHE_MAX:
+                    _PROMPT_SCHEMA_CACHE.popitem(last=False)
+                _PROMPT_SCHEMA_CACHE[cache_key] = cached
+        # 命中时 generator 为只读复用，run() 内不得再修改其状态。
+        self.schema_model_generator, self._operations_model, self._output_protocol = cached
 
         # 预计算工具 schemas
         allowed_tools = self.context_provider.get_tools()
@@ -232,10 +308,6 @@ class ExtractLoop:
             if tool.name in allowed_tools
         ]
 
-        # Resolve global link support before generating the operations model.
-        config = get_openviking_config()
-        self._link_enabled = config.memory.link_enabled if config.memory else False
-
         self._resolve_effective_max_output_tokens()
 
         # 获取 ExtractContext（整个流程复用）
@@ -243,15 +315,6 @@ class ExtractLoop:
         if self._extract_context is None:
             raise ValueError("Failed to get ExtractContext from provider")
 
-        # 预计算 operations_model
-        role_scope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
-
-        self._operations_model = self.schema_model_generator.create_structured_operations_model(
-            role_scope
-        )
-
-        output_format = getattr(config.memory, "extraction_output_format", "python")
-        self._output_protocol = create_extraction_output_protocol(output_format)
         self._output_context = ExtractionOutputContext(
             operations_model=self._operations_model,
             schemas=tuple(schemas),

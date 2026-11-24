@@ -5,6 +5,9 @@
 from typing import Literal
 from urllib.parse import quote
 
+import json
+import os
+
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -24,6 +27,8 @@ from openviking.server.auth import (
 )
 from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
+from openviking import _kunpeng_opt
+
 from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
@@ -34,6 +39,16 @@ from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
+
+# P1：/read 快路径——直接返回预编码 JSON，跳过 pydantic Response 的构造/校验/再序列化。
+# 默认开启；设 OPENVIKING_READ_FAST_JSON=0 可退回原生 Response 路径。
+_FAST_JSON_OFF_VALUES = {"0", "false", "off", "no", "disable", "disabled"}
+
+
+def _fast_json_read_enabled() -> bool:
+    if not _kunpeng_opt.enabled():
+        return False
+    return os.getenv("OPENVIKING_READ_FAST_JSON", "").strip().lower() not in _FAST_JSON_OFF_VALUES
 
 
 class WriteContentRequest(BaseModel):
@@ -151,6 +166,16 @@ async def read(
             raise mapped from e
         raise
 
+    # P1：payload 是纯字符串时直接输出预编码 JSON；其他类型退回原生 Response，
+    # 交给 jsonable_encoder 处理（datetime/bytes/UUID/嵌套模型等）。
+    if _fast_json_read_enabled() and type(result) is str:
+        # 经 Response 模型构造，保证 error/telemetry/profile 与原生路径同构，
+        # 避免同一接口按路径不同返回不同字段集合。
+        payload = Response(status="ok", result=result).model_dump()
+        return FastAPIResponse(
+            content=json.dumps(payload, ensure_ascii=False),
+            media_type="application/json",
+        )
     return Response(status="ok", result=result)
 
 

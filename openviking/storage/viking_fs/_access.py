@@ -34,6 +34,7 @@ from openviking.storage.acl import (
     normalize_acl_principal,
 )
 from openviking.storage.internal_names import is_storage_internal_name
+from openviking.storage.viking_fs._acl_cache import acl_enabled_cached
 from openviking_cli.exceptions import (
     FailedPreconditionError,
     InvalidArgumentError,
@@ -187,7 +188,9 @@ class _AccessMixin:
                 valid.append(uri)
 
         acl_manager = self.acl_manager
-        if acl_manager is None or not await acl_manager.is_enabled(real_ctx.account_id):
+        if acl_manager is None or not await acl_enabled_cached(
+            acl_manager, real_ctx.account_id
+        ):
             result.update({uri: self._is_accessible(uri, real_ctx) for uri in valid})
             return result
 
