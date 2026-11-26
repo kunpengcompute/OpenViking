@@ -1,0 +1,117 @@
+# DeepSeek Harness
+
+为 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（`dsh`）接入跨项目、跨会话的长期记忆。安装后每次对话都会自动召回相关记忆并捕获新内容，模型也会直接拿到 OpenViking 工具以及 `openviking-memory`、`openviking-skills`、`ov-experience-memory` 三个技能，无需额外配置。
+
+源码：[examples/dsh-memory-plugin](https://github.com/volcengine/OpenViking/tree/main/examples/dsh-memory-plugin)
+
+## 安装
+
+DSH 与其他记忆插件共用同一个安装器。它会询问要安装的 harness 和 OpenViking 凭据；每一步都是幂等的，重复运行完全安全。
+
+```bash
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
+```
+
+安装器会把插件装到 `web` profile。要装到其他 profile，用 `--dsh-profile <name>` 指定：`curl -fsSL https://openviking.ai/install | bash -s -- --dsh-profile <name>`。
+
+安装后按下方“验证”步骤检查工具接入和跨会话召回。
+
+<details>
+<summary><b>手动安装</b></summary>
+
+1. **配置连接** —— 写 `~/.openviking/ovcli.conf`（`url`、`api_key`，可选 `account`/`user`），或设置 `OPENVIKING_URL` 和 `OPENVIKING_API_KEY`。如果用纯本地模式（`http://127.0.0.1:1933`，无鉴权），这步可以跳过，插件默认就指向本地。
+
+2. **把插件装进 profile**：
+
+   ```bash
+   dsh plugin --profile web add @openviking/dsh-memory-plugin
+   ```
+
+   `dsh plugin` 会转发给 profile 目录下的 pnpm，所以任何 profile 名都可以；`web` 是 `dsh` 首次运行时自动创建的那个。
+
+3. **确认 profile 已生效**：
+
+   ```bash
+   dsh --profile web --dump-config
+   ```
+
+   输出里应该能看到 `openviking-memory-runtime` 条目。
+
+> 还没有 `ovcli.conf`？见[部署指南 → CLI](../guides/03-deployment.md#cli)。
+>
+> 卸载：`dsh plugin --profile web rm @openviking/dsh-memory-plugin`。
+
+</details>
+
+## 验证
+
+启动 `dsh --profile web` 打开一个会话，会话开头应该能看到一条 OpenViking 上下文注入，模型也应该具备 `mcp__openviking__*` 工具。问一句更早会话里聊过的事，确认召回生效。
+
+排查 MCP 代理问题时，在启动 DSH 前设置 `OPENVIKING_DEBUG=1` 和 `OPENVIKING_DEBUG_LOG=/tmp/ov-dsh.log`，然后查看该文件。自动记忆回调使用 DSH 自身的日志系统。旧别名 `OV_DEBUG_LOG=/tmp/ov-dsh.log` 仍然支持，并且优先于这两个规范配置项。
+
+## 工作方式
+
+插件以 Cordis 插件的形式跑在 DSH 进程内，而不是外挂 hook，因此能贴着会话走。会话开始时注入 OpenViking 画像块、可用记忆索引和 OpenViking 技能清单 `<available-skills>`；模型步骤带有新的用户输入时，用用户输入的文本做语义检索，把结果作为持久消息追加到同一步骤，因此注入会随会话重放，也对压缩可见。DSH 或其他插件注入的上下文（例如 `time-context`、job 通知）和工具结果既不触发召回，也不拼进检索文本。它直接从 DSH 的事件流捕获 user、assistant 以及（可选的）工具结果消息，并跳过注入的上下文，待同步 token 超过阈值即 commit，每次 commit 都归档全部已捕获的消息。写入失败会进入待写队列，在下次会话开始时重放。
+
+每个 DSH 会话映射为 OpenViking 中的 `dsh-<session-id>`，子 agent 各自拥有独立会话。
+
+模型看到的工具面就是 OpenViking 的 MCP 工具集，经由与其他记忆集成相同的 stdio 代理接入，以 `mcp__openviking__` 前缀发布。由于该代理每个 profile 只起一个进程，`mcp__openviking__remember` 写入的是服务端一个短生命周期的会话而不是当前会话（对话本身仍由自动捕获记录）。设置 `OPENVIKING_RECALL_PEER_SCOPE=actor` 后，固定的 `OPENVIKING_PEER_ID` 才会把该 profile 的工具调用归属到同一个 peer；默认 `all` 不发送 actor-peer 头。多个工作区需要不同工具身份时，使用独立 profile/进程。插件同时附带三个共享技能：`openviking-memory` 让模型知道何时该检索、读取和写入，`openviking-skills` 讲如何查找、使用、创建、共享和迁移存放在 OpenViking 里的技能，`ov-experience-memory` 让模型在执行类任务前检索并应用以往任务的 Experience。插件默认捕获工具结果（`captureToolResults: true`），服务端据此把该技能的读取关联回所用的 Experience；设为 `false` 时，它只检索和应用 Experience。
+
+文件工具误把 `viking://` URI 当本地路径时，调用会被拦截，并提示改用对应的 OpenViking 工具；写入或编辑的若是 `viking://~/skills/<name>/` 这类技能目录，提示的工具是 `mcp__openviking__add_skill`，它用完整的 `SKILL.md` 文本创建或替换整个技能。shell 命令带 `viking://` URI 时照常执行，模型会收到一条改用 OpenViking 工具的提示，URI 是有意传入的数据时可以忽略。
+
+<details>
+<summary><b>配置</b></summary>
+
+凭证解析顺序为 `OPENVIKING_*` 环境变量 → `~/.openviking/ovcli.conf` → `~/.openviking/ov.conf`，与 Claude Code、Codex、OpenCode、pi 共用同一条链路；这些文件变更后会自动重载。
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `OPENVIKING_URL` / `OPENVIKING_BASE_URL` | `http://127.0.0.1:1933` | 服务端点 |
+| `OPENVIKING_API_KEY` / `OPENVIKING_BEARER_TOKEN` | — | API Key（以 `Authorization: Bearer` 发送） |
+| `OPENVIKING_ACCOUNT` / `OPENVIKING_USER` | — | 可信模式下的 account 与 user |
+| `OPENVIKING_PEER_ID` | — | 显式指定 actor peer |
+| `OPENVIKING_WORKSPACE_PEER` | `true` | 按每个会话的工作区推导 peer；设为 `0` 则不发送 peer |
+| `OPENVIKING_RECALL_PEER_SCOPE` | `all` | 设为 `actor` 可将召回限制在当前工作区 |
+| `OPENVIKING_DEBUG` | `false` | 启用 MCP 代理调试日志；还需配置日志路径 |
+| `OPENVIKING_DEBUG_LOG` | `""` | MCP 代理调试日志的文件路径 |
+| `OV_DEBUG_LOG` | — | 旧别名：启用 MCP 代理日志，并覆盖规范的调试开关和日志路径 |
+
+行为参数写在 profile 的 Cordis patch 条目里：
+
+```yaml
+- id: openviking-memory-runtime
+  config:
+    recallTokenBudget: 2000
+    scoreThreshold: 0.35
+    captureToolResults: true
+    commitTokenThreshold: 20000
+```
+
+同一个 `config` 块里的 `syncTurns: false` 关闭自动捕获、commit 和待写队列重放，画像注入和召回照常。排队的写入保留到后续开启写入的会话处理；该开关不会撤销模型的 MCP 写工具或改变服务端权限。
+
+同一个 `config` 块里的 `peerSource` 决定工作区 peer 的派生方式。默认的 `"git"` 取仓库归一化后的 `origin` URL（`git@github.com:volcengine/OpenViking.git` 得到 `github.com-volcengine-openviking`），其次是仓库根路径，因此同一个仓库的每个 clone、worktree 和子目录共用同一个 peer；不在仓库中则完全不发送 peer，在那里记下的内容进入用户级空间 `viking://user/<you>/memories`。`"cwd"` 恢复此前的行为——把工作目录路径中的非字母数字字符全部替换成 `-`；`"none"` 则完全不发送 peer。要让仓库之外的目录拥有独立记忆，请为它设置 `OPENVIKING_PEER_ID`（见[让一个目录拥有独立记忆](../configuration/02-client.md#让一个目录拥有独立记忆)）。
+
+同一个 `config` 块里的 `skillCatalog` 和 `skillCatalogTokenBudget` 控制会话开始时注入的技能清单。清单先列你自己的技能，再列账号内共享在 `viking://agent/skills` 下的技能，每条描述截到约 40 token；它有独立的预算（默认 `1200` token，不占用画像预算），描述放不下时只列名称。`skillCatalog: false` 或把预算设为 `0` 即可关闭；对应的环境变量是 `OPENVIKING_SKILL_CATALOG` 和 `OPENVIKING_SKILL_CATALOG_TOKEN_BUDGET`。
+
+patch 中写的凭证优先于环境变量。行为配置按优先级从高到低解析：`OPENVIKING_*` 环境变量、工作区的 `.openviking/config.json` 与 `config.local.json`、`ovcli.conf` 的 `plugin.dsh`、`ovcli.conf` 的 `plugin`，最后才是这个 patch 块。完整参数列表见[插件 README](https://github.com/volcengine/OpenViking/tree/main/examples/dsh-memory-plugin)。
+
+</details>
+
+## 常见问题
+
+| 现象 | 排查方向 |
+|------|----------|
+| 没有注入，也没有 OpenViking 工具 | `dsh --profile web --dump-config` 里应能看到 `openviking-memory-runtime`；重新运行安装器或 `dsh plugin --profile web add …` |
+| 装到了错误的 profile | 安装器默认 `web`；用 `--dsh-profile <name>` 重新运行 |
+| DSH 提示插件与当前 dsh 版本不兼容 | 插件接受 `0.1.0-rc.6` 起的所有 `@deepseek-ai/dsh` 0.x 版本（peer 范围 `>=0.1.0-rc.6 <1.0.0-0`），出现这个提示说明 DSH 已是 1.0 或更高；升级插件，或者确认风险后用 `dsh plugin allow-version` 放行。所有 `@deepseek-ai/dsh-*` 宿主包要保持同一版本。 |
+| 升级 DSH 后插件启动失败 | 已验证的版本：`0.1.0-rc.6`、`0.1.5-rc.1`、`0.1.5-rc.2`、`0.1.7-rc.2`、`0.2.0-rc.2`、`0.2.1-alpha.1`。更新的 0.x 版本不经预先验证就会被接受；请把 DSH 固定到已验证的版本，并提 issue。 |
+| 安装时报包「不在 npm registry 中」 | 检查该 profile 的 pnpm 是否设置了 24 小时的最小发布年龄（`minimumReleaseAge`）。等一等，或把该精确版本加进 profile 的 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` |
+| 召不回任何内容 | `curl "<OpenViking 服务地址>/health"`；检查端点配置，以及 prompt 是否长于最小查询长度（3 个字符） |
+| OpenViking 返回 401 / 403 | 检查 `OPENVIKING_API_KEY`；可信模式部署还要检查 `OPENVIKING_ACCOUNT` 与 `OPENVIKING_USER` |
+| 串入了其他项目的记忆 | 设置 `OPENVIKING_RECALL_PEER_SCOPE=actor`，将 peer 记忆限定为当前 peer；用户级记忆仍会共享 |
+| 崩溃后没有 commit | commit 由 token 阈值和 teardown 触发；排队的写入会在下次会话开始时重放 |
+
+## 延伸阅读
+
+- [集成能力参考](./16-capability-reference.md)
