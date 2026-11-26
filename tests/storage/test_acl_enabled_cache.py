@@ -76,8 +76,6 @@ def _enable_kunpeng_opt(monkeypatch):
     monkeypatch.setattr("openviking._kunpeng_opt.enabled", lambda: True)
 
 
-
-
 async def test_same_account_is_queried_once():
     manager = FakeAclManager(enabled=True)
 
@@ -204,7 +202,7 @@ async def test_acl_enabled_still_uses_real_access_check(monkeypatch):
     first = await fs._can_access_many(uris, ctx)
     second = await fs._can_access_many(uris, ctx)
 
-    assert first == second == {uri: True for uri in uris}
+    assert first == second == dict.fromkeys(uris, True)
     assert manager.calls == 1  # 账号配置只查一次（缓存命中）
     assert manager.resolve_calls == 2  # ACL 判定每次都真的执行
 

@@ -13,10 +13,9 @@ import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from openviking import _kunpeng_opt
-
 from typing import Any, Dict, List, Optional, Tuple
 
+from openviking import _kunpeng_opt
 from openviking.models.vlm.base import ToolCall, VLMBase
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (

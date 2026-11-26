@@ -103,9 +103,7 @@ class _AccessMixin:
     def _require_request_context(self, ctx: Optional[RequestContext]) -> RequestContext:
         """Resolve an account context without inventing the default account."""
         if ctx is None and self._bound_ctx.get() is None:
-            raise RuntimeError(
-                "Account request context is required for account-scoped operations"
-            )
+            raise RuntimeError("Account request context is required for account-scoped operations")
         return self._ctx_or_default(ctx)
 
     @contextmanager
@@ -188,9 +186,7 @@ class _AccessMixin:
                 valid.append(uri)
 
         acl_manager = self.acl_manager
-        if acl_manager is None or not await acl_enabled_cached(
-            acl_manager, real_ctx.account_id
-        ):
+        if acl_manager is None or not await acl_enabled_cached(acl_manager, real_ctx.account_id):
             result.update({uri: self._is_accessible(uri, real_ctx) for uri in valid})
             return result
 

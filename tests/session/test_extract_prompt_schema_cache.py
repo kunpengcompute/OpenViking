@@ -47,8 +47,6 @@ def _enable_kunpeng_opt(monkeypatch):
     monkeypatch.setattr("openviking._kunpeng_opt.enabled", lambda: True)
 
 
-
-
 def test_cache_enabled_by_default():
     assert mod._prompt_schema_cache_enabled() is True
 

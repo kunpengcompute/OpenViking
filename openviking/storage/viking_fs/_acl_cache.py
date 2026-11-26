@@ -22,8 +22,8 @@ from __future__ import annotations
 import os
 import time
 from typing import Any, Dict, Optional, Tuple
-from openviking import _kunpeng_opt
 
+from openviking import _kunpeng_opt
 
 _ENV = "OPENVIKING_ACL_ENABLED_CACHE"
 _OFF_VALUES = {"0", "false", "off", "no", "disable", "disabled"}

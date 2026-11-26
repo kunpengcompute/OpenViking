@@ -24,16 +24,14 @@ import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
-from openviking import _kunpeng_opt
 
+from openviking import _kunpeng_opt
 
 _ENV = "OPENVIKING_CONTENT_CACHE"
 _OFF_VALUES = {"0", "false", "off", "no", "disable", "disabled"}
 _TTL_SECONDS = float(os.getenv("OPENVIKING_CONTENT_CACHE_TTL", "600.0"))
 _MAX_ENTRIES = int(os.getenv("OPENVIKING_CONTENT_CACHE_MAX_ENTRIES", "4096"))
-_MAX_ENTRY_BYTES = int(
-    os.getenv("OPENVIKING_CONTENT_CACHE_MAX_ENTRY_BYTES", str(256 * 1024))
-)
+_MAX_ENTRY_BYTES = int(os.getenv("OPENVIKING_CONTENT_CACHE_MAX_ENTRY_BYTES", str(256 * 1024)))
 _MAX_VERSION_ENTRIES = 65536
 
 CacheKey = Tuple[str, str, str]
@@ -67,12 +65,8 @@ def disable_for_multi_worker(workers: int) -> bool:
 def make_key(ctx: Any, uri: str) -> CacheKey:
     """按 (账号, 用户, URI) 生成 key，避免跨用户命中。"""
     user = getattr(ctx, "user", None)
-    account = str(
-        getattr(user, "account_id", None) or getattr(ctx, "account_id", "") or ""
-    )
-    uid = str(
-        getattr(user, "user_id", None) or getattr(user, "uid", None) or user or ""
-    )
+    account = str(getattr(user, "account_id", None) or getattr(ctx, "account_id", "") or "")
+    uid = str(getattr(user, "user_id", None) or getattr(user, "uid", None) or user or "")
     return (account, uid, uri)
 
 
@@ -80,9 +74,7 @@ class ReadContentCache:
     """带 TTL 的 LRU 文本缓存；条目带版本号，失效通过版本递增实现。"""
 
     def __init__(self) -> None:
-        self._data: "OrderedDict[CacheKey, Tuple[str, float, CacheVersion]]" = (
-            OrderedDict()
-        )
+        self._data: "OrderedDict[CacheKey, Tuple[str, float, CacheVersion]]" = OrderedDict()
         self._by_uri: Dict[str, set] = {}
         self._ver: Dict[str, int] = {}
         self._prefix_epoch = 0
@@ -116,9 +108,7 @@ class ReadContentCache:
 
     # ---------- 读写 ----------
 
-    def get(
-        self, key: CacheKey, version: Optional[CacheVersion] = None
-    ) -> Optional[str]:
+    def get(self, key: CacheKey, version: Optional[CacheVersion] = None) -> Optional[str]:
         if not cache_enabled():
             return None
         with self._lock:

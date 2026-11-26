@@ -28,8 +28,7 @@ from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response as ServerResponse
 from openviking.server.routers import content as content_router
-from openviking.storage.viking_fs import VikingFS
-from openviking.storage.viking_fs import _read_cache
+from openviking.storage.viking_fs import VikingFS, _read_cache
 from openviking.storage.viking_fs._read_cache import CACHE as READ_CACHE
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -119,8 +118,6 @@ def _reset_read_cache():
 def _enable_kunpeng_opt(monkeypatch):
     """单测在任意架构上开启鲲鹏优化总开关（CI 多为 x86）。"""
     monkeypatch.setattr("openviking._kunpeng_opt.enabled", lambda: True)
-
-
 
 
 async def test_second_read_hits_cache(monkeypatch):
@@ -479,9 +476,9 @@ def test_stale_refill_after_concurrent_write_is_missed(monkeypatch):
     uri = "viking://user/alice/memories/m1.md"
     key = _read_cache.make_key(_ctx("alice"), uri)
 
-    version_before = cache.version(uri)        # 读线程：读之前取版本
-    cache.invalidate(uri)                      # 写线程：写成功后失效（版本 +1）
-    cache.put(key, "stale", version_before)    # 读线程：迟到的旧内容回填
+    version_before = cache.version(uri)  # 读线程：读之前取版本
+    cache.invalidate(uri)  # 写线程：写成功后失效（版本 +1）
+    cache.put(key, "stale", version_before)  # 读线程：迟到的旧内容回填
 
     assert cache.get(key, cache.version(uri)) is None
 

@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Content endpoints for OpenViking HTTP Server."""
 
-from typing import Literal
-from urllib.parse import quote
-
 import json
 import os
+from typing import Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from openviking import _kunpeng_opt
 from openviking.core.namespace import (
     is_hidden_by_actor_peer_view,
     may_include_hidden_actor_peers,
@@ -27,8 +27,6 @@ from openviking.server.auth import (
 )
 from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
-from openviking import _kunpeng_opt
-
 from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
