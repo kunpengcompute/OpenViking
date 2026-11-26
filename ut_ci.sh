@@ -46,8 +46,15 @@ get_binding_client()
 print('UT native engine:', engine.ENGINE_VARIANT)
 PY
 
-# 记忆读写路径优化点回归用例。这些文件随优化点代码一并合入，缺失时回退到
-# tests/unit，避免仅合入 CI 脚本时因文件不存在把流水线弄红。
+# 基础用例取上游 lite CI 的 vectordb 子集：不依赖外部服务，构建完原生扩展即可跑。
+BASE_TARGETS=(
+    tests/vectordb/test_cuvs_config.py
+    tests/vectordb/test_cuvs_index.py
+    tests/vectordb/test_cuvs_collection.py
+    tests/vectordb/test_str_to_uint64.py
+)
+# 记忆读写路径优化点回归用例。这些文件随优化点 PR 一并合入，存在时追加执行；
+# 仅合入本 CI 脚本时它们尚不存在，不影响门禁。
 OPT_TARGETS=(
     tests/session/test_extract_prompt_schema_cache.py
     tests/storage/test_acl_enabled_cache.py
@@ -60,13 +67,18 @@ else
     case "${UT_SCOPE:-unit}" in
         unit|gate)
             targets=()
-            for path in "${OPT_TARGETS[@]}"; do
+            for path in "${BASE_TARGETS[@]}" "${OPT_TARGETS[@]}"; do
                 [[ ! -e "$path" ]] || targets+=("$path")
             done
             (( ${#targets[@]} )) || {
-                echo "WARN: 优化点用例不存在，回退 tests/unit"
-                targets=(tests/unit)
+                echo 'ERROR: 未找到可执行的用例文件' >&2; exit 2;
             }
+            if [[ "${UT_SCOPE:-unit}" == gate ]]; then
+                for path in tests/integration/ov_context tests/client/test_http_request_identity.py \
+                            tests/integration/langchain_langgraph/test_smoke.py benchmark/office/tests; do
+                    [[ ! -e "$path" ]] || targets+=("$path")
+                done
+            fi
             ;;
         full)
             targets=(tests)
