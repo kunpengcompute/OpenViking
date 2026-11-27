@@ -564,6 +564,20 @@ def test_multi_worker_disables_cache(monkeypatch):
     assert not _read_cache.cache_enabled()
 
 
+def test_entry_size_limit_counts_utf8_bytes(monkeypatch):
+    monkeypatch.delenv("OPENVIKING_CONTENT_CACHE", raising=False)
+    monkeypatch.setattr(_read_cache, "_MAX_ENTRY_BYTES", 12)
+    cache = _read_cache.ReadContentCache()
+    key = _read_cache.make_key(_ctx("alice"), "viking://user/shared/notes.md")
+    version = cache.version("viking://user/shared/notes.md")
+
+    cache.put(key, "abcdé", version)  # 6 字节，未超限
+    assert cache.get(key, version) == "abcdé"
+
+    cache.put(key, "感谢您的贡献", version)  # 18 字节，超 12 字节上限
+    assert cache.get(key, version) == "abcdé"
+
+
 def test_explicit_setting_wins(monkeypatch):
     monkeypatch.setenv("OPENVIKING_CONTENT_CACHE", "1")
 

@@ -136,7 +136,7 @@ class ReadContentCache:
         text: str,
         version: Optional[CacheVersion] = None,
     ) -> None:
-        if not cache_enabled() or not text or len(text) > _MAX_ENTRY_BYTES:
+        if not cache_enabled() or not text or len(text.encode("utf-8")) > _MAX_ENTRY_BYTES:
             return
         with self._lock:
             self._data[key] = (
