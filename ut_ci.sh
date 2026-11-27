@@ -74,8 +74,11 @@ else
                 echo 'ERROR: 未找到可执行的用例文件' >&2; exit 2;
             }
             if [[ "${UT_SCOPE:-unit}" == gate ]]; then
+                # 不含 langchain_langgraph/test_smoke：langchain_openviking 是
+                # examples/langchain 下的独立包，本作业未安装；pytest.importorskip
+                # 会让整个模块被跳过，门禁会假绿。
                 for path in tests/integration/ov_context tests/client/test_http_request_identity.py \
-                            tests/integration/langchain_langgraph/test_smoke.py benchmark/office/tests; do
+                            benchmark/office/tests; do
                     [[ ! -e "$path" ]] || targets+=("$path")
                 done
             fi

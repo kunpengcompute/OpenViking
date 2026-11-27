@@ -35,9 +35,13 @@ export CARGO_BUILD_JOBS="$CMAKE_BUILD_PARALLEL_LEVEL"
 [[ "$CMAKE_BUILD_PARALLEL_LEVEL" =~ ^[1-9][0-9]*$ ]] || {
     echo 'ERROR: CI_BUILD_JOBS 必须为正整数' >&2; exit 2;
 }
-if [[ -n "${OPENVIKING_VERSION:-}" ]]; then
-    export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="$OPENVIKING_VERSION"
+if [[ -z "${OPENVIKING_VERSION:-}" ]]; then
+    OPENVIKING_VERSION="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
 fi
+# CI checkout 可能没有 tag，这里兜底一个确定版本：
+# setup.py 构建 CLI 与 uv build 出的 wheel 必须使用同一个值。
+export OPENVIKING_VERSION="${OPENVIKING_VERSION:-0.5.0}"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="$OPENVIKING_VERSION"
 
 for tool in uv cmake gcc g++ cargo rustc; do
     command -v "$tool" >/dev/null || { echo "ERROR: 缺少工具 $tool" >&2; exit 2; }
