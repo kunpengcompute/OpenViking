@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
+from openviking import _kunpeng_opt
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
     is_hidden_by_actor_peer_view,
@@ -38,6 +39,12 @@ from openviking.storage.viking_fs._base import (
     _is_directory_not_empty_error,
     logger,
 )
+from openviking.storage.viking_fs._read_cache import (
+    CACHE as _READ_CACHE,
+)
+from openviking.storage.viking_fs._read_cache import (
+    make_key as _make_read_cache_key,
+)
 from openviking.utils.time_utils import format_iso8601, parse_iso_datetime
 from openviking_cli.exceptions import (
     InvalidArgumentError,
@@ -45,6 +52,15 @@ from openviking_cli.exceptions import (
     PermissionDeniedError,
 )
 from openviking_cli.utils.uri import VikingURI
+
+
+def _slice_read_text(text: str, offset: int, limit: int) -> str:
+    """按行号切片；全量读取（默认参数）直接原样返回。"""
+    if offset == 0 and limit == -1:
+        return text
+    lines = text.splitlines(keepends=True)
+    sliced = lines[offset:] if limit == -1 else lines[offset : offset + limit]
+    return "".join(sliced)
 
 
 def _glob_match_uri(entry_uri: str, is_dir: Optional[bool]) -> str:
@@ -340,6 +356,7 @@ class _OpsMixin:
                     )
                 raise
             # Add estimated_deleted_count to the result
+            _READ_CACHE.invalidate_prefix(uri)
             if isinstance(result, dict):
                 result["estimated_deleted_count"] = estimated_count
             else:
@@ -373,12 +390,14 @@ class _OpsMixin:
         cleanup of already-expired, uniquely-named upload directories).
         """
         path = self._uri_to_path(uri, ctx=ctx)
-        return await self._async_agfs.rm(
+        result = await self._async_agfs.rm(
             path,
             recursive=recursive,
             fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
             auto_pathlock=auto_pathlock,
         )
+        _READ_CACHE.invalidate_prefix(uri)
+        return result
 
     async def cp(
         self,
@@ -846,6 +865,14 @@ class _OpsMixin:
             await self._async_agfs.rm(
                 old_path, recursive=is_dir, fs_ctx=self._pathlock_fs_ctx(ctx, lease)
             )
+            # 读缓存须与存储保持一致：mv 是"复制 + 底层删除"，不经过 rm()，因此这里显式
+            # 失效源与目标；目录移动按前缀失效覆盖整棵子树。
+            if is_dir:
+                _READ_CACHE.invalidate_prefix(old_uri)
+                _READ_CACHE.invalidate_prefix(new_uri)
+            else:
+                _READ_CACHE.invalidate(old_uri)
+                _READ_CACHE.invalidate(new_uri)
             result: Dict[str, Any] = {
                 "operation_id": operation_id,
                 "operation": "move",
@@ -1986,6 +2013,7 @@ class _OpsMixin:
             fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
             auto_pathlock=auto_pathlock,
         )
+        _READ_CACHE.invalidate(uri)
 
     async def read_file(
         self,
@@ -2004,6 +2032,89 @@ class _OpsMixin:
         Raises:
             FileNotFoundError: If the file does not exist.
         """
+        if not _kunpeng_opt.enabled():
+            return await self._read_file_native(uri, offset, limit, ctx)
+
+        real_ctx = self._ctx_or_default(ctx)
+
+        uri = await self.resolve_uri(uri, real_ctx)
+        await self._ensure_access(uri, ctx)
+
+        # P2（保留鉴权版）：URI 解析与权限检查每次都执行，只在鉴权通过后查缓存；
+        # 命中时跳过路径映射与 AGFS 读盘。写路径主动失效，TTL 兜底。
+        cache_key = _make_read_cache_key(real_ctx, uri)
+        cache_version = _READ_CACHE.version(uri)
+        cached_text = _READ_CACHE.get(cache_key, cache_version)
+        if cached_text is not None:
+            return _slice_read_text(cached_text, offset, limit)
+
+        primary_path = self._uri_to_path(uri, ctx=ctx)
+
+        # P0：先读再判空。AGFS read 对不存在的文件返回空字节而不是报错，
+        # 所以只有读到空内容时才补一次 stat，用来区分「空文件 / 目录 / 不存在」。
+        last_not_found: Optional[Exception] = None
+        text: Optional[str] = None
+        for path in self._read_paths(uri, ctx=ctx):
+            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
+                continue
+            # 部分后端（如 LocalFS）读目录时直接抛插件错误而不是返回空字节，
+            # 先记下该错误再交给下面的 stat 探测判定，避免绕过目录错误的既定契约。
+            read_error: Optional[Exception] = None
+            try:
+                content = await self._async_agfs.read(path)
+            except Exception as exc:
+                if is_not_found_error(exc):
+                    last_not_found = exc
+                    continue
+                content = None
+                read_error = exc
+
+            if isinstance(content, bytes):
+                raw = content
+            elif content is not None and hasattr(content, "content"):
+                raw = content.content
+            else:
+                raw = b""
+
+            if not raw:
+                try:
+                    stat = await self._async_agfs.stat(path)
+                except Exception as exc:
+                    if read_error is not None:
+                        raise read_error
+                    if is_not_found_error(exc):
+                        last_not_found = exc
+                        continue
+                    raise
+                if isinstance(stat, dict) and stat.get("isDir", False):
+                    raise InvalidArgumentError(
+                        f"Directory URI is not readable as a file: {uri}. "
+                        "List it first, then read a file URI.",
+                        details={
+                            "resource": uri,
+                            "expected": "file",
+                            "actual": "directory",
+                        },
+                    ) from read_error
+                if read_error is not None:
+                    raise read_error
+
+            text = self._decode_bytes(raw)
+            break
+        else:
+            raise NotFoundError(uri, "file") from last_not_found
+
+        _READ_CACHE.put(cache_key, text, cache_version)
+        return _slice_read_text(text, offset, limit)
+
+    async def _read_file_native(
+        self,
+        uri: str,
+        offset: int = 0,
+        limit: int = -1,
+        ctx: Optional[RequestContext] = None,
+    ) -> str:
+        """0.5.0 原生 read_file（先 stat 再 read），鲲鹏优化总开关关闭时走这里。"""
         real_ctx = self._ctx_or_default(ctx)
         uri = await self.resolve_uri(uri, real_ctx)
         await self._ensure_access(uri, ctx)
@@ -2038,18 +2149,13 @@ class _OpsMixin:
                 raw = content.content
             else:
                 raw = b""
-
             text = self._decode_bytes(raw)
         except Exception as exc:
             if is_not_found_error(exc):
                 raise NotFoundError(uri, "file") from exc
             raise
 
-        if offset == 0 and limit == -1:
-            return text
-        lines = text.splitlines(keepends=True)
-        sliced = lines[offset:] if limit == -1 else lines[offset : offset + limit]
-        return "".join(sliced)
+        return _slice_read_text(text, offset, limit)
 
     async def read_file_bytes(
         self,
@@ -2112,6 +2218,7 @@ class _OpsMixin:
             fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
             auto_pathlock=auto_pathlock,
         )
+        _READ_CACHE.invalidate(uri)
 
     async def append_file(
         self,
@@ -2154,6 +2261,7 @@ class _OpsMixin:
                 final_content,
                 fs_ctx=fs_ctx,
             )
+            _READ_CACHE.invalidate(uri)
 
         except Exception as e:
             logger.error(f"[VikingFS] Failed to append to file {uri}: {e}")
@@ -2487,6 +2595,8 @@ class _OpsMixin:
 
         await self._copy_file_through_vikingfs(from_uri, to_uri, ctx=ctx)
         await self._async_agfs.rm(from_path)
+        _READ_CACHE.invalidate(from_uri)
+        _READ_CACHE.invalidate(to_uri)
 
     # ========== Temp File Operations (backward compatible) ==========
 

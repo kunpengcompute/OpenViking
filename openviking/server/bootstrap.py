@@ -324,6 +324,21 @@ def main():
     try:
         workers = config.workers
         if workers > 1:
+            # 多 worker 时每个进程各有一份读缓存，进程之间感知不到对方的写入，
+            # 为保证不读到旧内容，默认自动关闭内容缓存（单进程行为不变）。
+            # 部署方显式设置 OPENVIKING_CONTENT_CACHE 时以显式值为准。
+            from openviking.storage.viking_fs._read_cache import (
+                disable_for_multi_worker,
+            )
+
+            if disable_for_multi_worker(workers):
+                print(
+                    "OpenViking content cache disabled: multi-worker mode "
+                    f"({workers} workers) cannot share invalidation across processes. "
+                    "Cross-process content caching is available via the upstream "
+                    "CacheFS: set storage.agfs.cachefs.backend=cache and a shared "
+                    "provider (e.g. top-level cache.provider=redis)."
+                )
             # Multi-worker mode requires an import string so each worker
             # can independently import the application.  We stash the
             # resolved config path in an env-var so that the factory can
